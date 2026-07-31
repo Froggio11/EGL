@@ -895,6 +895,12 @@ async def weekly_check():
 async def bef():await bot.wait_until_ready()
 
 @bot.event
+async def on_guild_join(guild):
+    bot.tree.copy_global_to(guild=guild)
+    await bot.tree.sync(guild=guild)
+    log.info("\u2705 Joined %s, commands synced",guild.name)
+
+@bot.event
 async def on_ready():
     await init_db()
     for guild in bot.guilds:
