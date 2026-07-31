@@ -898,7 +898,13 @@ async def bef():await bot.wait_until_ready()
 async def on_guild_join(guild):
     bot.tree.copy_global_to(guild=guild)
     await bot.tree.sync(guild=guild)
-    log.info("\u2705 Joined %s, commands synced",guild.name)
+    # Create required roles if they don't exist
+    required=[ADMIN_ROLE,"Captain","Player","Free Agent",TESTER_ROLE]
+    for role_name in required:
+        if not find_role(guild,role_name):
+            try:await guild.create_role(name=role_name)
+            except:pass
+    log.info("\u2705 Joined %s, commands synced, roles created",guild.name)
 
 @bot.event
 async def on_ready():
