@@ -378,7 +378,18 @@ async def setup_run(i):
     async with aiosqlite.connect(DB)as db:
         await db.execute("INSERT INTO setup_data VALUES(?,?,?,?,?,?,?,?,?,?)",(gid,"EGL",str(lcat.id),str(mcat.id),str(ann.id),str(gen.id),str(tch.id),str(fa.id),str(mat.id),str(res.id)))
         await db.commit()
-    await i.followup.send(f"\u2705 **EGL** set up!\n{ann.mention} {guide_ch.mention} {gen.mention} {tch.mention} {fa.mention} {mat.mention} {res.mention}\n\nNow run `/league create` to start a season!")
+    await i.followup.send(
+        "\u2694\ufe0f **Elite Goon League is live.**\n"
+        "All channels and permissions have been configured.\n\n"
+        f"{ann.mention} \u2014 Announcements\n"
+        f"{guide_ch.mention} \u2014 Player guide\n"
+        f"{gen.mention} \u2014 General chat\n"
+        f"{tch.mention} \u2014 Team threads\n"
+        f"{fa.mention} \u2014 Free agents\n"
+        f"{mat.mention} \u2014 Match schedule\n"
+        f"{res.mention} \u2014 Results\n\n"
+        "Run `/league create` to start your first season."
+    )
 
 @setup.command(name="reset",description="Delete all bot channels and reset (League Admin only)")
 async def setup_reset(i):
