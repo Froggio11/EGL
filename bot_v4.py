@@ -899,10 +899,16 @@ async def on_guild_join(guild):
     bot.tree.copy_global_to(guild=guild)
     await bot.tree.sync(guild=guild)
     # Create required roles if they don't exist
-    required=[ADMIN_ROLE,"Captain","Player","Free Agent",TESTER_ROLE]
-    for role_name in required:
+    required=[
+        (ADMIN_ROLE,discord.Color.red()),
+        ("Captain",discord.Color.yellow()),
+        ("Free Agent",discord.Color.blue()),
+        ("Player",discord.Color.green()),
+        (TESTER_ROLE,discord.Color.from_rgb(255,105,180)),
+    ]
+    for role_name,color in required:
         if not find_role(guild,role_name):
-            try:await guild.create_role(name=role_name)
+            try:await guild.create_role(name=role_name,color=color)
             except:pass
     log.info("\u2705 Joined %s, commands synced, roles created",guild.name)
 
@@ -918,6 +924,36 @@ async def on_ready():
     weekly_check.start()
 
 bot.tree.add_command(setup)
+
+# ===== /backup & /restore =====
+@bot.tree.command(name="backup",description="Download a backup of the league database (League Admin only)")
+async def backup_cmd(i):
+    if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
+    await i.response.defer(ephemeral=True)
+    try:
+        file=discord.File(DB,filename="league_backup.db")
+        await i.user.send(
+            "\U0001f4be **EGL League Database Backup**\n"
+            "The attached file contains all your league data: teams, MMR, matches, and settings.\n\n"
+            "**How to restore after a Railway redeploy:**\n"
+            "1. Wait for the bot to come back online after the redeploy\n"
+            "2. Go to your Discord server\n"
+            "3. Use `/restore` and attach this file (`league_backup.db`)\n"
+            "4. Everything will be restored instantly!\n\n"
+            "**Tip:** Always `/backup` before pushing new code to GitHub.",
+            file=file
+        )
+        await i.followup.send("\u2705 Backup sent to your DMs!",ephemeral=True)
+    except:await i.followup.send("\u274c Couldn\u2019t DM you. Enable DMs from server members.",ephemeral=True)
+
+@bot.tree.command(name="restore",description="Restore the league database from a backup file (League Admin only)")
+@app_commands.describe(file="The league_backup.db file")
+async def restore_cmd(i,file:discord.Attachment):
+    if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
+    if not file.filename.endswith(".db"):await i.response.send_message("\u274c Must be a .db file.",ephemeral=True);return
+    await i.response.defer(ephemeral=True)
+    await file.save(DB)
+    await i.followup.send("\u2705 Database restored! Restarting connection...",ephemeral=True)
 
 if __name__=="__main__":
     if not TOKEN:print("\n\u274c Set DISCORD_BOT_TOKEN!\n")
