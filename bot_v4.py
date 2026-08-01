@@ -13,6 +13,7 @@ DB="league.db";DEFAULT_MMR=1000;MAX_TEAM=3;SEASON_WEEKS=8
 ADMIN_ROLE="League Admin";TESTER_ROLE="EGL Tester"
 MAPS=["Chessboard","Portal Mayhem","Construction Site","Parking Lot"]
 SCHED_FMT="%d %b %H:%M";SCHED_HELP="DD Mon HH:MM (e.g. 05 Aug 19:00)"
+RANKS=[(0,"Adept"),(1000,"Lotus"),(1125,"Monk"),(1250,"Warden"),(1375,"Avatar"),(1500,"Raava")]
 intents=discord.Intents.default();intents.members=True;intents.message_content=True
 bot=commands.Bot(command_prefix="!",intents=intents)
 
@@ -98,6 +99,12 @@ async def is_on_cooldown(gid,uid):
 def find_role(guild,name):return discord.utils.get(guild.roles,name=name)
 def is_admin(member):return any(r.name==ADMIN_ROLE for r in member.roles)
 def is_tester(member):return any(r.name==TESTER_ROLE for r in member.roles)
+
+def get_rank(mmr):
+    rank=RANKS[0][1]
+    for floor,name in RANKS:
+        if mmr>=floor:rank=name
+    return rank
 
 async def add_roles(guild,member,team_display,captain=False):
     try:
@@ -308,11 +315,10 @@ async def guide_cmd(i):
     p1+="Every **Sunday at 10pm (UTC+2)** matches are generated. Each matchup gets a private thread so you can talk to the other team.\n\n"
     p1+="**Map Vote:** Both captains vote on Chessboard, Portal Mayhem, Construction Site, or Parking Lot.\n\n"
     p1+="\u2501"*22+"\n"
-    p1+="\U0001f3c6 **Ranking (MMR)**\n"
-    p1+="Every team starts at **1000 MMR**.\n"
-    p1+="Beat a stronger team \u2192 earn **more** MMR. Beat a weaker team \u2192 earn **less**.\n"
-    p1+="Lose to a stronger team \u2192 lose **less** MMR. Lose to a weaker team \u2192 lose **more**.\n"
-    p1+="Equal teams \u2192 about **25 MMR** won or lost.\n"
+    p1+="\U0001f3c6 **Ranking System**\n"
+    p1+="Every team starts in **Lotus** rank.\n"
+    p1+="Winning matches earns points to climb the ranks. Losing costs points.\n"
+    p1+="**Ranks:** Adept \u2192 Lotus \u2192 Monk \u2192 Warden \u2192 Avatar \u2192 Raava\n"
     p1+="If you had a team before, your new team starts at your old team\u2019s MMR.\n"
     p1+="Top 4 advance to Finals, then a Grand Final decides the champion!\n\n"
     p1+="\u23f1\ufe0f **24-Hour Cooldown:** Leave or disband a team? Wait 24 hours before joining or creating another.\n\n"
@@ -474,7 +480,7 @@ async def league_standings(i):
     ts=sorted(await teams_all(str(i.guild_id)),key=lambda x:x["mmr"],reverse=True)
     if not ts:await i.response.send_message("No teams!");return
     medals=["\U0001f947","\U0001f948","\U0001f949"]
-    lines=["**\u2694\ufe0f Standings**",""]+[f"{medals[n]if n<3 else str(n+1)+'.'} **{t['display']}** - {t['wins']}W/{t['losses']}L MMR:{t['mmr']}"for n,t in enumerate(ts)]
+    lines=["**\u2694\ufe0f Standings**",""]+[f"{medals[n]if n<3 else str(n+1)+'.'} **{t['display']}** — {t['wins']}W/{t['losses']}L — **{get_rank(t['mmr'])}**"for n,t in enumerate(ts)]
     await i.response.send_message("\n".join(lines))
 
 @league.command(name="info",description="League info")
@@ -554,7 +560,7 @@ async def league_status(i):
     ts=await teams_all(gid)
     total_matches=sum(t["wins"]+t["losses"]for t in ts)//2
     sorted_ts=sorted(ts,key=lambda x:x["mmr"],reverse=True)
-    board="\n".join(f"{n+1}. **{t['display']}** \u2014 {t['wins']}W/{t['losses']}L MMR:{t['mmr']}"for n,t in enumerate(sorted_ts[:4]))
+    board="\n".join(f"{n+1}. **{t['display']}** \u2014 {t['wins']}W/{t['losses']}L — **{get_rank(t['mmr'])}**"for n,t in enumerate(sorted_ts[:4]))
     await i.response.send_message(f"\U0001f4ca **Season Status**\n\nWeek: **{weeks_done}/{SEASON_WEEKS}**\nWeeks left: **{weeks_left}**\nMatches played: **{total_matches}**\nTeams: **{len(ts)}**\n\n**Current Top 4:**\n{board}")
 
 bot.tree.add_command(league)
@@ -622,7 +628,7 @@ async def team_create(i,name:str):
         except Exception as e:log.warning("THREAD ERROR: %s",e)
     async with aiosqlite.connect(DB)as db:await db.execute("UPDATE teams SET role_id=?,thread_id=? WHERE guild_id=? AND name=?",(role_id,thread_id,gid,name.lower()));await db.commit()
     extra=f"\n\U0001f4cc <#{thread_id}>"if thread_id else""
-    await i.followup.send(f"\u2694\ufe0f **{name}** created!\nCaptain:{i.user.mention}|MMR:{start_mmr}|1/{MAX_TEAM}{extra}")
+    await i.followup.send(f"\u2694\ufe0f **{name}** created!\nCaptain:{i.user.mention}|Rank:{get_rank(start_mmr)}|1/{MAX_TEAM}{extra}")
 
 @team.command(name="invite",description="Invite (captain)")
 @app_commands.describe(player="Player")
@@ -663,7 +669,7 @@ async def team_roster(i,team:str=None):
     gid=str(i.guild_id);t=await team_get(gid,team)if team else await team_by_player(gid,str(i.user.id))
     if not t:await i.response.send_message("\u274c Not found.",ephemeral=True);return
     crown="\U0001f451";players="\n".join(f"\u2022 <@{m}> {crown if m==t['captain_id']else''}"for m in t["members"])
-    await i.response.send_message(f"\u2694\ufe0f **{t['display']}** {t['wins']}W/{t['losses']}L MMR:{t['mmr']}\n\n**Players ({len(t['members'])}/{MAX_TEAM}):**\n{players}")
+    await i.response.send_message(f"\u2694\ufe0f **{t['display']}** {t['wins']}W/{t['losses']}L — **{get_rank(t['mmr'])}**\n\n**Players ({len(t['members'])}/{MAX_TEAM}):**\n{players}")
 
 @team.command(name="leave",description="Leave (players only — captains use /disband)")
 async def team_leave(i):
@@ -715,7 +721,7 @@ async def teaminfo(i,team:str):
     if not t:await i.response.send_message("\u274c Not found.",ephemeral=True);return
     tot=t["wins"]+t["losses"];wr=f"{round(t['wins']/tot*100)}%"if tot else"N/A"
     crown="\U0001f451";players="\n".join(f"\u2022 <@{m}> {crown if m==t['captain_id']else''}"for m in t["members"])
-    await i.response.send_message(f"\u2694\ufe0f **{t['display']}**\nMMR:{t['mmr']}|{t['wins']}W/{t['losses']}L|WR:{wr}\n\n**Players ({len(t['members'])}/{MAX_TEAM}):**\n{players}")
+    await i.response.send_message(f"\u2694\ufe0f **{t['display']}**\nRank:**{get_rank(t['mmr'])}**|{t['wins']}W/{t['losses']}L|WR:{wr}\n\n**Players ({len(t['members'])}/{MAX_TEAM}):**\n{players}")
 
 # ===== /captain /match /stats /fa /mmr /test /schedule /reschedule =====
 cap=app_commands.Group(name="captain",description="Captain")
@@ -783,7 +789,7 @@ async def match_report(i,opponent:str,score:str):
     if c and c.get("results_ch"):
         rc=i.guild.get_channel(int(c["results_ch"]))
         if rc:await rc.send(f"\u26a1 **{d} {score} {opp['display']}**\nWinner:**{winner}**\nBy {i.user.mention}")
-    await i.response.send_message(f"\u26a1 **{d} {score} {opp['display']}**\nWinner:**{winner}**\nMMR:{d} {my_t['mmr']}({su}{delta})|{opp['display']} {opp_t['mmr']}({st}{delta})")
+    await i.response.send_message(f"\u26a1 **{d} {score} {opp['display']}**\nWinner:**{winner}**\n{d}({get_rank(my_t['mmr'])}) +{delta}|{opp['display']}({get_rank(opp_t['mmr'])}) -{delta}")
 bot.tree.add_command(mat)
 
 st=app_commands.Group(name="stats",description="Stats")
@@ -793,7 +799,7 @@ async def stats_team(i,team:str=None):
     gid=str(i.guild_id);t=await team_get(gid,team)if team else await team_by_player(gid,str(i.user.id))
     if not t:await i.response.send_message("\u274c Not found.",ephemeral=True);return
     tot=t["wins"]+t["losses"];wr=f"{round(t['wins']/tot*100)}%"if tot else"N/A"
-    await i.response.send_message(f"\U0001f4ca **{t['display']}**\nMMR:**{t['mmr']}**|{t['wins']}W/{t['losses']}L|WR:{wr}\n{len(t['members'])}/{MAX_TEAM}|Capt:<@{t['captain_id']}>")
+    await i.response.send_message(f"\U0001f4ca **{t['display']}**\nRank:**{get_rank(t['mmr'])}**|{t['wins']}W/{t['losses']}L|WR:{wr}\n{len(t['members'])}/{MAX_TEAM}|Capt:<@{t['captain_id']}>")
 bot.tree.add_command(st)
 
 fa=app_commands.Group(name="fa",description="Free agents")
