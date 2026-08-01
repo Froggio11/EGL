@@ -1,6 +1,6 @@
-# Elements Divided League Bot v4 — Elite Goon League
+# Elements Divided League Bot v5 — Elite Goon League
 # pip install discord.py aiosqlite
-# python bot.py
+# 2v2 league, max 3 players/team, rank-based system
 import asyncio,logging,os,uuid,random
 from datetime import datetime,timezone,timedelta
 import aiosqlite,discord
@@ -13,11 +13,10 @@ DB="league.db";DEFAULT_MMR=1000;MAX_TEAM=3;SEASON_WEEKS=8
 ADMIN_ROLE="League Admin";TESTER_ROLE="EGL Tester"
 MAPS=["Chessboard","Portal Mayhem","Construction Site","Parking Lot"]
 SCHED_FMT="%d %b %H:%M";SCHED_HELP="DD Mon HH:MM (e.g. 05 Aug 19:00)"
-RANKS=[(0,"Adept"),(1000,"Lotus"),(1125,"Monk"),(1250,"Warden"),(1375,"Avatar"),(1500,"Raava")]
+RANKS=[(0,"Adept"),(900,"Lotus"),(1000,"Monk"),(1050,"Warden"),(1100,"Avatar"),(1150,"Raava")]
 intents=discord.Intents.default();intents.members=True;intents.message_content=True
 bot=commands.Bot(command_prefix="!",intents=intents)
 
-# ===== DB =====
 async def init_db():
     async with aiosqlite.connect(DB)as db:
         await db.executescript("""
@@ -99,7 +98,6 @@ async def is_on_cooldown(gid,uid):
 def find_role(guild,name):return discord.utils.get(guild.roles,name=name)
 def is_admin(member):return any(r.name==ADMIN_ROLE for r in member.roles)
 def is_tester(member):return any(r.name==TESTER_ROLE for r in member.roles)
-
 def get_rank(mmr):
     rank=RANKS[0][1]
     for floor,name in RANKS:
@@ -152,7 +150,7 @@ async def need_captain(i):
     if t["captain_id"]!=str(i.user.id):await i.response.send_message("\u274c Captain only.",ephemeral=True);return False
     return t["display"]
 
-# ===== FA Views =====
+# ===== Views =====
 class FAButtonView(discord.ui.View):
     def __init__(self,tn,cid,gid,fa_ch):
         super().__init__(timeout=121);self.tn=tn;self.cid=cid;self.gid=gid;self.fa_ch=fa_ch;self.responded=set()
@@ -222,7 +220,7 @@ class RescheduleView(discord.ui.View):
         if str(i.user.id)!=self.ocid:await i.response.send_message("Other captain only.",ephemeral=True);return
         for c in self.children:c.disabled=True;await i.response.edit_message(content="Denied.",view=self)
 
-# ===== GEN MATCHES =====
+# ===== Gen Matches =====
 async def gen_matches(guild,c,force=False):
     gid=str(guild.id)
     async with aiosqlite.connect(DB)as db:
@@ -297,29 +295,28 @@ async def gen_matches(guild,c,force=False):
                 weeks_left=SEASON_WEEKS-week
                 ts_all=await teams_all(gid)
                 total_matches=sum(t["wins"]+t["losses"]for t in ts_all)//2
-                finals_note="\U0001f3c6 Finals next week! Top 4 teams advance."if weeks_left==0 else f"Top 4 by MMR advance to finals after Week {SEASON_WEEKS}."
+                finals_note="\U0001f3c6 Finals next week! Top 4 teams advance."if weeks_left==0 else f"Top 4 by rank advance to finals after Week {SEASON_WEEKS}."
                 await ann.send(f"\U0001f4ca **Season Update \u2014 Week {week}/{SEASON_WEEKS}**\n\nWeeks remaining: **{weeks_left}**\nMatches played: **{total_matches}**\nTeams in league: **{len(ts_all)}**\n\n{finals_note}")
     return len(match_ids)
 
 # ===== /guide =====
-@bot.tree.command(name="guide",description="Post the league guide in this channel (League Admin only)")
+@bot.tree.command(name="guide",description="Post the league guide (League Admin only)")
 async def guide_cmd(i):
     if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
     p1="\U0001f4d6 **EGL \u2014 Elite Goon League**\n"
-    p1+="Welcome to the EGL! This is our own community league for Elements Divided \u2014 a place to compete and have fun with friends.\n\n"
+    p1+="Welcome to the EGL! This is our own community league for Elements Divided.\n\n"
     p1+="\u2501"*22+"\n"
     p1+="\U0001f3ae **What is the EGL?**\n"
-    p1+="A 2v2 league we run ourselves for Elements Divided. Create or join a team of **up to 3 players**, fight other teams each week, and climb the leaderboard. You don\u2019t need a full team, but you can only use **1 Free Agent per match**. Top teams at the end of the season battle to become champion!\n\n"
+    p1+="A 2v2 league we run ourselves for Elements Divided. Create or join a team of **up to 3 players**, fight other teams each week, and climb the ranks. You don\u2019t need a full team, but you can only use **1 Free Agent per match**. Top teams at the end of the season battle to become champion!\n\n"
     p1+="\u2501"*22+"\n"
     p1+="\U0001f4c5 **How Matches Work**\n"
-    p1+="Every **Sunday at 10pm (UTC+2)** matches are generated. Each matchup gets a private thread so you can talk to the other team.\n\n"
+    p1+="Every **Sunday at 10pm (UTC+2)** matches are generated. Each matchup gets a private thread.\n\n"
     p1+="**Map Vote:** Both captains vote on Chessboard, Portal Mayhem, Construction Site, or Parking Lot.\n\n"
     p1+="\u2501"*22+"\n"
     p1+="\U0001f3c6 **Ranking System**\n"
-    p1+="Every team starts in **Lotus** rank.\n"
+    p1+="Every team starts in **Monk** rank.\n"
     p1+="Winning matches earns points to climb the ranks. Losing costs points.\n"
     p1+="**Ranks:** Adept \u2192 Lotus \u2192 Monk \u2192 Warden \u2192 Avatar \u2192 Raava\n"
-    p1+="If you had a team before, your new team starts at your old team\u2019s MMR.\n"
     p1+="Top 4 advance to Finals, then a Grand Final decides the champion!\n\n"
     p1+="\u23f1\ufe0f **24-Hour Cooldown:** Leave or disband a team? Wait 24 hours before joining or creating another.\n\n"
     p1+="\u2501"*22+"\n"
@@ -345,16 +342,15 @@ async def guide_cmd(i):
     p2+="`/reschedule 08 Aug 20:00` \u2014 Change time, other captain approves *(captain only)*\n"
     p2+="`/match report opponent:Name score:2-1` \u2014 Report result *(captain only)*\n\n"
     p2+="\U0001f4ca **Stats**\n"
-    p2+="`/stats team name:Name` \u2014 Team wins/losses/MMR\n"
+    p2+="`/stats team name:Name` \u2014 Team wins/losses/rank\n"
     p2+="`/league standings` \u2014 Full leaderboard\n"
     p2+="`/league status` \u2014 Weeks left + top 4\n\n"
     p2+="\u2501"*22+"\n"
     p2+="*Questions? Ask a **League Admin**. Good luck, Goons!*"
     await i.followup.send(p2)
 
-# ===== /setup =====
+# ===== /setup /setchannel /league /team /disband /teaminfo /captain /match /stats /fa /mmr /test /schedule /reschedule /backup /restore =====
 setup=app_commands.Group(name="setup",description="Bot setup")
-
 @setup.command(name="run",description="Create all league channels (League Admin only)")
 async def setup_run(i):
     if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
@@ -384,20 +380,8 @@ async def setup_run(i):
     async with aiosqlite.connect(DB)as db:
         await db.execute("INSERT INTO setup_data VALUES(?,?,?,?,?,?,?,?,?,?)",(gid,"EGL",str(lcat.id),str(mcat.id),str(ann.id),str(gen.id),str(tch.id),str(fa.id),str(mat.id),str(res.id)))
         await db.commit()
-    await i.followup.send(
-        "\u2694\ufe0f **Elite Goon League is live.**\n"
-        "All channels and permissions have been configured.\n\n"
-        f"{ann.mention} \u2014 Announcements\n"
-        f"{guide_ch.mention} \u2014 Player guide\n"
-        f"{gen.mention} \u2014 General chat\n"
-        f"{tch.mention} \u2014 Team threads\n"
-        f"{fa.mention} \u2014 Free agents\n"
-        f"{mat.mention} \u2014 Match schedule\n"
-        f"{res.mention} \u2014 Results\n\n"
-        "Run `/league create` to start your first season."
-    )
-
-@setup.command(name="reset",description="Delete all bot channels and reset (League Admin only)")
+    await i.followup.send("\u2694\ufe0f **Elite Goon League is live.**\nAll channels and permissions have been configured.\n\n" f"{ann.mention} \u2014 Announcements\n{guide_ch.mention} \u2014 Player guide\n{gen.mention} \u2014 General chat\n{tch.mention} \u2014 Team threads\n{fa.mention} \u2014 Free agents\n{mat.mention} \u2014 Match schedule\n{res.mention} \u2014 Results\n\nRun `/league create` to start your first season.")
+@setup.command(name="reset",description="Delete all bot channels and reset")
 async def setup_reset(i):
     if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
     gid=str(i.guild_id)
@@ -416,21 +400,17 @@ async def setup_reset(i):
             await cat.delete()
         except:pass
     async with aiosqlite.connect(DB)as db:await db.execute("DELETE FROM setup_data WHERE guild_id=?",(gid,));await db.commit()
-    await i.followup.send("\u2705 Reset complete. Run `/setup run` to start fresh.")
+    await i.followup.send("\u2705 Reset complete.")
 
-# ===== /setchannel =====
-@bot.tree.command(name="setchannel",description="Set the #teams channel for team threads (League Admin only)")
+@bot.tree.command(name="setchannel",description="Set #teams for team threads (League Admin only)")
 @app_commands.describe(channel="The #teams channel")
 async def setchannel(i,channel:discord.TextChannel):
     if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
-    gid=str(i.guild_id)
-    async with aiosqlite.connect(DB)as db:await db.execute("INSERT OR REPLACE INTO guild_settings VALUES(?,?)",(gid,str(channel.id)));await db.commit()
+    async with aiosqlite.connect(DB)as db:await db.execute("INSERT OR REPLACE INTO guild_settings VALUES(?,?)",(str(i.guild_id),str(channel.id)));await db.commit()
     await i.response.send_message(f"\u2705 Team threads: {channel.mention}.")
 
-# ===== /league =====
 league=app_commands.Group(name="league",description="League management")
-
-@league.command(name="create",description="Create a league season (League Admin)")
+@league.command(name="create",description="Create a season")
 @app_commands.describe(name="Season name")
 async def league_create(i,name:str):
     if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
@@ -438,34 +418,24 @@ async def league_create(i,name:str):
     if await cfg_get(gid):await i.response.send_message("\u274c League already exists. Use `/league delete` first.",ephemeral=True);return
     async with aiosqlite.connect(DB)as db:
         db.row_factory=aiosqlite.Row
-        async with db.execute("SELECT * FROM setup_data WHERE guild_id=?",(gid,))as cur:
-            sd=await cur.fetchone()
+        async with db.execute("SELECT * FROM setup_data WHERE guild_id=?",(gid,))as cur:sd=await cur.fetchone()
     if not sd:await i.response.send_message("\u274c Run `/setup run` first.",ephemeral=True);return
     sd=dict(sd)
     async with aiosqlite.connect(DB)as db:
         await db.execute("INSERT INTO config VALUES(?,?,?,?,?,?,?,?,?,?)",(gid,name,str(i.user.id),sd["announcements_ch"],sd["matches_ch"],sd["results_ch"],sd["general_ch"],sd["fa_ch"],sd["teams_ch"],datetime.now(timezone.utc).isoformat()))
         await db.execute("INSERT OR IGNORE INTO season VALUES(?,0,0)",(gid,));await db.commit()
-    await i.response.send_message(f"\u2694\ufe0f **{name}** season started!")
-    # Post announcement
+    end_date=datetime.now(timezone.utc)+timedelta(weeks=SEASON_WEEKS)
+    now=datetime.now(timezone.utc)
+    days_until_sunday=(6-now.weekday())%7
+    next_sunday=now.replace(hour=18,minute=0,second=0)+timedelta(days=days_until_sunday if days_until_sunday>0 else 0)
+    if days_until_sunday==0 and now.hour>=18:next_sunday+=timedelta(days=7)
+    sun_unix=int(next_sunday.replace(tzinfo=timezone.utc).timestamp())
     if sd.get("announcements_ch"):
         ann=i.guild.get_channel(int(sd["announcements_ch"]))
         if ann:
-            end_date=datetime.now(timezone.utc)+timedelta(weeks=SEASON_WEEKS)
-            now=datetime.now(timezone.utc)
-            days_until_sunday=(6-now.weekday())%7
-            next_sunday=now.replace(hour=18,minute=0,second=0)+timedelta(days=days_until_sunday if days_until_sunday>0 else 0)
-            if days_until_sunday==0 and now.hour>=18:next_sunday+=timedelta(days=7)
-            sun_unix=int(next_sunday.replace(tzinfo=timezone.utc).timestamp())
-            await ann.send(
-                f"\U0001f3c6 **{name}** has begun!\n\n"
-                f"\u2022 **{SEASON_WEEKS}-week season** \u2014 every team plays every other team\n"
-                f"\u2022 Matches generated **every Sunday at 10pm UTC+2** (<t:{sun_unix}:t> your time)\n"
-                f"\u2022 End of regular season: **{end_date.strftime('%d %b %Y')}**\n"
-                f"\u2022 Top 4 advance to Finals, then Grand Final\n\n"
-                f"Good luck, Goons!"
-            )
-
-@league.command(name="delete",description="Delete (League Admin)")
+            await ann.send(f"\U0001f3c6 **{name}** has begun!\n\n\u2022 **{SEASON_WEEKS}-week season** \u2014 every team plays every other team\n\u2022 Matches generated **every Sunday at 10pm UTC+2** (<t:{sun_unix}:t> your time)\n\u2022 End of regular season: **{end_date.strftime('%d %b %Y')}**\n\u2022 Top 4 advance to Finals, then Grand Final\n\nGood luck, Goons!")
+    await i.response.send_message(f"\u2694\ufe0f **{name}** season started!")
+@league.command(name="delete",description="Delete league")
 async def league_delete(i):
     if not await need_admin(i):return
     gid=str(i.guild_id);c=await cfg_get(gid)
@@ -473,60 +443,51 @@ async def league_delete(i):
         for tbl in("config","teams","members","fa","matches","season"):await db.execute(f"DELETE FROM {tbl} WHERE guild_id=?",(gid,))
         await db.commit()
     await i.response.send_message(f"\U0001f5d1\ufe0f **{c['name']}** deleted.")
-
-@league.command(name="standings",description="MMR leaderboard")
+@league.command(name="standings",description="Leaderboard")
 async def league_standings(i):
     if not await need_league(i):return
     ts=sorted(await teams_all(str(i.guild_id)),key=lambda x:x["mmr"],reverse=True)
     if not ts:await i.response.send_message("No teams!");return
     medals=["\U0001f947","\U0001f948","\U0001f949"]
-    lines=["**\u2694\ufe0f Standings**",""]+[f"{medals[n]if n<3 else str(n+1)+'.'} **{t['display']}** — {t['wins']}W/{t['losses']}L — **{get_rank(t['mmr'])}**"for n,t in enumerate(ts)]
+    lines=["**\u2694\ufe0f Standings**",""]+[f"{medals[n]if n<3 else str(n+1)+'.'} **{t['display']}** \u2014 {t['wins']}W/{t['losses']}L \u2014 **{get_rank(t['mmr'])}**"for n,t in enumerate(ts)]
     await i.response.send_message("\n".join(lines))
-
 @league.command(name="info",description="League info")
 async def league_info(i):
     if not await need_league(i):return
     c=await cfg_get(str(i.guild_id));ts=await teams_all(str(i.guild_id))
-    await i.response.send_message(f"\u2694\ufe0f **{c['name']}**\nTeams:{len(ts)}|{SEASON_WEEKS}w\n<#{c['announcements_ch']}> <#{c['matches_ch']}> <#{c['results_ch']}> <#{c['general_ch']}> <#{c['fa_ch']}> <#{c['teams_ch']}>")
-
-@league.command(name="finals",description="Start Top-4 round-robin finals (League Admin)")
+    await i.response.send_message(f"\u2694\ufe0f **{c['name']}**\nTeams:{len(ts)}|{SEASON_WEEKS}w")
+@league.command(name="finals",description="Start Top-4 finals")
 async def league_finals(i):
     if not await need_admin(i):return
     gid=str(i.guild_id);c=await cfg_get(gid)
     if not c:await i.response.send_message("\u274c No league.",ephemeral=True);return
     async with aiosqlite.connect(DB)as db:
         db.row_factory=aiosqlite.Row
-        async with db.execute("SELECT finals_generated FROM season WHERE guild_id=?",(gid,))as cur:
-            row=await cur.fetchone()
+        async with db.execute("SELECT finals_generated FROM season WHERE guild_id=?",(gid,))as cur:row=await cur.fetchone()
     if row and row["finals_generated"]:await i.response.send_message("\u274c Already started.",ephemeral=True);return
     ts=sorted(await teams_all(gid),key=lambda x:x["mmr"],reverse=True)[:4]
     if len(ts)<4:await i.response.send_message(f"\u274c Need 4 teams, have {len(ts)}.",ephemeral=True);return
     names=[t["display"]for t in ts]
     pairs=[(names[x],names[y])for x in range(4)for y in range(x+1,4)]
     async with aiosqlite.connect(DB)as db:
-        for a,b in pairs:
-            await db.execute("INSERT INTO matches VALUES(?,?,0,?,?,NULL,NULL,NULL,?,NULL,1,NULL,NULL,NULL,NULL)",(str(uuid.uuid4())[:8],gid,a,b,datetime.now(timezone.utc).isoformat()))
+        for a,b in pairs:await db.execute("INSERT INTO matches VALUES(?,?,0,?,?,NULL,NULL,NULL,?,NULL,1,NULL,NULL,NULL,NULL)",(str(uuid.uuid4())[:8],gid,a,b,datetime.now(timezone.utc).isoformat()))
         await db.execute("UPDATE season SET finals_generated=1 WHERE guild_id=?",(gid,));await db.commit()
     ch=i.guild.get_channel(int(c["matches_ch"]))
     if ch:
         seed_txt="\n".join(f"{n+1}. **{nm}**"for n,nm in enumerate(names))
         match_txt="\n".join(f"Match {n+1}: **{a}** vs **{b}**"for n,(a,b)in enumerate(pairs))
-        await ch.send(f"\U0001f3c6 **TOP 4 FINALS \u2014 Round Robin**\n\nSeedings:\n{seed_txt}\n\nMatches:\n{match_txt}\n\nAfter all 6 matches, use `/league grandfinal` to generate the Grand Final!")
+        await ch.send(f"\U0001f3c6 **TOP 4 FINALS**\n\nSeedings:\n{seed_txt}\n\nMatches:\n{match_txt}\n\nAfter all 6 matches, use `/league grandfinal`!")
     ann=i.guild.get_channel(int(c["announcements_ch"]))if c.get("announcements_ch")else None
-    if ann:
-        seed_txt="\n".join(f"{n+1}. **{nm}**"for n,nm in enumerate(names))
-        await ann.send(f"\U0001f3c6 **The Top 4 Finals have begun!**\n\nTop 4:\n{seed_txt}\n\nCheck <#{c['matches_ch']}> for the schedule!")
-    await i.response.send_message(f"\U0001f3c6 Finals started! {len(pairs)} round-robin matches in <#{c['matches_ch']}>.")
-
-@league.command(name="grandfinal",description="Generate Grand Final (League Admin)")
+    if ann:await ann.send(f"\U0001f3c6 **The Top 4 Finals have begun!**\n\nTop 4:\n{seed_txt}\n\nCheck <#{c['matches_ch']}> for the schedule!")
+    await i.response.send_message(f"\U0001f3c6 Finals started! {len(pairs)} matches in <#{c['matches_ch']}>.")
+@league.command(name="grandfinal",description="Generate Grand Final")
 async def league_grandfinal(i):
     if not await need_admin(i):return
     gid=str(i.guild_id);c=await cfg_get(gid)
     if not c:await i.response.send_message("\u274c No league.",ephemeral=True);return
     async with aiosqlite.connect(DB)as db:
         db.row_factory=aiosqlite.Row
-        async with db.execute("SELECT team1,team2,winner FROM matches WHERE guild_id=? AND is_finals=1 AND winner IS NOT NULL",(gid,))as c2:
-            results=await c2.fetchall()
+        async with db.execute("SELECT team1,team2,winner FROM matches WHERE guild_id=? AND is_finals=1 AND winner IS NOT NULL",(gid,))as c2:results=await c2.fetchall()
     if not results:await i.response.send_message("\u274c No finals results yet.",ephemeral=True);return
     wins={}
     for r in results:
@@ -535,37 +496,29 @@ async def league_grandfinal(i):
     if len(wins)<2:await i.response.send_message("\u274c Not enough results.",ephemeral=True);return
     top2=sorted(wins.items(),key=lambda x:x[1],reverse=True)[:2]
     t1,t2=top2[0][0],top2[1][0]
-    mid=str(uuid.uuid4())[:8]
     async with aiosqlite.connect(DB)as db:
-        await db.execute("INSERT INTO matches VALUES(?,?,0,?,?,NULL,NULL,NULL,?,NULL,2,NULL,NULL,NULL,NULL)",(mid,gid,t1,t2,datetime.now(timezone.utc).isoformat()))
+        await db.execute("INSERT INTO matches VALUES(?,?,0,?,?,NULL,NULL,NULL,?,NULL,2,NULL,NULL,NULL,NULL)",(str(uuid.uuid4())[:8],gid,t1,t2,datetime.now(timezone.utc).isoformat()))
         await db.commit()
     ch=i.guild.get_channel(int(c["matches_ch"]))
     if ch:await ch.send(f"\U0001f3c6\U0001f525 **GRAND FINAL**\n\n**{t1}** vs **{t2}**\n\nMay the best team win!")
-    ann=i.guild.get_channel(int(c["announcements_ch"]))if c.get("announcements_ch")else None
-    if ann:
-        board="\n".join(f"**{t}**: {w} win{'s'if w!=1 else''}"for t,w in sorted(wins.items(),key=lambda x:x[1],reverse=True))
-        await ann.send(f"\U0001f3c6\U0001f525 **GRAND FINAL** \u2014 **{t1}** vs **{t2}**!\n\nRound-robin standings:\n{board}")
     await i.response.send_message(f"\U0001f3c6 Grand Final: **{t1}** vs **{t2}**!")
-
-@league.command(name="status",description="Show season progress")
+@league.command(name="status",description="Season progress")
 async def league_status(i):
     if not await need_league(i):return
     gid=str(i.guild_id)
     async with aiosqlite.connect(DB)as db:
         db.row_factory=aiosqlite.Row
-        async with db.execute("SELECT weeks_done FROM season WHERE guild_id=?",(gid,))as cur:
-            row=await cur.fetchone()
+        async with db.execute("SELECT weeks_done FROM season WHERE guild_id=?",(gid,))as cur:row=await cur.fetchone()
     weeks_done=row["weeks_done"]if row else 0
     weeks_left=max(0,SEASON_WEEKS-weeks_done)
     ts=await teams_all(gid)
     total_matches=sum(t["wins"]+t["losses"]for t in ts)//2
     sorted_ts=sorted(ts,key=lambda x:x["mmr"],reverse=True)
-    board="\n".join(f"{n+1}. **{t['display']}** \u2014 {t['wins']}W/{t['losses']}L — **{get_rank(t['mmr'])}**"for n,t in enumerate(sorted_ts[:4]))
+    board="\n".join(f"{n+1}. **{t['display']}** \u2014 {t['wins']}W/{t['losses']}L \u2014 **{get_rank(t['mmr'])}**"for n,t in enumerate(sorted_ts[:4]))
     await i.response.send_message(f"\U0001f4ca **Season Status**\n\nWeek: **{weeks_done}/{SEASON_WEEKS}**\nWeeks left: **{weeks_left}**\nMatches played: **{total_matches}**\nTeams: **{len(ts)}**\n\n**Current Top 4:**\n{board}")
 
 bot.tree.add_command(league)
 
-# ===== /team =====
 class InviteView(discord.ui.View):
     def __init__(s,iid,tn,cid,gid):super().__init__(timeout=86400);s.iid=iid;s.tn=tn;s.cid=cid;s.gid=gid
     @discord.ui.button(label="\u2705 Accept",style=discord.ButtonStyle.green)
@@ -591,7 +544,6 @@ class InviteView(discord.ui.View):
         for c in s.children:c.disabled=True;await i.response.edit_message(content="\u274c Declined.",view=s)
 
 team=app_commands.Group(name="team",description="Team management")
-
 @team.command(name="create",description="Create team")
 @app_commands.describe(name="Team name")
 async def team_create(i,name:str):
@@ -604,7 +556,6 @@ async def team_create(i,name:str):
     async with aiosqlite.connect(DB)as db:await db.execute("INSERT INTO teams VALUES(?,?,?,?,0,0,?,NULL,NULL,?)",(gid,name.lower(),name,uid,start_mmr,datetime.now(timezone.utc).isoformat()));await db.execute("INSERT INTO members VALUES(?,?,?)",(gid,name.lower(),uid));await db.execute("DELETE FROM fa WHERE guild_id=? AND user_id=?",(gid,uid));await db.commit()
     c=await cfg_get(gid);tr=await add_roles(i.guild,i.user,name,captain=True)
     role_id=str(tr.id)if tr else None;thread_id=None
-    # Priority: league config > setup_data > guild_settings > current channel
     target_ch=None
     if c and c.get("teams_ch"):
         try:target_ch=await i.guild.fetch_channel(int(c["teams_ch"]))
@@ -617,19 +568,16 @@ async def team_create(i,name:str):
         if sd and sd[0]:
             try:target_ch=await i.guild.fetch_channel(int(sd[0]))
             except:pass
-    if target_ch is None and isinstance(i.channel,discord.TextChannel):
-        target_ch=i.channel
+    if target_ch is None and isinstance(i.channel,discord.TextChannel):target_ch=i.channel
     if isinstance(target_ch,discord.TextChannel):
         try:
-            unique_name=name
-            th=await target_ch.create_thread(name=unique_name,type=discord.ChannelType.private_thread,auto_archive_duration=10080)
+            th=await target_ch.create_thread(name=name,type=discord.ChannelType.private_thread,auto_archive_duration=10080)
             thread_id=str(th.id);await th.add_user(i.user)
             await th.send(f"\u2694\ufe0f **{name}** thread!\nCaptain:{i.user.mention}\n`/team invite @player`")
         except Exception as e:log.warning("THREAD ERROR: %s",e)
     async with aiosqlite.connect(DB)as db:await db.execute("UPDATE teams SET role_id=?,thread_id=? WHERE guild_id=? AND name=?",(role_id,thread_id,gid,name.lower()));await db.commit()
     extra=f"\n\U0001f4cc <#{thread_id}>"if thread_id else""
     await i.followup.send(f"\u2694\ufe0f **{name}** created!\nCaptain:{i.user.mention}|Rank:{get_rank(start_mmr)}|1/{MAX_TEAM}{extra}")
-
 @team.command(name="invite",description="Invite (captain)")
 @app_commands.describe(player="Player")
 async def team_invite(i,player:discord.Member):
@@ -642,7 +590,6 @@ async def team_invite(i,player:discord.Member):
     c=await cfg_get(gid);teams_ch=c.get("teams_ch")if c else None;view=InviteView(player.id,d,i.user.id,gid)
     if teams_ch and(ch:=i.guild.get_channel(int(teams_ch))):await ch.send(f"\U0001f4e8 {player.mention} invited to **{d}** by {i.user.mention}!",view=view);await i.response.send_message(f"\u2705 Sent in {ch.mention}.",ephemeral=True)
     else:await i.response.send_message(f"\U0001f4e8 {player.mention} invited to **{d}**!",view=view)
-
 @team.command(name="kick",description="Kick (captain)")
 @app_commands.describe(player="Player")
 async def team_kick(i,player:discord.Member):
@@ -662,16 +609,14 @@ async def team_kick(i,player:discord.Member):
             try:await th.remove_user(player)
             except:pass
     await i.followup.send(f"\U0001f9b5 **{player.display_name}** has been kicked.")
-
 @team.command(name="roster",description="Show roster")
 @app_commands.describe(team="Team (blank=yours)")
 async def team_roster(i,team:str=None):
     gid=str(i.guild_id);t=await team_get(gid,team)if team else await team_by_player(gid,str(i.user.id))
     if not t:await i.response.send_message("\u274c Not found.",ephemeral=True);return
     crown="\U0001f451";players="\n".join(f"\u2022 <@{m}> {crown if m==t['captain_id']else''}"for m in t["members"])
-    await i.response.send_message(f"\u2694\ufe0f **{t['display']}** {t['wins']}W/{t['losses']}L — **{get_rank(t['mmr'])}**\n\n**Players ({len(t['members'])}/{MAX_TEAM}):**\n{players}")
-
-@team.command(name="leave",description="Leave (players only — captains use /disband)")
+    await i.response.send_message(f"\u2694\ufe0f **{t['display']}** {t['wins']}W/{t['losses']}L \u2014 **{get_rank(t['mmr'])}**\n\n**Players ({len(t['members'])}/{MAX_TEAM}):**\n{players}")
+@team.command(name="leave",description="Leave (players only)")
 async def team_leave(i):
     gid=str(i.guild_id);uid=str(i.user.id);t=await team_by_player(gid,uid)
     if not t:await i.response.send_message("\u274c Not on team.",ephemeral=True);return
@@ -686,10 +631,8 @@ async def team_leave(i):
             try:await th.remove_user(i.user)
             except:pass
     await i.followup.send(f"\U0001f44b Left **{t['display']}**.")
-
 bot.tree.add_command(team)
 
-# ===== /disband =====
 @bot.tree.command(name="disband",description="Disband your team (captain only)")
 async def disband(i):
     d=await need_captain(i)
@@ -713,7 +656,6 @@ async def disband(i):
     async with aiosqlite.connect(DB)as db:await db.execute("DELETE FROM members WHERE guild_id=? AND team_name=?",(gid,t["name"]));await db.execute("DELETE FROM teams WHERE guild_id=? AND name=?",(gid,t["name"]));await db.commit()
     await i.followup.send(f"\U0001f5d1\ufe0f **{t['display']}** disbanded.")
 
-# ===== /teaminfo =====
 @bot.tree.command(name="teaminfo",description="Team info")
 @app_commands.describe(team="Team name")
 async def teaminfo(i,team:str):
@@ -723,7 +665,6 @@ async def teaminfo(i,team:str):
     crown="\U0001f451";players="\n".join(f"\u2022 <@{m}> {crown if m==t['captain_id']else''}"for m in t["members"])
     await i.response.send_message(f"\u2694\ufe0f **{t['display']}**\nRank:**{get_rank(t['mmr'])}**|{t['wins']}W/{t['losses']}L|WR:{wr}\n\n**Players ({len(t['members'])}/{MAX_TEAM}):**\n{players}")
 
-# ===== /captain /match /stats /fa /mmr /test /schedule /reschedule =====
 cap=app_commands.Group(name="captain",description="Captain")
 @cap.command(name="swap",description="Transfer captain")
 @app_commands.describe(player="New captain")
@@ -754,7 +695,6 @@ async def match_report(i,opponent:str,score:str):
     try:our,their=map(int,score.strip().split("-"))
     except:await i.response.send_message("\u274c 2-1",ephemeral=True);return
     won=our>their;winner=d if won else opp["display"]
-    # Dynamic MMR based on ELO difference
     my_t=await team_get(gid,d);opp_t=await team_get(gid,opp["name"])
     my_mmr=int(my_t["mmr"]);opp_mmr=int(opp_t["mmr"])
     if my_mmr==opp_mmr:expected=0.5
@@ -837,22 +777,22 @@ async def fa_request(i):
     if fa_ch_id and(ch:=i.guild.get_channel(int(fa_ch_id))):
         pings=' '.join(f'<@{p["user_id"]}>'for p in pool)
         msg=await ch.send(f"\U0001f4e2 **{d}** needs a sub! (2 min)\n{pings}",view=view);view.msg=msg
-        await i.response.send_message(f"\u2705 Posted in {ch.mention}. Check DMs.",ephemeral=True)
+        await i.response.send_message(f"\u2705 Posted in {ch.mention}.",ephemeral=True)
     else:
         pings=' '.join(f'<@{p["user_id"]}>'for p in pool)
         msg=await i.response.send_message(f"\U0001f4e2 **{d}** needs sub!\n{pings}",view=view);view.msg=(await i.original_response())
 bot.tree.add_command(fa)
 
 mmr=app_commands.Group(name="mmr",description="MMR (Admin)")
-@mmr.command(name="adjust",description="Adjust MMR")
-@app_commands.describe(team="Team",amount="+/- N")
+@mmr.command(name="adjust",description="Adjust rank (admin)")
+@app_commands.describe(team="Team",amount="+/- change")
 async def mmr_adjust(i,team:str,amount:int):
     if not await need_admin(i):return
     gid=str(i.guild_id);t=await team_get(gid,team)
     if not t:await i.response.send_message("\u274c Not found.",ephemeral=True);return
     old=t["mmr"];new=old+amount
     async with aiosqlite.connect(DB)as db:await db.execute("UPDATE teams SET mmr=? WHERE guild_id=? AND name=?",(new,gid,t["name"]));await db.commit()
-    await i.response.send_message(f"\U0001f4ca **{t['display']}** MMR:{old}\u2192{new} ({'+'if amount>=0 else''}{amount})")
+    await i.response.send_message(f"\U0001f4ca **{t['display']}** Rank:{get_rank(old)}\u2192{get_rank(new)}")
 bot.tree.add_command(mmr)
 
 test=app_commands.Group(name="test",description="Test (Admin)")
@@ -876,7 +816,7 @@ async def schedule_cmd(i,datetime_str:str):
     async with aiosqlite.connect(DB)as db:await db.execute("UPDATE matches SET scheduled=? WHERE thread_id=?",(sched,str(i.channel.id)));await db.commit()
     await i.response.send_message(f"\U0001f4c5 Scheduled: **{sched}**\n\U0001f550 Your time: <t:{unix}:f>")
 
-@bot.tree.command(name="reschedule",description="Reschedule — other captain approves")
+@bot.tree.command(name="reschedule",description="Reschedule (other captain approves)")
 @app_commands.describe(datetime_str=SCHED_HELP)
 async def reschedule_cmd(i,datetime_str:str):
     if not isinstance(i.channel,discord.Thread):await i.response.send_message("\u274c Match threads only.",ephemeral=True);return
@@ -887,8 +827,7 @@ async def reschedule_cmd(i,datetime_str:str):
     except:await i.response.send_message(f"\u274c Format: `{SCHED_HELP}`",ephemeral=True);return
     async with aiosqlite.connect(DB)as db:
         db.row_factory=aiosqlite.Row
-        async with db.execute("SELECT * FROM matches WHERE thread_id=? AND guild_id=?",(str(i.channel.id),gid))as cur:
-            row=await cur.fetchone()
+        async with db.execute("SELECT * FROM matches WHERE thread_id=? AND guild_id=?",(str(i.channel.id),gid))as cur:row=await cur.fetchone()
     if not row:await i.response.send_message("\u274c No match here.",ephemeral=True);return
     row=dict(row);mt=await team_by_player(gid,str(i.user.id))
     if not mt:await i.response.send_message("\u274c Not on team.",ephemeral=True);return
@@ -899,7 +838,26 @@ async def reschedule_cmd(i,datetime_str:str):
     v=RescheduleView(ot["captain_id"],nt,row["id"],gid)
     await i.response.send_message(f"\U0001f4c5 {i.user.mention} wants **{nt}** (<t:{unix}:f>).\n{oc.mention} approve?",view=v)
 
-# ===== SCHEDULER =====
+@bot.tree.command(name="backup",description="Download league database backup (League Admin only)")
+async def backup_cmd(i):
+    if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
+    await i.response.defer(ephemeral=True)
+    try:
+        file=discord.File(DB,filename="league_backup.db")
+        await i.user.send("\U0001f4be **EGL League Database Backup**\nThe attached file contains all your league data: teams, ranks, matches, and settings.\n\n**How to restore after a Railway redeploy:**\n1. Wait for the bot to come back online\n2. Use `/restore` and attach this file\n3. Everything will be restored instantly!\n\n**Tip:** Always `/backup` before pushing new code to GitHub.",file=file)
+        await i.followup.send("\u2705 Backup sent to your DMs!",ephemeral=True)
+    except:await i.followup.send("\u274c Couldn\u2019t DM you. Enable DMs from server members.",ephemeral=True)
+
+@bot.tree.command(name="restore",description="Restore the league database (League Admin only)")
+@app_commands.describe(file="The league_backup.db file")
+async def restore_cmd(i,file:discord.Attachment):
+    if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
+    if not file.filename.endswith(".db"):await i.response.send_message("\u274c Must be a .db file.",ephemeral=True);return
+    await i.response.defer(ephemeral=True)
+    await file.save(DB)
+    await i.followup.send("\u2705 Database restored!",ephemeral=True)
+
+# ===== Scheduler =====
 @tasks.loop(hours=1)
 async def weekly_check():
     now=datetime.now(timezone.utc)
@@ -907,7 +865,6 @@ async def weekly_check():
     for g in bot.guilds:
         c=await cfg_get(str(g.id))
         if c:await gen_matches(g,c)
-
 @weekly_check.before_loop
 async def bef():await bot.wait_until_ready()
 
@@ -915,7 +872,6 @@ async def bef():await bot.wait_until_ready()
 async def on_guild_join(guild):
     bot.tree.copy_global_to(guild=guild)
     await bot.tree.sync(guild=guild)
-    # Create required roles if they don't exist
     required=[
         (ADMIN_ROLE,discord.Color.red()),
         ("Captain",discord.Color.yellow()),
@@ -942,36 +898,7 @@ async def on_ready():
 
 bot.tree.add_command(setup)
 
-# ===== /backup & /restore =====
-@bot.tree.command(name="backup",description="Download a backup of the league database (League Admin only)")
-async def backup_cmd(i):
-    if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
-    await i.response.defer(ephemeral=True)
-    try:
-        file=discord.File(DB,filename="league_backup.db")
-        await i.user.send(
-            "\U0001f4be **EGL League Database Backup**\n"
-            "The attached file contains all your league data: teams, MMR, matches, and settings.\n\n"
-            "**How to restore after a Railway redeploy:**\n"
-            "1. Wait for the bot to come back online after the redeploy\n"
-            "2. Go to your Discord server\n"
-            "3. Use `/restore` and attach this file (`league_backup.db`)\n"
-            "4. Everything will be restored instantly!\n\n"
-            "**Tip:** Always `/backup` before pushing new code to GitHub.",
-            file=file
-        )
-        await i.followup.send("\u2705 Backup sent to your DMs!",ephemeral=True)
-    except:await i.followup.send("\u274c Couldn\u2019t DM you. Enable DMs from server members.",ephemeral=True)
-
-@bot.tree.command(name="restore",description="Restore the league database from a backup file (League Admin only)")
-@app_commands.describe(file="The league_backup.db file")
-async def restore_cmd(i,file:discord.Attachment):
-    if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
-    if not file.filename.endswith(".db"):await i.response.send_message("\u274c Must be a .db file.",ephemeral=True);return
-    await i.response.defer(ephemeral=True)
-    await file.save(DB)
-    await i.followup.send("\u2705 Database restored! Restarting connection...",ephemeral=True)
-
 if __name__=="__main__":
     if not TOKEN:print("\n\u274c Set DISCORD_BOT_TOKEN!\n")
     else:bot.run(TOKEN)
+
