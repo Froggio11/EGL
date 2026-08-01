@@ -9,7 +9,7 @@ from discord.ext import commands,tasks
 logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(message)s")
 log=logging.getLogger(__name__)
 TOKEN=os.environ.get("DISCORD_BOT_TOKEN","")
-DB="league.db";DEFAULT_MMR=1000;MAX_TEAM=4;SEASON_WEEKS=8
+DB="league.db";DEFAULT_MMR=1000;MAX_TEAM=3;SEASON_WEEKS=8
 ADMIN_ROLE="League Admin";TESTER_ROLE="EGL Tester"
 MAPS=["Chessboard","Portal Mayhem","Construction Site","Parking Lot"]
 SCHED_FMT="%d %b %H:%M";SCHED_HELP="DD Mon HH:MM (e.g. 05 Aug 19:00)"
@@ -302,7 +302,7 @@ async def guide_cmd(i):
     p1+="Welcome to the EGL! This is our own community league for Elements Divided \u2014 a place to compete and have fun with friends.\n\n"
     p1+="\u2501"*22+"\n"
     p1+="\U0001f3ae **What is the EGL?**\n"
-    p1+="A 3v3 league we run ourselves for Elements Divided. Create or join a team of **up to 4 players**, fight other teams each week, and climb the leaderboard. You don\u2019t need a full team, but you can only use **1 Free Agent per match**. Top teams at the end of the season battle to become champion!\n\n"
+    p1+="A 2v2 league we run ourselves for Elements Divided. Create or join a team of **up to 3 players**, fight other teams each week, and climb the leaderboard. You don\u2019t need a full team, but you can only use **1 Free Agent per match**. Top teams at the end of the season battle to become champion!\n\n"
     p1+="\u2501"*22+"\n"
     p1+="\U0001f4c5 **How Matches Work**\n"
     p1+="Every **Sunday at 10pm (UTC+2)** matches are generated. Each matchup gets a private thread so you can talk to the other team.\n\n"
