@@ -286,30 +286,8 @@ async def update_scrim_embed(gid,date):
     except:pass
 
 async def create_scrim_thread(gid,date):
-    session=await get_scrim_session(gid,date)
-    if not session:return
-    g=bot.get_guild(int(gid))
-    if not g:return
-    members=await scrim_signups_active(gid,date)
-    if not members:return
-    msc=None
-    for cat in g.categories:
-        if cat.name=="Scrims":
-            for ch in cat.text_channels:
-                if ch.name=="mixed-scrims":msc=ch;break
-    if not msc:return
-    try:
-        th=await msc.create_thread(name=f"Mixed Scrim {date}",type=discord.ChannelType.private_thread,auto_archive_duration=4320)
-        added=[]
-        for uid in members[:6]:
-            m=g.get_member(int(uid))
-            if m:
-                try:await th.add_user(m);added.append(m.mention)
-                except:pass
-        await th.send(f"\U0001f3ae **Mixed Scrim Thread**\n\nPlayers: {' '.join(added)}\n\nTeams: make your own teams in-game! 3v3 or 2v2. Have fun!")
-        async with aiosqlite.connect(DB)as db:
-            await db.execute("UPDATE scrim_sessions SET thread_id=? WHERE guild_id=? AND date=?",(str(th.id),gid,date));await db.commit()
-    except Exception as e:log.warning("Scrim thread: %s",e)
+    # Not used — scrim threads removed
+    pass
 
 class RescheduleView(discord.ui.View):
     def __init__(self,ocid,nt,mid,gid):
@@ -1020,7 +998,7 @@ async def weekly_check():
 @weekly_check.before_loop
 async def bef():await bot.wait_until_ready()
 
-@tasks.loop(minutes=30)
+@tasks.loop(minutes=1)
 async def scrim_check():
     now=datetime.now(timezone.utc)
     hour=now.hour;minute=now.minute;today=now.strftime("%Y-%m-%d")
@@ -1048,11 +1026,7 @@ async def scrim_check():
             async with aiosqlite.connect(DB)as db:
                 await db.execute("INSERT OR REPLACE INTO scrim_sessions VALUES(?,?,NULL,?)",(gid,today,str(msg.id)));await db.commit()
         # 8pm = 18:00 UTC
-        elif hour==18 and minute<30:
-            session=await get_scrim_session(gid,today)
-            if session and not session.get("thread_id"):
-                await create_scrim_thread(gid,today)
-        # Midnight cleanup
+        elif hour==18 and minute==55:
         elif hour==0 and minute<30:
             async with aiosqlite.connect(DB)as db:
                 await db.execute("DELETE FROM scrim_signups WHERE guild_id=? AND date<?",(gid,today))
