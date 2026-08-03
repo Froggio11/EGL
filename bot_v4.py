@@ -1025,12 +1025,13 @@ async def scrim_check():
             msg=await msc.send(embed=embed,view=view)
             async with aiosqlite.connect(DB)as db:
                 await db.execute("INSERT OR REPLACE INTO scrim_sessions VALUES(?,?,NULL,?)",(gid,today,str(msg.id)));await db.commit()
-        # 8pm = 18:00 UTC
+        # 8pm = 18:00 UTC — 5-min ping
         elif hour==18 and minute==55:
-        elif hour==0 and minute<30:
-            async with aiosqlite.connect(DB)as db:
-                await db.execute("DELETE FROM scrim_signups WHERE guild_id=? AND date<?",(gid,today))
-                await db.execute("DELETE FROM scrim_sessions WHERE guild_id=? AND date<?",(gid,today));await db.commit()
+            members=await scrim_signups_active(gid,today)
+            if members:
+                pings=" ".join(f"<@{uid}>"for uid in members)
+                await msc.send(f"\U0001f514 Scrim starts in 5 minutes! {pings}")
+        # Midnight cleanup
 
 @scrim_check.before_loop
 async def scrim_bef():await bot.wait_until_ready()
