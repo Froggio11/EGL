@@ -29,6 +29,8 @@ async def init_db():
         CREATE TABLE IF NOT EXISTS player_history(guild_id TEXT,user_id TEXT,last_mmr INT DEFAULT 1000,cooldown_until TEXT,PRIMARY KEY(guild_id,user_id));
         CREATE TABLE IF NOT EXISTS guild_settings(guild_id TEXT PRIMARY KEY,teams_ch TEXT);
         CREATE TABLE IF NOT EXISTS setup_data(guild_id TEXT PRIMARY KEY,league_name TEXT,league_category_id TEXT,matches_category_id TEXT,announcements_ch TEXT,general_ch TEXT,teams_ch TEXT,fa_ch TEXT,matches_ch TEXT,results_ch TEXT);
+        CREATE TABLE IF NOT EXISTS scrim_sessions(guild_id TEXT,date TEXT,thread_id TEXT,msg_id TEXT,PRIMARY KEY(guild_id,date));
+        CREATE TABLE IF NOT EXISTS scrim_signups(guild_id TEXT,date TEXT,user_id TEXT,position INT,PRIMARY KEY(guild_id,date,user_id));
         """)
         await db.commit()
 
@@ -72,7 +74,26 @@ async def fa_all(gid):
         async with db.execute("SELECT user_id,username FROM fa WHERE guild_id=?",(gid,))as c:
             return[{"user_id":r[0],"username":r[1]}for r in await c.fetchall()]
 
-async def get_player_mmr(gid,uid):
+async def get_scrim_session(gid,date):
+    async with aiosqlite.connect(DB)as db:
+        db.row_factory=aiosqlite.Row
+        async with db.execute("SELECT * FROM scrim_sessions WHERE guild_id=? AND date=?",(gid,date))as c:
+            r=await c.fetchone();return dict(r)if r else None
+
+async def scrim_signup_count(gid,date):
+    async with aiosqlite.connect(DB)as db:
+        async with db.execute("SELECT COUNT(*) FROM scrim_signups WHERE guild_id=? AND date=?",(gid,date))as c:
+            r=await c.fetchone();return r[0]if r else 0
+
+async def scrim_signups_active(gid,date):
+    async with aiosqlite.connect(DB)as db:
+        async with db.execute("SELECT user_id FROM scrim_signups WHERE guild_id=? AND date=? ORDER BY position ASC LIMIT 6",(gid,date))as c:
+            return[r[0]for r in await c.fetchall()]
+
+async def scrim_next_queue(gid,date):
+    async with aiosqlite.connect(DB)as db:
+        async with db.execute("SELECT user_id FROM scrim_signups WHERE guild_id=? AND date=? AND position>=6 ORDER BY position ASC LIMIT 1",(gid,date))as c:
+            r=await c.fetchone();return r[0]if r else None
     async with aiosqlite.connect(DB)as db:
         async with db.execute("SELECT last_mmr FROM player_history WHERE guild_id=? AND user_id=?",(gid,uid))as c:
             r=await c.fetchone();return r[0]if r else DEFAULT_MMR
@@ -205,6 +226,88 @@ class FASelectView(discord.ui.View):
                 try:await th.add_user(p);await th.send(f"\U0001f44b {p.mention} is subbing for **{t['display']}** this match!")
                 except:pass
         if self.fa_ch and(ch:=g.get_channel(int(self.fa_ch))):await ch.send(f"\u2705 {p.mention} subbing for **{self.tn}**!")
+
+class ScrimSignupView(discord.ui.View):
+    def __init__(self,gid,date):
+        super().__init__(timeout=None);self.gid=gid;self.date=date
+    @discord.ui.button(label="Sign Up",style=discord.ButtonStyle.green,emoji="\u2795")
+    async def signup(self,i,btn):
+        gid=self.gid;date=self.date;uid=str(i.user.id)
+        count=await scrim_signup_count(gid,date)
+        async with aiosqlite.connect(DB)as db:
+            await db.execute("INSERT OR IGNORE INTO scrim_signups VALUES(?,?,?,?)",(gid,date,uid,count));await db.commit()
+        status="Active"if count<6 else f"Queue (#{count-5})"
+        await i.response.send_message(f"\u2705 Signed up! ({count+1}/6 active) {status}",ephemeral=True)
+        await update_scrim_embed(gid,date)
+    @discord.ui.button(label="Leave",style=discord.ButtonStyle.red,emoji="\u274c")
+    async def leave(self,i,btn):
+        gid=self.gid;date=self.date;uid=str(i.user.id)
+        async with aiosqlite.connect(DB)as db:
+            async with db.execute("SELECT position FROM scrim_signups WHERE guild_id=? AND date=? AND user_id=?",(gid,date,uid))as c:
+                r=await c.fetchone()
+            if not r:await i.response.send_message("\u274c Not signed up.",ephemeral=True);return
+            pos=r[0];await db.execute("DELETE FROM scrim_signups WHERE guild_id=? AND date=? AND user_id=?",(gid,date,uid));await db.commit()
+        await i.response.send_message("\u274c Left the scrim.",ephemeral=True)
+        if pos<6:
+            next_uid=await scrim_next_queue(gid,date)
+            if next_uid:
+                async with aiosqlite.connect(DB)as db:
+                    await db.execute("INSERT OR REPLACE INTO scrim_signups VALUES(?,?,?,?)",(gid,date,next_uid,5));await db.commit()
+                g=bot.get_guild(int(gid))
+                if g:
+                    m=g.get_member(int(next_uid))
+                    ch=g.get_channel(int(i.channel_id))
+                    if m and ch:await ch.send(f"\U0001f4e2 {m.mention} you're now in the scrim!")
+        await update_scrim_embed(gid,date)
+
+async def update_scrim_embed(gid,date):
+    g=bot.get_guild(int(gid))
+    if not g:return
+    session=await get_scrim_session(gid,date)
+    if not session or not session.get("msg_id"):return
+    members=await scrim_signups_active(gid,date)
+    total=await scrim_signup_count(gid,date)
+    desc="\n".join(f"{n+1}. <@{uid}>"for n,uid in enumerate(members))if members else"*No signups yet. Be the first!*"
+    q_count=max(0,total-6)
+    embed=discord.Embed(title="\U0001f3ae Mixed Scrim — Tonight 8pm",description=desc,color=0x5865F2)
+    embed.add_field(name="Signed Up",value=f"{len(members)}/6 active"+(f" (+{q_count} in queue)"if q_count else""),inline=True)
+    embed.set_footer(text="Click Sign Up to join | Signups close at 7:55pm")
+    try:
+        msc=None
+        for cat in g.categories:
+            if cat.name=="Scrims":
+                for ch in cat.text_channels:
+                    if ch.name=="mixed-scrims":msc=ch;break
+        if msc and session.get("msg_id"):
+            msg=await msc.fetch_message(int(session["msg_id"]))
+            await msg.edit(embed=embed)
+    except:pass
+
+async def create_scrim_thread(gid,date):
+    session=await get_scrim_session(gid,date)
+    if not session:return
+    g=bot.get_guild(int(gid))
+    if not g:return
+    members=await scrim_signups_active(gid,date)
+    if not members:return
+    msc=None
+    for cat in g.categories:
+        if cat.name=="Scrims":
+            for ch in cat.text_channels:
+                if ch.name=="mixed-scrims":msc=ch;break
+    if not msc:return
+    try:
+        th=await msc.create_thread(name=f"Mixed Scrim {date}",type=discord.ChannelType.private_thread,auto_archive_duration=4320)
+        added=[]
+        for uid in members[:6]:
+            m=g.get_member(int(uid))
+            if m:
+                try:await th.add_user(m);added.append(m.mention)
+                except:pass
+        await th.send(f"\U0001f3ae **Mixed Scrim Thread**\n\nPlayers: {' '.join(added)}\n\nTeams: make your own teams in-game! 3v3 or 2v2. Have fun!")
+        async with aiosqlite.connect(DB)as db:
+            await db.execute("UPDATE scrim_sessions SET thread_id=? WHERE guild_id=? AND date=?",(str(th.id),gid,date));await db.commit()
+    except Exception as e:log.warning("Scrim thread: %s",e)
 
 class RescheduleView(discord.ui.View):
     def __init__(self,ocid,nt,mid,gid):
@@ -359,8 +462,7 @@ async def setup_run(i):
         async with db.execute("SELECT guild_id FROM setup_data WHERE guild_id=?",(gid,))as cur:
             if await cur.fetchone():await i.response.send_message("\u274c Already set up. Use `/setup reset` first.",ephemeral=True);return
     await i.response.defer()
-    ev=i.guild.default_role
-    ar=discord.utils.get(i.guild.roles,name=ADMIN_ROLE)
+    ev=i.guild.default_role;ar=discord.utils.get(i.guild.roles,name=ADMIN_ROLE)
     bot_override=discord.PermissionOverwrite(send_messages=True,read_messages=True)
     admin_only={ev:discord.PermissionOverwrite(send_messages=False,read_messages=True),i.guild.me:bot_override}
     if ar:admin_only[ar]=discord.PermissionOverwrite(send_messages=True,read_messages=True)
@@ -376,11 +478,16 @@ async def setup_run(i):
         mcat=await i.guild.create_category("Matches")
         mat=await i.guild.create_text_channel("matches",category=mcat,overwrites=react_only)
         res=await i.guild.create_text_channel("results",category=mcat,overwrites=react_only)
+        scat=await i.guild.create_category("Scrims")
+        msc=await i.guild.create_text_channel("mixed-scrims",category=scat)
+        tsc=await i.guild.create_text_channel("team-scrims",category=scat)
     except Exception as e:await i.followup.send(f"\u274c Failed: {e}");return
+    # Create Team Scrims channel if Scrims category exists
     async with aiosqlite.connect(DB)as db:
         await db.execute("INSERT INTO setup_data VALUES(?,?,?,?,?,?,?,?,?,?)",(gid,"EGL",str(lcat.id),str(mcat.id),str(ann.id),str(gen.id),str(tch.id),str(fa.id),str(mat.id),str(res.id)))
         await db.commit()
-    await i.followup.send("\u2694\ufe0f **Elite Goon League is live.**\nAll channels and permissions have been configured.\n\n" f"{ann.mention} \u2014 Announcements\n{guide_ch.mention} \u2014 Player guide\n{gen.mention} \u2014 General chat\n{tch.mention} \u2014 Team threads\n{fa.mention} \u2014 Free agents\n{mat.mention} \u2014 Match schedule\n{res.mention} \u2014 Results\n\nRun `/league create` to start your first season.")
+    # Create Team Scrims + Mixed Scrims channel with proper permissions
+    await i.followup.send("\u2694\ufe0f **Elite Goon League is live.**\nAll channels and permissions have been configured.\n\n" f"{ann.mention} \u2014 Announcements\n{guide_ch.mention} \u2014 Player guide\n{gen.mention} \u2014 General chat\n{tch.mention} \u2014 Team threads\n{fa.mention} \u2014 Free agents\n{mat.mention} \u2014 Match schedule\n{res.mention} \u2014 Results\n{msc.mention} \u2014 Mixed scrims\n{tsc.mention} \u2014 Team scrims\n\nRun `/league create` to start your first season.")
 @setup.command(name="reset",description="Delete all bot channels and reset")
 async def setup_reset(i):
     if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
@@ -399,6 +506,16 @@ async def setup_reset(i):
                 except:pass
             await cat.delete()
         except:pass
+    # Also delete Scrims category
+    for cat in i.guild.categories:
+        if cat.name=="Scrims":
+            try:
+                for ch in list(cat.channels):
+                    try:await ch.delete()
+                    except:pass
+                await cat.delete()
+            except:pass
+            break
     async with aiosqlite.connect(DB)as db:await db.execute("DELETE FROM setup_data WHERE guild_id=?",(gid,));await db.commit()
     await i.followup.send("\u2705 Reset complete.")
 
@@ -838,6 +955,48 @@ async def reschedule_cmd(i,datetime_str:str):
     v=RescheduleView(ot["captain_id"],nt,row["id"],gid)
     await i.response.send_message(f"\U0001f4c5 {i.user.mention} wants **{nt}** (<t:{unix}:f>).\n{oc.mention} approve?",view=v)
 
+create_grp=app_commands.Group(name="create",description="Create scrims")
+@create_grp.command(name="mixedscrim",description="Create a mixed scrim")
+@app_commands.describe(time="Start time HH:MM UTC+2 (e.g. 20:00)",format="Match format")
+@app_commands.choices(format=[app_commands.Choice(name="3v3 (6 players)",value="3v3"),app_commands.Choice(name="2v2 (4 players)",value="2v2")])
+async def create_mixedscrim(i,time:str,format:str):
+    try:
+        h,m=map(int,time.split(":"));utc_h=(h-2)%24;scrim_time=f"{h:02d}:{m:02d}"
+        dt=datetime.now(timezone.utc).replace(hour=utc_h,minute=m,second=0,tzinfo=timezone.utc);unix=int(dt.timestamp())
+    except:await i.response.send_message("\u274c Format: HH:MM (e.g. 20:00)",ephemeral=True);return
+    gid=str(i.guild_id);max_p=6 if format=="3v3" else 4;today=datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    msc=None
+    for cat in i.guild.categories:
+        if cat.name=="Scrims":
+            for ch in cat.text_channels:
+                if ch.name=="mixed-scrims":msc=ch;break
+    if not msc:await i.response.send_message("\u274c No #mixed-scrims channel.",ephemeral=True);return
+    async with aiosqlite.connect(DB)as db:await db.execute("DELETE FROM scrim_signups WHERE guild_id=? AND date=?",(gid,today));await db.commit()
+    embed=discord.Embed(title=f"Mixed Scrim — {format.upper()} — Tonight {scrim_time}",description=f"*{max_p} spots | Click Sign Up!*",color=0x5865F2)
+    embed.add_field(name="Signed Up",value=f"0/{max_p}",inline=True)
+    embed.add_field(name="Your Time",value=f"<t:{unix}:f>",inline=True)
+    embed.set_footer(text="Click Sign Up to join")
+    view=ScrimSignupView(gid,today);msg=await msc.send(embed=embed,view=view)
+    async with aiosqlite.connect(DB)as db:await db.execute("INSERT OR REPLACE INTO scrim_sessions VALUES(?,?,NULL,?)",(gid,today,str(msg.id)));await db.commit()
+    await i.response.send_message(f"\u2705 Mixed {format} scrim created! ({scrim_time})",ephemeral=True)
+
+@bot.tree.command(name="teamscrim",description="Ping @TeamScrims for scrim (Captain only, in #team-scrims)")
+async def teamscrim_ping(i):
+    d=await need_captain(i)
+    if not d:return
+    role=find_role(i.guild,"TeamScrims")
+    if not role:await i.response.send_message("\u274c @TeamScrims role not found.",ephemeral=True);return
+    tsc=None
+    for cat in i.guild.categories:
+        if cat.name=="Scrims":
+            for ch in cat.text_channels:
+                if ch.name=="team-scrims":tsc=ch;break
+    if not tsc:await i.response.send_message("\u274c #team-scrims not found.",ephemeral=True);return
+    if i.channel.id!=tsc.id:await i.response.send_message(f"\u274c Use in {tsc.mention}.",ephemeral=True);return
+    await i.response.send_message(f"{role.mention} {i.user.mention} from **{d}** is looking for a team scrim!")
+
+bot.tree.add_command(create_grp)
+
 @bot.tree.command(name="backup",description="Download league database backup (League Admin only)")
 async def backup_cmd(i):
     if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
@@ -868,6 +1027,47 @@ async def weekly_check():
 @weekly_check.before_loop
 async def bef():await bot.wait_until_ready()
 
+@tasks.loop(minutes=30)
+async def scrim_check():
+    now=datetime.now(timezone.utc)
+    hour=now.hour;minute=now.minute;today=now.strftime("%Y-%m-%d")
+    for g in bot.guilds:
+        gid=str(g.id)
+        async with aiosqlite.connect(DB)as db:
+            async with db.execute("SELECT guild_id FROM setup_data WHERE guild_id=?",(gid,))as c:
+                if not await c.fetchone():continue
+        msc=None
+        for cat in g.categories:
+            if cat.name=="Scrims":
+                for ch in cat.text_channels:
+                    if ch.name=="mixed-scrims":msc=ch;break
+        if not msc:continue
+        # 5pm UTC+2 = 15:00 UTC
+        if hour==15 and minute<30:
+            if await get_scrim_session(gid,today):continue
+            async with aiosqlite.connect(DB)as db:
+                await db.execute("DELETE FROM scrim_signups WHERE guild_id=? AND date=?",(gid,today));await db.commit()
+            embed=discord.Embed(title="Mixed Scrim — Tonight 8pm",description="*Click Sign Up below to join!*",color=0x5865F2)
+            embed.add_field(name="Signed Up",value="0/6 active",inline=True)
+            embed.set_footer(text="Signups close at 7:55pm")
+            view=ScrimSignupView(gid,today)
+            msg=await msc.send(embed=embed,view=view)
+            async with aiosqlite.connect(DB)as db:
+                await db.execute("INSERT OR REPLACE INTO scrim_sessions VALUES(?,?,NULL,?)",(gid,today,str(msg.id)));await db.commit()
+        # 8pm = 18:00 UTC
+        elif hour==18 and minute<30:
+            session=await get_scrim_session(gid,today)
+            if session and not session.get("thread_id"):
+                await create_scrim_thread(gid,today)
+        # Midnight cleanup
+        elif hour==0 and minute<30:
+            async with aiosqlite.connect(DB)as db:
+                await db.execute("DELETE FROM scrim_signups WHERE guild_id=? AND date<?",(gid,today))
+                await db.execute("DELETE FROM scrim_sessions WHERE guild_id=? AND date<?",(gid,today));await db.commit()
+
+@scrim_check.before_loop
+async def scrim_bef():await bot.wait_until_ready()
+
 @bot.event
 async def on_guild_join(guild):
     bot.tree.copy_global_to(guild=guild)
@@ -877,11 +1077,13 @@ async def on_guild_join(guild):
         ("Captain",discord.Color.yellow()),
         ("Free Agent",discord.Color.blue()),
         ("Player",discord.Color.green()),
+        ("TeamScrims",discord.Color.orange()),
         (TESTER_ROLE,discord.Color.from_rgb(255,105,180)),
     ]
     for role_name,color in required:
         if not find_role(guild,role_name):
-            try:await guild.create_role(name=role_name,color=color)
+            try:
+                r=await guild.create_role(name=role_name,color=color)
             except:pass
     log.info("\u2705 Joined %s, commands synced, roles created",guild.name)
 
@@ -895,6 +1097,7 @@ async def on_ready():
     await bot.tree.sync()
     log.info("\u2705 %s | synced to %d guild(s)",bot.user,len(bot.guilds))
     weekly_check.start()
+    scrim_check.start()
 
 bot.tree.add_command(setup)
 
