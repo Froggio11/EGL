@@ -94,6 +94,8 @@ async def scrim_next_queue(gid,date):
     async with aiosqlite.connect(DB)as db:
         async with db.execute("SELECT user_id FROM scrim_signups WHERE guild_id=? AND date=? AND position>=6 ORDER BY position ASC LIMIT 1",(gid,date))as c:
             r=await c.fetchone();return r[0]if r else None
+
+async def get_player_mmr(gid,uid):
     async with aiosqlite.connect(DB)as db:
         async with db.execute("SELECT last_mmr FROM player_history WHERE guild_id=? AND user_id=?",(gid,uid))as c:
             r=await c.fetchone();return r[0]if r else DEFAULT_MMR
