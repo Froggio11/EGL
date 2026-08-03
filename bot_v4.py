@@ -12,7 +12,20 @@ TOKEN=os.environ.get("DISCORD_BOT_TOKEN","")
 DB="league.db";DEFAULT_MMR=1000;MAX_TEAM=3;SEASON_WEEKS=8
 ADMIN_ROLE="League Admin";TESTER_ROLE="EGL Tester"
 MAPS=["Chessboard","Portal Mayhem","Construction Site","Parking Lot"]
-SCHED_FMT="%d %b %H:%M";SCHED_HELP="DD Mon HH:MM (e.g. 05 Aug 19:00)"
+SCHED_FMT="%d %b %H:%M";SCHED_HELP="DD Mon HH:MM or 8pm (e.g. 05 Aug 20:00 or 05 Aug 8pm)"
+
+def parse_schedule(s):
+    import re
+    parts=s.strip().split()
+    if len(parts)<3:raise ValueError("Need: DD Mon time")
+    day=int(parts[0]);mon=parts[1];t=" ".join(parts[2:]).lower()
+    m24=re.match(r'^(\d{1,2})[:\.](\d{2})$',t)
+    m12=re.match(r'^(\d{1,2})[:\.]?(\d{2})?(am|pm)$',t)
+    if m12:h=int(m12.group(1));mi=int(m12.group(2)or 0);ap=m12.group(3);h=0 if h==12 and ap=='am'else(12 if h==12 and ap=='pm'else(h+(12 if ap=='pm'else 0)))
+    elif m24:h=int(m24.group(1));mi=int(m24.group(2))
+    else:raise ValueError(f"Invalid time: {t}")
+    yr=datetime.now(timezone.utc).year
+    return datetime.strptime(f"{day:02d} {mon} {yr} {h:02d}:{mi:02d}","%d %b %Y %H:%M").replace(tzinfo=timezone.utc)
 RANKS=[(0,"Adept"),(900,"Lotus"),(1000,"Monk"),(1050,"Warden"),(1100,"Avatar"),(1150,"Raava")]
 intents=discord.Intents.default();intents.members=True;intents.message_content=True
 bot=commands.Bot(command_prefix="!",intents=intents)
@@ -295,7 +308,7 @@ async def update_scrim_embed(gid,date):
         if msc and session.get("msg_id"):
             msg=await msc.fetch_message(int(session["msg_id"]))
             await msg.edit(embed=embed)
-    except:pass
+    except Exception as e:log.warning("update_scrim_embed failed: %s",e)
 
 async def create_scrim_thread(gid,date):
     # Not used — scrim threads removed
@@ -910,9 +923,9 @@ bot.tree.add_command(test)
 async def schedule_cmd(i,datetime_str:str):
     if not isinstance(i.channel,discord.Thread):await i.response.send_message("\u274c Match threads only.",ephemeral=True);return
     try:
-        dt=datetime.strptime(datetime_str,SCHED_FMT).replace(year=datetime.now(timezone.utc).year,tzinfo=timezone.utc)
+        dt=parse_schedule(datetime_str)
         sched=dt.strftime(SCHED_FMT+" GMT");unix=int(dt.timestamp())
-    except:await i.response.send_message(f"\u274c Format: `{SCHED_HELP}`",ephemeral=True);return
+    except Exception as ex:await i.response.send_message(f"\u274c {ex}. Try: 05 Aug 20:00 or 05 Aug 8pm",ephemeral=True);return
     async with aiosqlite.connect(DB)as db:await db.execute("UPDATE matches SET scheduled=? WHERE thread_id=?",(sched,str(i.channel.id)));await db.commit()
     await i.response.send_message(f"\U0001f4c5 Scheduled: **{sched}**\n\U0001f550 Your time: <t:{unix}:f>")
 
@@ -922,7 +935,7 @@ async def reschedule_cmd(i,datetime_str:str):
     if not isinstance(i.channel,discord.Thread):await i.response.send_message("\u274c Match threads only.",ephemeral=True);return
     gid=str(i.guild_id)
     try:
-        dt=datetime.strptime(datetime_str,SCHED_FMT).replace(year=datetime.now(timezone.utc).year,tzinfo=timezone.utc)
+        dt=parse_schedule(datetime_str)
         nt=dt.strftime(SCHED_FMT+" GMT");unix=int(dt.timestamp())
     except:await i.response.send_message(f"\u274c Format: `{SCHED_HELP}`",ephemeral=True);return
     async with aiosqlite.connect(DB)as db:
@@ -955,6 +968,7 @@ async def create_mixedscrim(i,time:str,format:str):
         utc_h=(h-2)%24;scrim_time=f"{h:02d}:{mi:02d}"
         dt=datetime.now(timezone.utc).replace(hour=utc_h,minute=mi,second=0,tzinfo=timezone.utc);unix=int(dt.timestamp())
     except:await i.response.send_message("\u274c Try: 20:00, 20.00, 8pm, 8:30pm",ephemeral=True);return
+    await i.response.defer(ephemeral=True)
     gid=str(i.guild_id);max_p=6 if format=="3v3" else 4;today=datetime.now(timezone.utc).strftime("%Y-%m-%d")
     title=f"Mixed Scrim \u2014 {format.upper()} \u2014 Today {scrim_time}"
     msc=None
@@ -970,7 +984,7 @@ async def create_mixedscrim(i,time:str,format:str):
     embed.set_footer(text="Click Sign Up to join")
     view=ScrimSignupView(gid,today);msg=await msc.send(embed=embed,view=view)
     async with aiosqlite.connect(DB)as db:await db.execute("INSERT OR REPLACE INTO scrim_sessions VALUES(?,?,NULL,?,?,?,?)",(gid,today,str(msg.id),max_p,title,unix));await db.commit()
-    await i.response.send_message(f"\u2705 Mixed {format} scrim created! ({scrim_time})",ephemeral=True)
+    await i.followup.send(f"\u2705 Mixed {format} scrim created! ({scrim_time})",ephemeral=True)
 
 @bot.tree.command(name="teamscrim",description="Ping @TeamScrims for scrim (Captain only, in #team-scrims)")
 async def teamscrim_ping(i):
@@ -1034,8 +1048,8 @@ async def scrim_check():
                 for ch in cat.text_channels:
                     if ch.name=="mixed-scrims":msc=ch;break
         if not msc:continue
-        # 5pm UTC+2 = 15:00 UTC
-        if hour==15 and minute<30:
+        # 5pm GMT — auto daily signup post
+        if hour==20 and minute==0:
             if await get_scrim_session(gid,today):continue
             async with aiosqlite.connect(DB)as db:
                 await db.execute("DELETE FROM scrim_signups WHERE guild_id=? AND date=?",(gid,today));await db.commit()
@@ -1046,8 +1060,9 @@ async def scrim_check():
             msg=await msc.send(embed=embed,view=view)
             async with aiosqlite.connect(DB)as db:
                 await db.execute("INSERT OR REPLACE INTO scrim_sessions VALUES(?,?,NULL,?,6,'Mixed Scrim \u2014 Today 8pm',NULL)",(gid,today,str(msg.id)));await db.commit()
-        # 8pm = 18:00 UTC — 5-min ping
-        elif hour==18 and minute==55:
+        # Every 5 min — refresh embed silently
+        if minute%5==0:
+            await update_scrim_embed(gid,today)
             members=await scrim_signups_active(gid,today)
             if members:
                 pings=" ".join(f"<@{uid}>"for uid in members)
@@ -1056,6 +1071,32 @@ async def scrim_check():
 
 @scrim_check.before_loop
 async def scrim_bef():await bot.wait_until_ready()
+
+@tasks.loop(minutes=1)
+async def match_reminders():
+    now=datetime.now(timezone.utc)
+    async with aiosqlite.connect(DB)as db:
+        db.row_factory=aiosqlite.Row
+        async with db.execute("SELECT * FROM matches WHERE scheduled IS NOT NULL AND winner IS NULL AND score IS NULL")as c:
+            rows=await c.fetchall()
+    for row in rows:
+        row=dict(row)
+        sched=row.get("scheduled")
+        if not sched:continue
+        try:
+            dt=datetime.strptime(sched.replace(" GMT",""),SCHED_FMT).replace(year=now.year,tzinfo=timezone.utc)
+            diff=(dt-now).total_seconds()
+            if 3540<=diff<=3660:  # 59-61 min window
+                g=bot.get_guild(int(row["guild_id"]))
+                if not g:continue
+                th=g.get_thread(int(row["thread_id"]))if row.get("thread_id")else None
+                if th:
+                    unix=int(dt.timestamp())
+                    await th.send(f"\u23f0 **Match starts in 1 hour!** <t:{unix}:f>\n\nBoth teams be ready! Use `/match report` after the match.")
+        except:continue
+
+@match_reminders.before_loop
+async def mr_bef():await bot.wait_until_ready()
 
 @bot.event
 async def on_guild_join(guild):
@@ -1087,6 +1128,7 @@ async def on_ready():
     log.info("\u2705 %s | synced to %d guild(s)",bot.user,len(bot.guilds))
     weekly_check.start()
     scrim_check.start()
+    match_reminders.start()
 
 bot.tree.add_command(setup)
 
