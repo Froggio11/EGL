@@ -403,7 +403,7 @@ async def guide_cmd(i):
     p1+="\u2501"*22+"\n"
     p1+="\U0001f3c6 **The Basics**\n"
     p1+="Start at **Monk** rank, climb to Raava. Top 4 advance to Finals.\n"
-    p1+="Matches every **Sunday10pm GMT"**. Map voted by captains.\n"
+    p1+="Matches every **Sunday 10pm GMT**. Map voted by captains.\n"
     p1+="Max 1 Free Agent sub per match. 24h cooldown after leaving.\n\n"
     p1+="\u2501"*22+"\n"
     p1+="\U0001f3ae **Scrims (Casual)**\n"
