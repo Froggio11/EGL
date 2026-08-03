@@ -29,7 +29,7 @@ async def init_db():
         CREATE TABLE IF NOT EXISTS player_history(guild_id TEXT,user_id TEXT,last_mmr INT DEFAULT 1000,cooldown_until TEXT,PRIMARY KEY(guild_id,user_id));
         CREATE TABLE IF NOT EXISTS guild_settings(guild_id TEXT PRIMARY KEY,teams_ch TEXT);
         CREATE TABLE IF NOT EXISTS setup_data(guild_id TEXT PRIMARY KEY,league_name TEXT,league_category_id TEXT,matches_category_id TEXT,announcements_ch TEXT,general_ch TEXT,teams_ch TEXT,fa_ch TEXT,matches_ch TEXT,results_ch TEXT);
-        CREATE TABLE IF NOT EXISTS scrim_sessions(guild_id TEXT,date TEXT,thread_id TEXT,msg_id TEXT,PRIMARY KEY(guild_id,date));
+        CREATE TABLE IF NOT EXISTS scrim_sessions(guild_id TEXT,date TEXT,thread_id TEXT,msg_id TEXT,max_players INT DEFAULT 6,PRIMARY KEY(guild_id,date));
         CREATE TABLE IF NOT EXISTS scrim_signups(guild_id TEXT,date TEXT,user_id TEXT,position INT,PRIMARY KEY(guild_id,date,user_id));
         """)
         await db.commit()
@@ -84,6 +84,11 @@ async def scrim_signup_count(gid,date):
     async with aiosqlite.connect(DB)as db:
         async with db.execute("SELECT COUNT(*) FROM scrim_signups WHERE guild_id=? AND date=?",(gid,date))as c:
             r=await c.fetchone();return r[0]if r else 0
+
+async def scrim_max_players(gid,date):
+    async with aiosqlite.connect(DB)as db:
+        async with db.execute("SELECT max_players FROM scrim_sessions WHERE guild_id=? AND date=?",(gid,date))as c:
+            r=await c.fetchone();return r[0]if r else 6
 
 async def scrim_signups_active(gid,date):
     async with aiosqlite.connect(DB)as db:
@@ -239,7 +244,7 @@ class ScrimSignupView(discord.ui.View):
         async with aiosqlite.connect(DB)as db:
             await db.execute("INSERT OR IGNORE INTO scrim_signups VALUES(?,?,?,?)",(gid,date,uid,count));await db.commit()
         status="Active"if count<6 else f"Queue (#{count-5})"
-        await i.response.send_message(f"\u2705 Signed up! ({count+1}/6 active) {status}",ephemeral=True)
+        await i.response.send_message(f"\u2705 Signed up! ({min(count+1,max_p)}/{max_p}) {status}",ephemeral=True)
         await update_scrim_embed(gid,date)
     @discord.ui.button(label="Leave",style=discord.ButtonStyle.red,emoji="\u274c")
     async def leave(self,i,btn):
@@ -250,7 +255,9 @@ class ScrimSignupView(discord.ui.View):
             if not r:await i.response.send_message("\u274c Not signed up.",ephemeral=True);return
             pos=r[0];await db.execute("DELETE FROM scrim_signups WHERE guild_id=? AND date=? AND user_id=?",(gid,date,uid));await db.commit()
         await i.response.send_message("\u274c Left the scrim.",ephemeral=True)
-        if pos<6:
+        # Also fix active limit based on max_players
+        max_p=await scrim_max_players(gid,date)
+        if pos<max_p:
             next_uid=await scrim_next_queue(gid,date)
             if next_uid:
                 async with aiosqlite.connect(DB)as db:
@@ -269,10 +276,11 @@ async def update_scrim_embed(gid,date):
     if not session or not session.get("msg_id"):return
     members=await scrim_signups_active(gid,date)
     total=await scrim_signup_count(gid,date)
+    max_p=await scrim_max_players(gid,date)
     desc="\n".join(f"{n+1}. <@{uid}>"for n,uid in enumerate(members))if members else"*No signups yet. Be the first!*"
-    q_count=max(0,total-6)
-    embed=discord.Embed(title="\U0001f3ae Mixed Scrim — Tonight 8pm",description=desc,color=0x5865F2)
-    embed.add_field(name="Signed Up",value=f"{len(members)}/6 active"+(f" (+{q_count} in queue)"if q_count else""),inline=True)
+    q_count=max(0,total-max_p)
+    embed=discord.Embed(title="Mixed Scrim",description=desc,color=0x5865F2)
+    embed.add_field(name="Signed Up",value=f"{len(members)}/{max_p} active"+(f" (+{q_count} in queue)"if q_count else""),inline=True)
     embed.set_footer(text="Click Sign Up to join | Signups close at 7:55pm")
     try:
         msc=None
@@ -1024,7 +1032,7 @@ async def scrim_check():
             view=ScrimSignupView(gid,today)
             msg=await msc.send(embed=embed,view=view)
             async with aiosqlite.connect(DB)as db:
-                await db.execute("INSERT OR REPLACE INTO scrim_sessions VALUES(?,?,NULL,?)",(gid,today,str(msg.id)));await db.commit()
+                await db.execute("INSERT OR REPLACE INTO scrim_sessions VALUES(?,?,NULL,?,6)",(gid,today,str(msg.id)));await db.commit()
         # 8pm = 18:00 UTC — 5-min ping
         elif hour==18 and minute==55:
             members=await scrim_signups_active(gid,today)
