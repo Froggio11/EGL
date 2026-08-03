@@ -280,9 +280,12 @@ async def update_scrim_embed(gid,date):
     max_p=await scrim_max_players(gid,date)
     desc="\n".join(f"{n+1}. <@{uid}>"for n,uid in enumerate(members))if members else"*No signups yet. Be the first!*"
     q_count=max(0,total-max_p)
-    embed=discord.Embed(title="Mixed Scrim",description=desc,color=0x5865F2)
+    title=session.get("scrim_title","Mixed Scrim")or"Mixed Scrim"
+    unix=session.get("unix_time")
+    embed=discord.Embed(title=title,description=desc,color=0x5865F2)
     embed.add_field(name="Signed Up",value=f"{len(members)}/{max_p} active"+(f" (+{q_count} in queue)"if q_count else""),inline=True)
-    embed.set_footer(text="Click Sign Up to join | Signups close at 7:55pm")
+    if unix:embed.add_field(name="Your Time",value=f"<t:{unix}:f>",inline=True)
+    embed.set_footer(text="Click Sign Up to join")
     try:
         msc=None
         for cat in g.categories:
@@ -941,7 +944,7 @@ create_grp=app_commands.Group(name="create",description="Create scrims")
 @app_commands.choices(format=[app_commands.Choice(name="3v3 (6 players)",value="3v3"),app_commands.Choice(name="2v2 (4 players)",value="2v2")])
 async def create_mixedscrim(i,time:str,format:str):
     try:
-        h,m=map(int,time.split(":"));utc_h=(h-2)%24;scrim_time=f"{h:02d}:{m:02d}"
+        h,m=map(int,time.replace(".",":").split(":"))if ":"in time or "."in time else (int(re.sub(r'[aApP][mM]','',time)),0);utc_h=(h-2)%24;scrim_time=f"{h:02d}:{m:02d}"
         dt=datetime.now(timezone.utc).replace(hour=utc_h,minute=m,second=0,tzinfo=timezone.utc);unix=int(dt.timestamp())
     except:await i.response.send_message("\u274c Format: HH:MM (e.g. 20:00)",ephemeral=True);return
     gid=str(i.guild_id);max_p=6 if format=="3v3" else 4;today=datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -952,12 +955,12 @@ async def create_mixedscrim(i,time:str,format:str):
                 if ch.name=="mixed-scrims":msc=ch;break
     if not msc:await i.response.send_message("\u274c No #mixed-scrims channel.",ephemeral=True);return
     async with aiosqlite.connect(DB)as db:await db.execute("DELETE FROM scrim_signups WHERE guild_id=? AND date=?",(gid,today));await db.commit()
-    embed=discord.Embed(title=f"Mixed Scrim — {format.upper()} — Tonight {scrim_time}",description=f"*{max_p} spots | Click Sign Up!*",color=0x5865F2)
+    embed=discord.Embed(title=f"Mixed Scrim \u2014 {format.upper()} \u2014 Today {scrim_time}",description=f"*{max_p} spots | Click Sign Up!*",color=0x5865F2)
     embed.add_field(name="Signed Up",value=f"0/{max_p}",inline=True)
     embed.add_field(name="Your Time",value=f"<t:{unix}:f>",inline=True)
     embed.set_footer(text="Click Sign Up to join")
     view=ScrimSignupView(gid,today);msg=await msc.send(embed=embed,view=view)
-    async with aiosqlite.connect(DB)as db:await db.execute("INSERT OR REPLACE INTO scrim_sessions VALUES(?,?,NULL,?,?)",(gid,today,str(msg.id),max_p));await db.commit()
+    async with aiosqlite.connect(DB)as db:await db.execute("INSERT OR REPLACE INTO scrim_sessions VALUES(?,?,NULL,?,?,?,?)",(gid,today,str(msg.id),max_p,title,unix));await db.commit()
     await i.response.send_message(f"\u2705 Mixed {format} scrim created! ({scrim_time})",ephemeral=True)
 
 @bot.tree.command(name="teamscrim",description="Ping @TeamScrims for scrim (Captain only, in #team-scrims)")
@@ -1027,13 +1030,13 @@ async def scrim_check():
             if await get_scrim_session(gid,today):continue
             async with aiosqlite.connect(DB)as db:
                 await db.execute("DELETE FROM scrim_signups WHERE guild_id=? AND date=?",(gid,today));await db.commit()
-            embed=discord.Embed(title="Mixed Scrim — Tonight 8pm",description="*Click Sign Up below to join!*",color=0x5865F2)
+            embed=discord.Embed(title="Mixed Scrim \u2014 Today 8pm",description="*Click Sign Up below to join!*",color=0x5865F2)
             embed.add_field(name="Signed Up",value="0/6 active",inline=True)
             embed.set_footer(text="Signups close at 7:55pm")
             view=ScrimSignupView(gid,today)
             msg=await msc.send(embed=embed,view=view)
             async with aiosqlite.connect(DB)as db:
-                await db.execute("INSERT OR REPLACE INTO scrim_sessions VALUES(?,?,NULL,?,6)",(gid,today,str(msg.id)));await db.commit()
+                await db.execute("INSERT OR REPLACE INTO scrim_sessions VALUES(?,?,NULL,?,6,'Mixed Scrim \u2014 Today 8pm',NULL)",(gid,today,str(msg.id)));await db.commit()
         # 8pm = 18:00 UTC — 5-min ping
         elif hour==18 and minute==55:
             members=await scrim_signups_active(gid,today)
