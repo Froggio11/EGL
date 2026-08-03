@@ -241,6 +241,7 @@ class ScrimSignupView(discord.ui.View):
     async def signup(self,i,btn):
         gid=self.gid;date=self.date;uid=str(i.user.id)
         count=await scrim_signup_count(gid,date)
+        max_p=await scrim_max_players(gid,date)
         async with aiosqlite.connect(DB)as db:
             await db.execute("INSERT OR IGNORE INTO scrim_signups VALUES(?,?,?,?)",(gid,date,uid,count));await db.commit()
         status="Active"if count<6 else f"Queue (#{count-5})"
@@ -956,7 +957,7 @@ async def create_mixedscrim(i,time:str,format:str):
     embed.add_field(name="Your Time",value=f"<t:{unix}:f>",inline=True)
     embed.set_footer(text="Click Sign Up to join")
     view=ScrimSignupView(gid,today);msg=await msc.send(embed=embed,view=view)
-    async with aiosqlite.connect(DB)as db:await db.execute("INSERT OR REPLACE INTO scrim_sessions VALUES(?,?,NULL,?)",(gid,today,str(msg.id)));await db.commit()
+    async with aiosqlite.connect(DB)as db:await db.execute("INSERT OR REPLACE INTO scrim_sessions VALUES(?,?,NULL,?,?)",(gid,today,str(msg.id),max_p));await db.commit()
     await i.response.send_message(f"\u2705 Mixed {format} scrim created! ({scrim_time})",ephemeral=True)
 
 @bot.tree.command(name="teamscrim",description="Ping @TeamScrims for scrim (Captain only, in #team-scrims)")
