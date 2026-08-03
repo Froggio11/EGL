@@ -403,7 +403,7 @@ async def guide_cmd(i):
     p1+="\u2501"*22+"\n"
     p1+="\U0001f3c6 **The Basics**\n"
     p1+="Start at **Monk** rank, climb to Raava. Top 4 advance to Finals.\n"
-    p1+="Matches every **Sunday 10pm UTC+2**. Map voted by captains.\n"
+    p1+="Matches every **Sunday10pm GMT"**. Map voted by captains.\n"
     p1+="Max 1 Free Agent sub per match. 24h cooldown after leaving.\n\n"
     p1+="\u2501"*22+"\n"
     p1+="\U0001f3ae **Scrims (Casual)**\n"
@@ -533,7 +533,7 @@ async def league_create(i,name:str):
     if sd.get("announcements_ch"):
         ann=i.guild.get_channel(int(sd["announcements_ch"]))
         if ann:
-            await ann.send(f"\U0001f3c6 **{name}** has begun!\n\n\u2022 **{SEASON_WEEKS}-week season** \u2014 every team plays every other team\n\u2022 Matches generated **every Sunday at 10pm UTC+2** (<t:{sun_unix}:t> your time)\n\u2022 End of regular season: **{end_date.strftime('%d %b %Y')}**\n\u2022 Top 4 advance to Finals, then Grand Final\n\nGood luck, Goons!")
+            await ann.send(f"\U0001f3c6 **{name}** has begun!\n\n\u2022 **{SEASON_WEEKS}-week season** \u2014 every team plays every other team\n\u2022 Matches generated **every Sunday at 10pm GMT** (<t:{sun_unix}:t> your time)\n\u2022 End of regular season: **{end_date.strftime('%d %b %Y')}**\n\u2022 Top 4 advance to Finals, then Grand Final\n\nGood luck, Goons!")
     await i.response.send_message(f"\u2694\ufe0f **{name}** season started!")
 @league.command(name="delete",description="Delete league")
 async def league_delete(i):
@@ -940,14 +940,23 @@ async def reschedule_cmd(i,datetime_str:str):
 
 create_grp=app_commands.Group(name="create",description="Create scrims")
 @create_grp.command(name="mixedscrim",description="Create a mixed scrim")
-@app_commands.describe(time="Start time HH:MM UTC+2 (e.g. 20:00)",format="Match format")
+@app_commands.describe(time="Start time HH:MM GMT (e.g. 20:00)",format="Match format")
 @app_commands.choices(format=[app_commands.Choice(name="3v3 (6 players)",value="3v3"),app_commands.Choice(name="2v2 (4 players)",value="2v2")])
 async def create_mixedscrim(i,time:str,format:str):
+    # Accept: 20:00, 20.00, 8pm, 8:30pm, 8.30pm, 20, 8pm
+    import re
+    t=time.strip().lower()
+    m24=re.match(r'^(\d{1,2})[:\.](\d{2})$',t)
+    m12=re.match(r'^(\d{1,2})[:\.]?(\d{2})?(am|pm)$',t)
     try:
-        h,m=map(int,time.replace(".",":").split(":"))if ":"in time or "."in time else (int(re.sub(r'[aApP][mM]','',time)),0);utc_h=(h-2)%24;scrim_time=f"{h:02d}:{m:02d}"
-        dt=datetime.now(timezone.utc).replace(hour=utc_h,minute=m,second=0,tzinfo=timezone.utc);unix=int(dt.timestamp())
-    except:await i.response.send_message("\u274c Format: HH:MM (e.g. 20:00)",ephemeral=True);return
+        if m12: h=int(m12.group(1));mi=int(m12.group(2)or 0);ap=m12.group(3);h=0 if h==12 and ap=='am'else(12 if h==12 and ap=='pm'else(h+(12 if ap=='pm'else 0)))
+        elif m24: h=int(m24.group(1));mi=int(m24.group(2))
+        else: raise ValueError
+        utc_h=(h-2)%24;scrim_time=f"{h:02d}:{mi:02d}"
+        dt=datetime.now(timezone.utc).replace(hour=utc_h,minute=mi,second=0,tzinfo=timezone.utc);unix=int(dt.timestamp())
+    except:await i.response.send_message("\u274c Try: 20:00, 20.00, 8pm, 8:30pm",ephemeral=True);return
     gid=str(i.guild_id);max_p=6 if format=="3v3" else 4;today=datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    title=f"Mixed Scrim \u2014 {format.upper()} \u2014 Today {scrim_time}"
     msc=None
     for cat in i.guild.categories:
         if cat.name=="Scrims":
@@ -955,7 +964,7 @@ async def create_mixedscrim(i,time:str,format:str):
                 if ch.name=="mixed-scrims":msc=ch;break
     if not msc:await i.response.send_message("\u274c No #mixed-scrims channel.",ephemeral=True);return
     async with aiosqlite.connect(DB)as db:await db.execute("DELETE FROM scrim_signups WHERE guild_id=? AND date=?",(gid,today));await db.commit()
-    embed=discord.Embed(title=f"Mixed Scrim \u2014 {format.upper()} \u2014 Today {scrim_time}",description=f"*{max_p} spots | Click Sign Up!*",color=0x5865F2)
+    embed=discord.Embed(title=title,description=f"*{max_p} spots | Click Sign Up!*",color=0x5865F2)
     embed.add_field(name="Signed Up",value=f"0/{max_p}",inline=True)
     embed.add_field(name="Your Time",value=f"<t:{unix}:f>",inline=True)
     embed.set_footer(text="Click Sign Up to join")
