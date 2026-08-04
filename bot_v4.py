@@ -404,14 +404,14 @@ async def gen_matches(guild,c,force=False):
                 ts_all=await teams_all(gid)
                 total_matches=sum(t["wins"]+t["losses"]for t in ts_all)//2
                 finals_note="\U0001f3c6 Finals next week! Top 4 teams advance."if weeks_left==0 else f"Top 4 by rank advance to finals after Week {SEASON_WEEKS}."
-                await ann.send(f"\U0001f4ca **Season Update \u2014 Week {week}/{SEASON_WEEKS}**\n\nWeeks remaining: **{weeks_left}**\nMatches played: **{total_matches}**\nTeams in league: **{len(ts_all)}**\n\n{finals_note}")
+                await ann.send(f"\U0001f4ca **Season Update  -  Week {week}/{SEASON_WEEKS}**\n\nWeeks remaining: **{weeks_left}**\nMatches played: **{total_matches}**\nTeams in league: **{len(ts_all)}**\n\n{finals_note}")
     return len(match_ids)
 
 # ===== /guide =====
 @bot.tree.command(name="guide",description="Post the league guide (League Admin only)")
 async def guide_cmd(i):
     if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
-    p1="\U0001f4d6 **EGL \u2014 Elite Goon League**\n"
+    p1="\U0001f4d6 **EGL  -  Elite Goon League**\n"
     p1+="Our own 2v2 league for Elements Divided. Teams of up to 3, 8-week season, weekly matches.\n\n"
     p1+="\u2501"*22+"\n"
     p1+="\U0001f3c6 **The Basics**\n"
@@ -438,7 +438,7 @@ async def guide_cmd(i):
     p2+="`/fa request` — Find a sub *(captain)\n\n"
     p2+="\U0001f4c5 **Match**\n"
     p2+="`/schedule 05 Aug 19:00` / `/reschedule` — Set match time\n"
-    p2+="`/match report opponent:Name score:2-1` — Report result\n\n"
+    p2+="`/match result opponent:Name score:2-1` — Report result\n\n"
     p2+="\U0001f3ae **Scrims**\n"
     p2+="`/create mixedscrim time:20:00 format:3v3` — Make a scrim\n"
     p2+="`/teamscrim` — Ping @TeamScrims *(captain, in #team-scrims)*\n\n"
@@ -474,6 +474,7 @@ async def setup_run(i):
         mcat=await i.guild.create_category("Matches")
         mat=await i.guild.create_text_channel("matches",category=mcat,overwrites=react_only)
         res=await i.guild.create_text_channel("results",category=mcat,overwrites=react_only)
+        lb=await i.guild.create_text_channel("leaderboard",category=mcat,overwrites=admin_only)
         scat=await i.guild.create_category("Scrims")
         msc=await i.guild.create_text_channel("mixed-scrims",category=scat)
         tsc=await i.guild.create_text_channel("team-scrims",category=scat)
@@ -482,8 +483,7 @@ async def setup_run(i):
     async with aiosqlite.connect(DB)as db:
         await db.execute("INSERT INTO setup_data VALUES(?,?,?,?,?,?,?,?,?,?)",(gid,"EGL",str(lcat.id),str(mcat.id),str(ann.id),str(gen.id),str(tch.id),str(fa.id),str(mat.id),str(res.id)))
         await db.commit()
-    # Create Team Scrims + Mixed Scrims channel with proper permissions
-    await i.followup.send("\u2694\ufe0f **Elite Goon League is live.**\nAll channels and permissions have been configured.\n\n" f"{ann.mention} \u2014 Announcements\n{guide_ch.mention} \u2014 Player guide\n{gen.mention} \u2014 General chat\n{tch.mention} \u2014 Team threads\n{fa.mention} \u2014 Free agents\n{mat.mention} \u2014 Match schedule\n{res.mention} \u2014 Results\n{msc.mention} \u2014 Mixed scrims\n{tsc.mention} \u2014 Team scrims\n\nRun `/league create` to start your first season.")
+    # Create Team Scrims + Mixed Scrims chann    await i.followup.send("\u2694\ufe0f **Elite Goon League is live.**\nAll channels and permissions have been configured.\n\n" f"{ann.mention} \u2014 Announcements\n{guide_ch.mention} \u2014 Player guide\n{gen.mention} \u2014 General chat\n{tch.mention} \u2014 Team threads\n{fa.mention} \u2014 Free agents\n{mat.mention} \u2014 Match schedule\n{res.mention} \u2014 Results\n{lb.mention} \u2014 Leaderboard\n{msc.mention} \u2014 Mixed scrims\n{tsc.mention} \u2014 Team scrims\n\nRun `/league create` to start your first season.")
 @setup.command(name="reset",description="Delete all bot channels and reset")
 async def setup_reset(i):
     if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
@@ -546,7 +546,7 @@ async def league_create(i,name:str):
     if sd.get("announcements_ch"):
         ann=i.guild.get_channel(int(sd["announcements_ch"]))
         if ann:
-            await ann.send(f"\U0001f3c6 **{name}** has begun!\n\n\u2022 **{SEASON_WEEKS}-week season** \u2014 every team plays every other team\n\u2022 Matches generated **every Sunday at 10pm GMT** (<t:{sun_unix}:t> your time)\n\u2022 End of regular season: **{end_date.strftime('%d %b %Y')}**\n\u2022 Top 4 advance to Finals, then Grand Final\n\nGood luck, Goons!")
+            await ann.send(f"\U0001f3c6 **{name}** has begun!\n\n\u2022 **{SEASON_WEEKS}-week season**  -  every team plays every other team\n\u2022 Matches generated **every Sunday at 10pm GMT** (<t:{sun_unix}:t> your time)\n\u2022 End of regular season: **{end_date.strftime('%d %b %Y')}**\n\u2022 Top 4 advance to Finals, then Grand Final\n\nGood luck, Goons!")
     await i.response.send_message(f"\u2694\ufe0f **{name}** season started!")
 @league.command(name="delete",description="Delete league")
 async def league_delete(i):
@@ -556,14 +556,6 @@ async def league_delete(i):
         for tbl in("config","teams","members","fa","matches","season"):await db.execute(f"DELETE FROM {tbl} WHERE guild_id=?",(gid,))
         await db.commit()
     await i.response.send_message(f"\U0001f5d1\ufe0f **{c['name']}** deleted.")
-@league.command(name="standings",description="Leaderboard")
-async def league_standings(i):
-    if not await need_league(i):return
-    ts=sorted(await teams_all(str(i.guild_id)),key=lambda x:x["mmr"],reverse=True)
-    if not ts:await i.response.send_message("No teams!");return
-    medals=["\U0001f947","\U0001f948","\U0001f949"]
-    lines=["**\u2694\ufe0f Standings**",""]+[f"{medals[n]if n<3 else str(n+1)+'.'} **{t['display']}** \u2014 {t['wins']}W/{t['losses']}L \u2014 **{get_rank(t['mmr'])}**"for n,t in enumerate(ts)]
-    await i.response.send_message("\n".join(lines))
 @league.command(name="info",description="League info")
 async def league_info(i):
     if not await need_league(i):return
@@ -627,7 +619,7 @@ async def league_status(i):
     ts=await teams_all(gid)
     total_matches=sum(t["wins"]+t["losses"]for t in ts)//2
     sorted_ts=sorted(ts,key=lambda x:x["mmr"],reverse=True)
-    board="\n".join(f"{n+1}. **{t['display']}** \u2014 {t['wins']}W/{t['losses']}L \u2014 **{get_rank(t['mmr'])}**"for n,t in enumerate(sorted_ts[:4]))
+    board="\n".join(f"{n+1}. **{t['display']}**  -  {t['wins']}W/{t['losses']}L  -  **{get_rank(t['mmr'])}**"for n,t in enumerate(sorted_ts[:4]))
     await i.response.send_message(f"\U0001f4ca **Season Status**\n\nWeek: **{weeks_done}/{SEASON_WEEKS}**\nWeeks left: **{weeks_left}**\nMatches played: **{total_matches}**\nTeams: **{len(ts)}**\n\n**Current Top 4:**\n{board}")
 
 bot.tree.add_command(league)
@@ -728,7 +720,7 @@ async def team_roster(i,team:str=None):
     gid=str(i.guild_id);t=await team_get(gid,team)if team else await team_by_player(gid,str(i.user.id))
     if not t:await i.response.send_message("\u274c Not found.",ephemeral=True);return
     crown="\U0001f451";players="\n".join(f"\u2022 <@{m}> {crown if m==t['captain_id']else''}"for m in t["members"])
-    await i.response.send_message(f"\u2694\ufe0f **{t['display']}** {t['wins']}W/{t['losses']}L \u2014 **{get_rank(t['mmr'])}**\n\n**Players ({len(t['members'])}/{MAX_TEAM}):**\n{players}")
+    await i.response.send_message(f"\u2694\ufe0f **{t['display']}** {t['wins']}W/{t['losses']}L  -  **{get_rank(t['mmr'])}**\n\n**Players ({len(t['members'])}/{MAX_TEAM}):**\n{players}")
 @team.command(name="leave",description="Leave (players only)")
 async def team_leave(i):
     gid=str(i.guild_id);uid=str(i.user.id);t=await team_by_player(gid,uid)
@@ -797,7 +789,7 @@ async def captain_swap(i,player:discord.Member):
 bot.tree.add_command(cap)
 
 mat=app_commands.Group(name="match",description="Match")
-@mat.command(name="report",description="Report result (captain)")
+@mat.command(name="result",description="Report result (captain)")
 @app_commands.describe(opponent="Opponent",score="e.g. 2-1")
 async def match_report(i,opponent:str,score:str):
     d=await need_captain(i)
@@ -970,7 +962,7 @@ async def create_mixedscrim(i,time:str,format:str):
     except:await i.response.send_message("\u274c Try: 20:00, 20.00, 8pm, 8:30pm",ephemeral=True);return
     await i.response.defer(ephemeral=True)
     gid=str(i.guild_id);max_p=6 if format=="3v3" else 4;today=datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    title=f"Mixed Scrim \u2014 {format.upper()} \u2014 Today {scrim_time}"
+    title=f"Mixed Scrim  -  {format.upper()}  -  Today {scrim_time}"
     msc=None
     for cat in i.guild.categories:
         if cat.name=="Scrims":
@@ -1002,6 +994,72 @@ async def teamscrim_ping(i):
     await i.response.send_message(f"{role.mention} {i.user.mention} from **{d}** is looking for a team scrim!")
 
 bot.tree.add_command(create_grp)
+
+# ===== /leaderboard =====
+leaderboard_msg_ids={}
+
+async def refresh_leaderboard(guild):
+    gid=str(guild.id)
+    if gid not in leaderboard_msg_ids:return
+    msg_data=leaderboard_msg_ids[gid]
+    ch=guild.get_channel(int(msg_data["ch"]))
+    if not ch:return
+    ts=sorted(await teams_all(gid),key=lambda x:x["mmr"],reverse=True)
+    if not ts:return
+    lines=[]
+    for n,t in enumerate(ts[:25]):
+        lines.append(f"`{n+1:>2}.` **{t['display']}** - {t['wins']}W/{t['losses']}L - {get_rank(t['mmr'])} `{t['mmr']} MMR`")
+    if len(ts)>25:lines.append(f"\n*...and {len(ts)-25} more teams*")
+    c=await cfg_get(gid)
+    season_name=c["name"]if c else "EGL"
+    embed=discord.Embed(title=f"\U0001f4ca {season_name} Leaderboard",description="\n".join(lines),color=0x5865F2)
+    embed.set_footer(text=f"{len(ts)} teams - Auto-refreshed")
+    try:
+        msg=await ch.fetch_message(int(msg_data["msg"]))
+        await msg.edit(embed=embed)
+    except:pass
+
+@bot.tree.command(name="leaderboard",description="Post/refresh the leaderboard in #leaderboard (League Admin only)")
+async def leaderboard_cmd(i):
+    if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
+    gid=str(i.guild_id)
+    lb_ch=None
+    for cat in i.guild.categories:
+        if cat.name=="Matches":
+            for ch in cat.text_channels:
+                if ch.name=="leaderboard":lb_ch=ch;break
+    if not lb_ch:await i.response.send_message("\u274c No #leaderboard channel. Run `/setup run`.",ephemeral=True);return
+    if i.channel.id!=lb_ch.id:await i.response.send_message(f"\u274c Use this in {lb_ch.mention}.",ephemeral=True);return
+    ts=sorted(await teams_all(gid),key=lambda x:x["mmr"],reverse=True)
+    if not ts:await i.response.send_message("No teams yet.",ephemeral=True);return
+    lines=[]
+    for n,t in enumerate(ts[:25]):
+        lines.append(f"`{n+1:>2}.` **{t['display']}** - {t['wins']}W/{t['losses']}L - {get_rank(t['mmr'])} `{t['mmr']} MMR`")
+    if len(ts)>25:lines.append(f"\n*...and {len(ts)-25} more teams*")
+    c=await cfg_get(gid)
+    season_name=c["name"]if c else"EGL"
+    embed=discord.Embed(title=f"\U0001f4ca {season_name} Leaderboard",description="\n".join(lines),color=0x5865F2)
+    embed.set_footer(text=f"{len(ts)} teams - Auto-refreshed")
+    # Delete old message if exists
+    if gid in leaderboard_msg_ids:
+        try:
+            old_ch=i.guild.get_channel(int(leaderboard_msg_ids[gid]["ch"]))
+            if old_ch:
+                try:
+                    old_msg=await old_ch.fetch_message(int(leaderboard_msg_ids[gid]["msg"]))
+                    await old_msg.delete()
+                except:pass
+        except:pass
+    msg=await lb_ch.send(embed=embed)
+    leaderboard_msg_ids[gid]={"ch":str(lb_ch.id),"msg":str(msg.id)}
+    await i.response.send_message("\u2705 Leaderboard posted!",ephemeral=True)
+
+@tasks.loop(minutes=1)
+async def leaderboard_refresh():
+    for g in bot.guilds:
+        await refresh_leaderboard(g)
+@leaderboard_refresh.before_loop
+async def lb_bef():await bot.wait_until_ready()
 
 @bot.tree.command(name="backup",description="Download league database backup (League Admin only)")
 async def backup_cmd(i):
@@ -1048,26 +1106,29 @@ async def scrim_check():
                 for ch in cat.text_channels:
                     if ch.name=="mixed-scrims":msc=ch;break
         if not msc:continue
-        # 5pm GMT — auto daily signup post
-        if hour==20 and minute==0:
-            if await get_scrim_session(gid,today):continue
-            async with aiosqlite.connect(DB)as db:
-                await db.execute("DELETE FROM scrim_signups WHERE guild_id=? AND date=?",(gid,today));await db.commit()
-            embed=discord.Embed(title="Mixed Scrim \u2014 Today 8pm",description="*Click Sign Up below to join!*",color=0x5865F2)
-            embed.add_field(name="Signed Up",value="0/6 active",inline=True)
-            embed.set_footer(text="Signups close at 7:55pm")
-            view=ScrimSignupView(gid,today)
-            msg=await msc.send(embed=embed,view=view)
-            async with aiosqlite.connect(DB)as db:
-                await db.execute("INSERT OR REPLACE INTO scrim_sessions VALUES(?,?,NULL,?,6,'Mixed Scrim \u2014 Today 8pm',NULL)",(gid,today,str(msg.id)));await db.commit()
-        # Every 5 min — refresh embed silently
+        # Every 5 min - refresh embed
         if minute%5==0:
             await update_scrim_embed(gid,today)
-            members=await scrim_signups_active(gid,today)
-            if members:
-                pings=" ".join(f"<@{uid}>"for uid in members)
-                await msc.send(f"\U0001f514 Scrim starts in 5 minutes! {pings}")
+        # Check for 5-min ping
+        async with aiosqlite.connect(DB)as db:
+            db.row_factory=aiosqlite.Row
+            async with db.execute("SELECT * FROM scrim_sessions WHERE guild_id=? AND date=? AND unix_time IS NOT NULL",(gid,today))as c:
+                sessions=await c.fetchall()
+        for sess in sessions:
+            sess=dict(sess)
+            if not sess.get("unix_time"):continue
+            dt=datetime.fromtimestamp(sess["unix_time"],tz=timezone.utc)
+            diff=(dt-now).total_seconds()
+            if 280<=diff<=310:
+                members=await scrim_signups_active(gid,today)
+                if members:
+                    pings=" ".join(f"<@{uid}>"for uid in members)
+                    await msc.send(f"\U0001f514 **{sess.get('scrim_title','Mixed Scrim')}** starts in 5 minutes! {pings}")
         # Midnight cleanup
+        if hour==0 and minute==0:
+            async with aiosqlite.connect(DB)as db:
+                await db.execute("DELETE FROM scrim_signups WHERE guild_id=? AND date<?",(gid,today))
+                await db.execute("DELETE FROM scrim_sessions WHERE guild_id=? AND date<?",(gid,today));await db.commit()
 
 @scrim_check.before_loop
 async def scrim_bef():await bot.wait_until_ready()
@@ -1092,7 +1153,7 @@ async def match_reminders():
                 th=g.get_thread(int(row["thread_id"]))if row.get("thread_id")else None
                 if th:
                     unix=int(dt.timestamp())
-                    await th.send(f"\u23f0 **Match starts in 1 hour!** <t:{unix}:f>\n\nBoth teams be ready! Use `/match report` after the match.")
+                    await th.send(f"\u23f0 **Match starts in 1 hour!** <t:{unix}:f>\n\nBoth teams be ready! Use `/match result` after the match.")
         except:continue
 
 @match_reminders.before_loop
@@ -1129,6 +1190,7 @@ async def on_ready():
     weekly_check.start()
     scrim_check.start()
     match_reminders.start()
+    leaderboard_refresh.start()
 
 bot.tree.add_command(setup)
 
