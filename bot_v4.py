@@ -159,7 +159,7 @@ async def add_roles(guild,member,team_display,captain=False):
         if fa and fa in member.roles:await member.remove_roles(fa)
         p=find_role(guild,"Player")
         if p:await member.add_roles(p)
-        tr=find_role(guild,team_display)or await guild.create_role(name=team_display,mentionable=True)
+        tr=find_role(guild,team_display)or await guild.create_role(name=team_display,mentionable=True,hoist=True)
         await member.add_roles(tr)
         if captain:
             cr=find_role(guild,"Captain")
