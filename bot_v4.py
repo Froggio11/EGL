@@ -982,7 +982,7 @@ async def create_mixedscrim(i,time:str,format:str):
     embed.add_field(name="Signed Up",value=f"0/{max_p}",inline=True)
     embed.add_field(name="Your Time",value=f"<t:{unix}:f>",inline=True)
     embed.set_footer(text="Click Sign Up to join")
-    view=ScrimSignupView(gid,today)    msg=await msc.send(embed=embed,view=view)
+    view=ScrimSignupView(gid,today);msg=await msc.send(embed=embed,view=view)
     async with aiosqlite.connect(DB)as db:await db.execute("INSERT OR REPLACE INTO scrim_sessions VALUES(?,?,NULL,?,?,?,?)",(gid,today,str(msg.id),max_p,title,unix));await db.commit()
     await i.followup.send(f"\u2705 Mixed {format} scrim created! ({scrim_time})",ephemeral=True)
 
