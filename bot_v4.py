@@ -257,6 +257,10 @@ class ScrimSignupView(discord.ui.View):
     @discord.ui.button(label="Sign Up",style=discord.ButtonStyle.green,emoji="\u2795")
     async def signup(self,i,btn):
         gid=self.gid;date=self.date;uid=str(i.user.id)
+        # Prevent duplicate
+        async with aiosqlite.connect(DB)as db:
+            async with db.execute("SELECT 1 FROM scrim_signups WHERE guild_id=? AND date=? AND user_id=?",(gid,date,uid))as c:
+                if await c.fetchone():await i.response.send_message("\u274c Already signed up!",ephemeral=True);return
         count=await scrim_signup_count(gid,date)
         max_p=await scrim_max_players(gid,date)
         async with aiosqlite.connect(DB)as db:
@@ -978,7 +982,7 @@ async def create_mixedscrim(i,time:str,format:str):
     embed.add_field(name="Signed Up",value=f"0/{max_p}",inline=True)
     embed.add_field(name="Your Time",value=f"<t:{unix}:f>",inline=True)
     embed.set_footer(text="Click Sign Up to join")
-    view=ScrimSignupView(gid,today);msg=await msc.send(embed=embed,view=view)
+    view=ScrimSignupView(gid,today)    msg=await msc.send(embed=embed,view=view)
     async with aiosqlite.connect(DB)as db:await db.execute("INSERT OR REPLACE INTO scrim_sessions VALUES(?,?,NULL,?,?,?,?)",(gid,today,str(msg.id),max_p,title,unix));await db.commit()
     await i.followup.send(f"\u2705 Mixed {format} scrim created! ({scrim_time})",ephemeral=True)
 
