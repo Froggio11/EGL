@@ -45,6 +45,10 @@ async def init_db():
         CREATE TABLE IF NOT EXISTS scrim_sessions(guild_id TEXT,date TEXT,thread_id TEXT,msg_id TEXT,max_players INT DEFAULT 6,PRIMARY KEY(guild_id,date));
         CREATE TABLE IF NOT EXISTS scrim_signups(guild_id TEXT,date TEXT,user_id TEXT,position INT,PRIMARY KEY(guild_id,date,user_id));
         """)
+        # Migrate: add new columns to scrim_sessions if missing
+        for col,typ in [("max_players","INT DEFAULT 6"),("scrim_title","TEXT"),("unix_time","INT")]:
+            try:await db.execute(f"ALTER TABLE scrim_sessions ADD COLUMN {col} {typ}")
+            except:pass
         await db.commit()
 
 async def cfg_get(gid):
@@ -257,7 +261,7 @@ class ScrimSignupView(discord.ui.View):
         max_p=await scrim_max_players(gid,date)
         async with aiosqlite.connect(DB)as db:
             await db.execute("INSERT OR IGNORE INTO scrim_signups VALUES(?,?,?,?)",(gid,date,uid,count));await db.commit()
-        status="Active"if count<6 else f"Queue (#{count-5})"
+        status="Active"if count<max_p else f"Queue (#{count-max_p+1})"
         await i.response.send_message(f"\u2705 Signed up! ({min(count+1,max_p)}/{max_p}) {status}",ephemeral=True)
         await update_scrim_embed(gid,date)
     @discord.ui.button(label="Leave",style=discord.ButtonStyle.red,emoji="\u274c")
