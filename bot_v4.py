@@ -471,7 +471,7 @@ async def scrimguide_cmd(i):
     sg+="Captains use `/teamscrim` in #team-scrims to find opponents.\n"
     sg+="This pings @TeamScrims with your team name.\n\n"
     sg+="\u2501"*22+"\n"
-    sg+="**Setup:** Run `/setup scrimbot` first to create the Scrims channels.\n"
+    sg+="**Setup:** Run `/scrimbot setup` first to create the Scrims channels.\n"
     sg+="**Guide:** Use `/scrimguide` to repost this anytime."
     await i.response.send_message(sg)
 
@@ -515,7 +515,7 @@ async def setup_run(i):
     msg+=f"{mat.mention} \u2014 Match schedule\n"
     msg+=f"{res.mention} \u2014 Results\n"
     msg+=f"{lb.mention} \u2014 Leaderboard\n\n"
-    msg+="Run `/league create` to start your first season.\nWant scrims? `/setup scrimbot` to add those channels."
+    msg+="Run `/league create` to start your first season.\nWant scrims? `/scrimbot setup` to add those channels."
     await i.followup.send(msg)
 @setup.command(name="reset",description="Delete all bot channels and reset")
 async def setup_reset(i):
@@ -548,17 +548,40 @@ async def setup_reset(i):
     async with aiosqlite.connect(DB)as db:await db.execute("DELETE FROM setup_data WHERE guild_id=?",(gid,));await db.commit()
     await i.followup.send("\u2705 Reset complete.")
 
-@setup.command(name="scrimbot",description="Set up the Scrims category + channels (League Admin)")
-async def setup_scrimbot(i):
+# ===== /scrimbot =====
+scrimbot_grp=app_commands.Group(name="scrimbot",description="Scrim management (League Admin)")
+@scrimbot_grp.command(name="setup",description="Create the Scrims category + channels")
+async def scrimbot_setup(i):
     if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
     await i.response.defer()
+    ev=i.guild.default_role;ar=discord.utils.get(i.guild.roles,name=ADMIN_ROLE)
+    bot_ow=discord.PermissionOverwrite(send_messages=True,read_messages=True)
+    ao={ev:discord.PermissionOverwrite(send_messages=False,read_messages=True),i.guild.me:bot_ow}
+    if ar:ao[ar]=discord.PermissionOverwrite(send_messages=True,read_messages=True)
     try:
         scat=await i.guild.create_category("Scrims")
         msc=await i.guild.create_text_channel("mixed-scrims",category=scat)
         tsc=await i.guild.create_text_channel("team-scrims",category=scat)
-        sgch=await i.guild.create_text_channel("scrimguide",category=scat,overwrites=admin_only)
+        sgch=await i.guild.create_text_channel("scrimguide",category=scat,overwrites=ao)
     except Exception as e:await i.followup.send(f"\u274c Failed (may already exist): {e}");return
-    await i.followup.send(f"\U0001f3ae **Scrims activated!**\n{msc.mention} - Mixed scrims\n{tsc.mention} - Team scrims\n{sgch.mention} - Scrim guide\n\nUse `/create mixedscrim` and `/teamscrim` to get started.")
+    await i.followup.send(f"\U0001f3ae **Scrims activated!**\n{msc.mention} - Mixed scrims\n{tsc.mention} - Team scrims\n{sgch.mention} - Scrim guide (read-only)\n\nUse `/create mixedscrim` and `/teamscrim` to get started.")
+@scrimbot_grp.command(name="reset",description="Delete the Scrims category + channels")
+async def scrimbot_reset(i):
+    if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
+    await i.response.defer()
+    for cat in i.guild.categories:
+        if cat.name=="Scrims":
+            try:
+                for ch in list(cat.channels):
+                    try:await ch.delete()
+                    except:pass
+                await cat.delete()
+            except:pass
+            await i.followup.send("\u2705 Scrims removed.");return
+    await i.followup.send("\u274c No Scrims category found.")
+
+
+
 
 @bot.tree.command(name="setchannel",description="Set #teams for team threads (League Admin only)")
 @app_commands.describe(channel="The #teams channel")
@@ -1006,7 +1029,7 @@ async def create_mixedscrim(i,time:str,format:str):
         dt=datetime.now(timezone.utc).replace(hour=utc_h,minute=mi,second=0,tzinfo=timezone.utc);unix=int(dt.timestamp())
     except:await i.response.send_message("\u274c Try: 20:00, 20.00, 8pm, 8:30pm",ephemeral=True);return
     await i.response.defer(ephemeral=True)
-    if not has_scrims(i.guild):await i.response.send_message("\u274c Run `/setup scrimbot` first.",ephemeral=True);return
+    if not has_scrims(i.guild):await i.response.send_message("\u274c Run `/scrimbot setup` first.",ephemeral=True);return
     gid=str(i.guild_id);max_p=6 if format=="3v3" else 4;today=datetime.now(timezone.utc).strftime("%Y-%m-%d")
     title=f"Mixed Scrim  -  {format.upper()}  -  Today {scrim_time}"
     msc=None
@@ -1028,7 +1051,7 @@ async def create_mixedscrim(i,time:str,format:str):
 async def teamscrim_ping(i):
     d=await need_captain(i)
     if not d:return
-    if not has_scrims(i.guild):await i.response.send_message("\u274c Run `/setup scrimbot` first.",ephemeral=True);return
+    if not has_scrims(i.guild):await i.response.send_message("\u274c Run `/scrimbot setup` first.",ephemeral=True);return
     role=find_role(i.guild,"TeamScrims")
     if not role:await i.response.send_message("\u274c @TeamScrims role not found.",ephemeral=True);return
     tsc=None
@@ -1240,6 +1263,7 @@ async def on_ready():
     match_reminders.start()
     leaderboard_refresh.start()
 
+bot.tree.add_command(scrimbot_grp)
 bot.tree.add_command(setup)
 
 if __name__=="__main__":
