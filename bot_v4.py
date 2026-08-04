@@ -475,17 +475,6 @@ async def scrimguide_cmd(i):
     sg+="**Guide:** Use `/scrimguide` to repost this anytime."
     await i.response.send_message(sg)
 
-@setup.command(name="scrimbot",description="Set up the Scrims category + channels (League Admin)")
-async def setup_scrimbot(i):
-    if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
-    await i.response.defer()
-    try:
-        scat=await i.guild.create_category("Scrims")
-        msc=await i.guild.create_text_channel("mixed-scrims",category=scat)
-        tsc=await i.guild.create_text_channel("team-scrims",category=scat)
-    except Exception as e:await i.followup.send(f"\u274c Failed (may already exist): {e}");return
-    await i.followup.send(f"\U0001f3ae **Scrims activated!**\n{msc.mention} \u2014 Mixed scrims\n{tsc.mention} \u2014 Team scrims\n\nUse `/create mixedscrim` and `/teamscrim` to get started.")
-
 # ===== /setup /setchannel /league /team /disband /teaminfo /captain /match /stats /fa /mmr /test /schedule /reschedule /backup /restore =====
 setup=app_commands.Group(name="setup",description="Bot setup")
 @setup.command(name="run",description="Create all league channels (League Admin only)")
@@ -558,6 +547,17 @@ async def setup_reset(i):
             break
     async with aiosqlite.connect(DB)as db:await db.execute("DELETE FROM setup_data WHERE guild_id=?",(gid,));await db.commit()
     await i.followup.send("\u2705 Reset complete.")
+
+@setup.command(name="scrimbot",description="Set up the Scrims category + channels (League Admin)")
+async def setup_scrimbot(i):
+    if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
+    await i.response.defer()
+    try:
+        scat=await i.guild.create_category("Scrims")
+        msc=await i.guild.create_text_channel("mixed-scrims",category=scat)
+        tsc=await i.guild.create_text_channel("team-scrims",category=scat)
+    except Exception as e:await i.followup.send(f"\u274c Failed (may already exist): {e}");return
+    await i.followup.send(f"\U0001f3ae **Scrims activated!**\n{msc.mention} - Mixed scrims\n{tsc.mention} - Team scrims\n\nUse `/create mixedscrim` and `/teamscrim` to get started.")
 
 @bot.tree.command(name="setchannel",description="Set #teams for team threads (League Admin only)")
 @app_commands.describe(channel="The #teams channel")
