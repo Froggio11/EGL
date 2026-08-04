@@ -982,6 +982,8 @@ bot.tree.add_command(test)
 @app_commands.describe(datetime_str=SCHED_HELP)
 async def schedule_cmd(i,datetime_str:str):
     if not isinstance(i.channel,discord.Thread):await i.response.send_message("\u274c Match threads only.",ephemeral=True);return
+    d=await need_captain(i)
+    if not d:return
     try:
         dt=parse_schedule(datetime_str)
         sched=dt.strftime(SCHED_FMT+" GMT");unix=int(dt.timestamp())
@@ -993,6 +995,8 @@ async def schedule_cmd(i,datetime_str:str):
 @app_commands.describe(datetime_str=SCHED_HELP)
 async def reschedule_cmd(i,datetime_str:str):
     if not isinstance(i.channel,discord.Thread):await i.response.send_message("\u274c Match threads only.",ephemeral=True);return
+    d=await need_captain(i)
+    if not d:return
     gid=str(i.guild_id)
     try:
         dt=parse_schedule(datetime_str)
