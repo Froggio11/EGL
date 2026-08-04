@@ -556,8 +556,9 @@ async def setup_scrimbot(i):
         scat=await i.guild.create_category("Scrims")
         msc=await i.guild.create_text_channel("mixed-scrims",category=scat)
         tsc=await i.guild.create_text_channel("team-scrims",category=scat)
+        sgch=await i.guild.create_text_channel("scrimguide",category=scat,overwrites=admin_only)
     except Exception as e:await i.followup.send(f"\u274c Failed (may already exist): {e}");return
-    await i.followup.send(f"\U0001f3ae **Scrims activated!**\n{msc.mention} - Mixed scrims\n{tsc.mention} - Team scrims\n\nUse `/create mixedscrim` and `/teamscrim` to get started.")
+    await i.followup.send(f"\U0001f3ae **Scrims activated!**\n{msc.mention} - Mixed scrims\n{tsc.mention} - Team scrims\n{sgch.mention} - Scrim guide\n\nUse `/create mixedscrim` and `/teamscrim` to get started.")
 
 @bot.tree.command(name="setchannel",description="Set #teams for team threads (League Admin only)")
 @app_commands.describe(channel="The #teams channel")
