@@ -143,6 +143,10 @@ async def is_on_cooldown(gid,uid):
 def find_role(guild,name):return discord.utils.get(guild.roles,name=name)
 def is_admin(member):return any(r.name==ADMIN_ROLE for r in member.roles)
 def is_tester(member):return any(r.name==TESTER_ROLE for r in member.roles)
+def has_scrims(guild):
+    for cat in guild.categories:
+        if cat.name=="Scrims":return True
+    return False
 def get_rank(mmr):
     rank=RANKS[0][1]
     for floor,name in RANKS:
@@ -427,11 +431,6 @@ async def guide_cmd(i):
     p1+="Matches every **Sunday 10pm GMT**. Map voted by captains.\n"
     p1+="Max 1 Free Agent sub per match. 24h cooldown after leaving.\n\n"
     p1+="\u2501"*22+"\n"
-    p1+="\U0001f3ae **Scrims (Casual)**\n"
-    p1+="Daily mixed scrims in #mixed-scrims — sign up and play!\n"
-    p1+="Team scrims in #team-scrims — `/teamscrim` to find opponents.\n"
-    p1+="Create your own: `/create mixedscrim time:20:00 format:3v3`\n\n"
-    p1+="\u2501"*22+"\n"
     p1+="\U0001f91d **Free Agents**\n"
     p1+="Subs who fill in when teams are short. FAs keep their role."
     await i.response.send_message(p1)
@@ -447,14 +446,45 @@ async def guide_cmd(i):
     p2+="\U0001f4c5 **Match**\n"
     p2+="`/schedule 05 Aug 19:00` / `/reschedule` — Set match time\n"
     p2+="`/match result opponent:Name score:2-1` — Report result\n\n"
-    p2+="\U0001f3ae **Scrims**\n"
-    p2+="`/create mixedscrim time:20:00 format:3v3` — Make a scrim\n"
-    p2+="`/teamscrim` — Ping @TeamScrims *(captain, in #team-scrims)*\n\n"
     p2+="\U0001f4ca **Stats**\n"
     p2+="`/stats team` `/league standings` `/league status`\n\n"
     p2+="\u2501"*22+"\n"
     p2+="*Questions? Ask a **League Admin**. Good luck, Goons!*"
     await i.followup.send(p2)
+
+# ===== /scrimguide =====
+@bot.tree.command(name="scrimguide",description="Post the scrim guide (League Admin)")
+async def scrimguide_cmd(i):
+    if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
+    sg="\U0001f3ae **Scrims Guide**\n\n"
+    sg+="Scrims are casual practice matches — no league points, just fun.\n\n"
+    sg+="\u2501"*22+"\n"
+    sg+="**Mixed Scrims**\n"
+    sg+="Anyone can create one: `/create mixedscrim time:20:00 format:3v3`\n"
+    sg+="- 3v3 = 6 spots | 2v2 = 4 spots\n"
+    sg+="- People click **Sign Up** to join (leave anytime)\n"
+    sg+="- Embed auto-updates with the player list\n"
+    sg+="- 5 minutes before start, everyone gets pinged\n\n"
+    sg+="**Time formats:** `20:00`, `8pm`, `8:30pm`\n\n"
+    sg+="\u2501"*22+"\n"
+    sg+="**Team Scrims**\n"
+    sg+="Captains use `/teamscrim` in #team-scrims to find opponents.\n"
+    sg+="This pings @TeamScrims with your team name.\n\n"
+    sg+="\u2501"*22+"\n"
+    sg+="**Setup:** Run `/setup scrimbot` first to create the Scrims channels.\n"
+    sg+="**Guide:** Use `/scrimguide` to repost this anytime."
+    await i.response.send_message(sg)
+
+@setup.command(name="scrimbot",description="Set up the Scrims category + channels (League Admin)")
+async def setup_scrimbot(i):
+    if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
+    await i.response.defer()
+    try:
+        scat=await i.guild.create_category("Scrims")
+        msc=await i.guild.create_text_channel("mixed-scrims",category=scat)
+        tsc=await i.guild.create_text_channel("team-scrims",category=scat)
+    except Exception as e:await i.followup.send(f"\u274c Failed (may already exist): {e}");return
+    await i.followup.send(f"\U0001f3ae **Scrims activated!**\n{msc.mention} \u2014 Mixed scrims\n{tsc.mention} \u2014 Team scrims\n\nUse `/create mixedscrim` and `/teamscrim` to get started.")
 
 # ===== /setup /setchannel /league /team /disband /teaminfo /captain /match /stats /fa /mmr /test /schedule /reschedule /backup /restore =====
 setup=app_commands.Group(name="setup",description="Bot setup")
@@ -483,15 +513,21 @@ async def setup_run(i):
         mat=await i.guild.create_text_channel("matches",category=mcat,overwrites=react_only)
         res=await i.guild.create_text_channel("results",category=mcat,overwrites=react_only)
         lb=await i.guild.create_text_channel("leaderboard",category=mcat,overwrites=admin_only)
-        scat=await i.guild.create_category("Scrims")
-        msc=await i.guild.create_text_channel("mixed-scrims",category=scat)
-        tsc=await i.guild.create_text_channel("team-scrims",category=scat)
     except Exception as e:await i.followup.send(f"\u274c Failed: {e}");return
-    # Create Team Scrims channel if Scrims category exists
     async with aiosqlite.connect(DB)as db:
         await db.execute("INSERT INTO setup_data VALUES(?,?,?,?,?,?,?,?,?,?)",(gid,"EGL",str(lcat.id),str(mcat.id),str(ann.id),str(gen.id),str(tch.id),str(fa.id),str(mat.id),str(res.id)))
         await db.commit()
-    # Create Team Scrims + Mixed Scrims chann    await i.followup.send("\u2694\ufe0f **Elite Goon League is live.**\nAll channels and permissions have been configured.\n\n" f"{ann.mention} \u2014 Announcements\n{guide_ch.mention} \u2014 Player guide\n{gen.mention} \u2014 General chat\n{tch.mention} \u2014 Team threads\n{fa.mention} \u2014 Free agents\n{mat.mention} \u2014 Match schedule\n{res.mention} \u2014 Results\n{lb.mention} \u2014 Leaderboard\n{msc.mention} \u2014 Mixed scrims\n{tsc.mention} \u2014 Team scrims\n\nRun `/league create` to start your first season.")
+    msg="\u2694\ufe0f **Elite Goon League is live.**\nAll channels and permissions have been configured.\n\n"
+    msg+=f"{ann.mention} \u2014 Announcements\n"
+    msg+=f"{guide_ch.mention} \u2014 Player guide\n"
+    msg+=f"{gen.mention} \u2014 General chat\n"
+    msg+=f"{tch.mention} \u2014 Team threads\n"
+    msg+=f"{fa.mention} \u2014 Free agents\n"
+    msg+=f"{mat.mention} \u2014 Match schedule\n"
+    msg+=f"{res.mention} \u2014 Results\n"
+    msg+=f"{lb.mention} \u2014 Leaderboard\n\n"
+    msg+="Run `/league create` to start your first season.\nWant scrims? `/setup scrimbot` to add those channels."
+    await i.followup.send(msg)
 @setup.command(name="reset",description="Delete all bot channels and reset")
 async def setup_reset(i):
     if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
@@ -969,6 +1005,7 @@ async def create_mixedscrim(i,time:str,format:str):
         dt=datetime.now(timezone.utc).replace(hour=utc_h,minute=mi,second=0,tzinfo=timezone.utc);unix=int(dt.timestamp())
     except:await i.response.send_message("\u274c Try: 20:00, 20.00, 8pm, 8:30pm",ephemeral=True);return
     await i.response.defer(ephemeral=True)
+    if not has_scrims(i.guild):await i.response.send_message("\u274c Run `/setup scrimbot` first.",ephemeral=True);return
     gid=str(i.guild_id);max_p=6 if format=="3v3" else 4;today=datetime.now(timezone.utc).strftime("%Y-%m-%d")
     title=f"Mixed Scrim  -  {format.upper()}  -  Today {scrim_time}"
     msc=None
@@ -990,6 +1027,7 @@ async def create_mixedscrim(i,time:str,format:str):
 async def teamscrim_ping(i):
     d=await need_captain(i)
     if not d:return
+    if not has_scrims(i.guild):await i.response.send_message("\u274c Run `/setup scrimbot` first.",ephemeral=True);return
     role=find_role(i.guild,"TeamScrims")
     if not role:await i.response.send_message("\u274c @TeamScrims role not found.",ephemeral=True);return
     tsc=None
@@ -1114,6 +1152,7 @@ async def scrim_check():
                 for ch in cat.text_channels:
                     if ch.name=="mixed-scrims":msc=ch;break
         if not msc:continue
+        if not has_scrims(g):continue
         # Every 5 min - refresh embed
         if minute%5==0:
             await update_scrim_embed(gid,today)
