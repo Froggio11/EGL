@@ -153,6 +153,16 @@ def get_rank(mmr):
         if mmr>=floor:rank=name
     return rank
 
+def rank_progress(mmr):
+    cur_rank=RANKS[0];nxt=None
+    for i,(floor,name)in enumerate(RANKS):
+        if mmr>=floor:cur_rank=(floor,name)
+        else:nxt=(floor,name);break
+    if not nxt or cur_rank[0]==nxt[0]:return cur_rank[1],10,cur_rank[1]
+    pct=min(10,int((mmr-cur_rank[0])/(nxt[0]-cur_rank[0])*10))
+    bar="\u2588"*pct+"\u2591"*(10-pct)
+    return cur_rank[1],pct,nxt[1]
+
 async def add_roles(guild,member,team_display,captain=False):
     try:
         fa=find_role(guild,"Free Agent")
@@ -423,58 +433,19 @@ async def gen_matches(guild,c,force=False):
 @bot.tree.command(name="guide",description="Post the league guide (League Admin only)")
 async def guide_cmd(i):
     if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
-    p1="\U0001f4d6 **EGL - Elite Goon League**\n"
-    p1+="Welcome to the EGL, our own 2v2 competitive league for Elements Divided.\n\n"
-    p1+="\u2501"*22+"\n"
-    p1+="\U0001f3c6 **League Format**\n"
-    p1+="- Teams of **up to 3 players**\n"
-    p1+="- **8-week season**, every team plays every other team\n"
-    p1+="- Matches generated **every Sunday at 10pm GMT**\n"
-    p1+="- Captains **vote on the map**: Chessboard, Portal Mayhem, Construction Site, or Parking Lot. Same = that map, different = coin flip!\n"
-    p1+="- Top 4 advance to Finals: round-robin, then Grand Final!\n\n"
-    p1+="\u2501"*22+"\n"
-    p1+="\U0001f4ca **Ranking & MMR**\n"
-    p1+="Every team has a hidden **MMR rating**. All start at **1000 MMR** (Monk rank).\n\n"
-    p1+="**Ranks:** Adept (0-899) \u2192 Lotus (900-999) \u2192 **Monk** (1000-1049) \u2192 Warden (1050-1099) \u2192 Avatar (1100-1149) \u2192 \U0001f451 Raava (1150+)\n\n"
-    p1+="**How MMR changes:**\n"
-    p1+="- Beat a stronger team = bigger gain | Lose = smaller loss\n"
-    p1+="- Beat a weaker team = smaller gain | Lose = bigger loss\n"
-    p1+="- Equal teams = about **25 MMR** won or lost\n"
-    p1+="- Returning players: new team starts at **old team's MMR**\n\n"
-    p1+="\u2501"*22+"\n"
-    p1+="\u23f1\ufe0f **Penalties**\n"
-    p1+="- Leave or disband a team? **24-hour cooldown** before joining or creating another.\n"
-    p1+="- This keeps the league fair and stops team hopping.\n\n"
-    p1+="\u2501"*22+"\n"
-    p1+="\U0001f91d **Free Agents (Subs)**\n"
-    p1+="- Fill-in players when a team is short or someone drops out.\n"
-    p1+="- Max **1 Free Agent per match**.\n"
-    p1+="- FAs keep their role, do NOT permanently join your team.\n"
-    p1+="- Captains use `/fa request` to find a sub."
-    await i.response.send_message(p1)
-    p2="\U0001f4cb **Commands**\n\n"
-    p2+="\u2694\ufe0f **Team**\n"
-    p2+="`/team create name:Name` — Create a team, become captain\n"
-    p2+="`/team invite @player` — Invite someone *(captain)*\n"
-    p2+="`/team roster` / `/teaminfo name:Name` — See team info\n"
-    p2+="`/team kick @player` — Remove someone *(captain)*\n"
-    p2+="`/team leave` — Leave your team\n"
-    p2+="`/disband` — Delete your team *(captain)*\n"
-    p2+="`/captain swap @player` — Transfer captain role\n\n"
-    p2+="\U0001f91d **Free Agent**\n"
-    p2+="`/fa register` / `unregister` / `list` — Manage FA status\n"
-    p2+="`/fa request` — Ping FAs to find a sub *(captain)*\n\n"
-    p2+="\U0001f4c5 **Match** *(captains only, in your match thread)*\n"
-    p2+="`/schedule 05 Aug 19:00` — Set match time\n"
-    p2+="`/reschedule 05 Aug 20:00` — Change time (other captain approves)\n"
-    p2+="`/match result opponent:Name score:2-1` — Report result\n\n"
-    p2+="\U0001f4ca **Stats**\n"
-    p2+="`/stats team name:Name` — Wins, losses, rank, MMR\n"
-    p2+="`/leaderboard` — Full leaderboard (auto-refreshes)\n"
-    p2+="`/league status` — Weeks remaining + top 4\n\n"
-    p2+="\u2501"*22+"\n"
-    p2+="*Questions? Ask a **League Admin**. Good luck, Goons!*"
-    await i.followup.send(p2)
+    embed1=discord.Embed(title="\U0001f4d6 EGL - Elite Goon League",description="Welcome to the EGL, our own 2v2 competitive league for Elements Divided.",color=0x5865F2)
+    embed1.add_field(name="\U0001f3c6 League Format",value="- Teams of **up to 3 players**\n- **8-week season**\n- Matches every **Sunday 10pm GMT**\n- Captains vote on map: Chessboard, Portal Mayhem, Construction Site, Parking Lot\n- Top 4 advance to Finals",inline=False)
+    embed1.add_field(name="\U0001f4ca Ranking & MMR",value="Adept (0-899) \u2192 Lotus (900-999) \u2192 **Monk** (1000-1049) \u2192 Warden (1050-1099) \u2192 Avatar (1100-1149) \u2192 \U0001f451 Raava (1150+)\n\nBeat stronger teams = bigger gain. Lose to weaker teams = bigger loss. Equal teams = ~25 MMR.",inline=False)
+    embed1.add_field(name="\u23f1\ufe0f Penalties",value="Leave/disband = **24-hour cooldown** before joining or creating a new team.",inline=False)
+    embed1.add_field(name="\U0001f91d Free Agents (Subs)",value="Fill-in players. Max 1 per match. Keep FA role, do NOT join permanently.",inline=False)
+    await i.response.send_message(embed=embed1)
+    embed2=discord.Embed(title="\U0001f4cb Commands",color=0x5865F2)
+    embed2.add_field(name="\u2694\ufe0f Team",value="`/team create` `/team invite` `/teaminfo` `/team kick` `/team leave` `/disband` `/captain swap`",inline=False)
+    embed2.add_field(name="\U0001f91d Free Agent",value="`/fa register` `/fa unregister` `/fa list` `/fa request`",inline=False)
+    embed2.add_field(name="\U0001f4c5 Match *(captains only)*",value="`/schedule 05 Aug 19:00` — Set match time\n`/reschedule` — Change time (needs approval)\n`/match result opponent:Name score:2-1` — Report result",inline=False)
+    embed2.add_field(name="\U0001f4ca Stats",value="`/teaminfo name:Name` — Rank, MMR, progress bar, roster\n`/leaderboard` — Full leaderboard (auto-refreshes)\n`/league status` — Weeks remaining + top 4",inline=False)
+    embed2.set_footer(text="Questions? Ask a League Admin. Good luck, Goons!")
+    await i.followup.send(embed=embed2)
 
 # ===== /scrimguide =====
 @bot.tree.command(name="scrimguide",description="Post the scrim guide (League Admin)")
@@ -806,13 +777,6 @@ async def team_kick(i,player:discord.Member):
             try:await th.remove_user(player)
             except:pass
     await i.followup.send(f"\U0001f9b5 **{player.display_name}** has been kicked.")
-@team.command(name="roster",description="Show roster")
-@app_commands.describe(team="Team (blank=yours)")
-async def team_roster(i,team:str=None):
-    gid=str(i.guild_id);t=await team_get(gid,team)if team else await team_by_player(gid,str(i.user.id))
-    if not t:await i.response.send_message("\u274c Not found.",ephemeral=True);return
-    crown="\U0001f451";players="\n".join(f"\u2022 <@{m}> {crown if m==t['captain_id']else''}"for m in t["members"])
-    await i.response.send_message(f"\u2694\ufe0f **{t['display']}** {t['wins']}W/{t['losses']}L  -  **{get_rank(t['mmr'])}**\n\n**Players ({len(t['members'])}/{MAX_TEAM}):**\n{players}")
 @team.command(name="leave",description="Leave (players only)")
 async def team_leave(i):
     gid=str(i.guild_id);uid=str(i.user.id);t=await team_by_player(gid,uid)
@@ -860,7 +824,15 @@ async def teaminfo(i,team:str):
     if not t:await i.response.send_message("\u274c Not found.",ephemeral=True);return
     tot=t["wins"]+t["losses"];wr=f"{round(t['wins']/tot*100)}%"if tot else"N/A"
     crown="\U0001f451";players="\n".join(f"\u2022 <@{m}> {crown if m==t['captain_id']else''}"for m in t["members"])
-    await i.response.send_message(f"\u2694\ufe0f **{t['display']}**\nRank:**{get_rank(t['mmr'])}**|{t['wins']}W/{t['losses']}L|WR:{wr}\n\n**Players ({len(t['members'])}/{MAX_TEAM}):**\n{players}")
+    rn,rpct,next_r=rank_progress(t["mmr"])
+    bar="\u2588"*rpct+"\u2591"*(10-rpct)
+    embed=discord.Embed(title=f"\u2694\ufe0f {t['display']}",color=0x5865F2)
+    embed.add_field(name="Rank",value=f"**{rn}** `{t['mmr']} MMR`\n{bar} `{rpct*10}%` to {next_r}",inline=False)
+    embed.add_field(name="Record",value=f"{t['wins']}W / {t['losses']}L",inline=True)
+    embed.add_field(name="Win Rate",value=wr,inline=True)
+    embed.add_field(name="Players",value=f"{len(t['members'])}/{MAX_TEAM}",inline=True)
+    embed.add_field(name="Roster",value=players,inline=False)
+    await i.response.send_message(embed=embed)
 
 cap=app_commands.Group(name="captain",description="Captain")
 @cap.command(name="swap",description="Transfer captain")
@@ -928,16 +900,6 @@ async def match_report(i,opponent:str,score:str):
         if rc:await rc.send(f"\u26a1 **{d} {score} {opp['display']}**\nWinner:**{winner}**\nBy {i.user.mention}")
     await i.response.send_message(f"\u26a1 **{d} {score} {opp['display']}**\nWinner:**{winner}**\n{d}({get_rank(my_t['mmr'])}) +{delta}|{opp['display']}({get_rank(opp_t['mmr'])}) -{delta}")
 bot.tree.add_command(mat)
-
-st=app_commands.Group(name="stats",description="Stats")
-@st.command(name="team",description="Team stats")
-@app_commands.describe(team="Team")
-async def stats_team(i,team:str=None):
-    gid=str(i.guild_id);t=await team_get(gid,team)if team else await team_by_player(gid,str(i.user.id))
-    if not t:await i.response.send_message("\u274c Not found.",ephemeral=True);return
-    tot=t["wins"]+t["losses"];wr=f"{round(t['wins']/tot*100)}%"if tot else"N/A"
-    await i.response.send_message(f"\U0001f4ca **{t['display']}**\nRank:**{get_rank(t['mmr'])}**|{t['wins']}W/{t['losses']}L|WR:{wr}\n{len(t['members'])}/{MAX_TEAM}|Capt:<@{t['captain_id']}>")
-bot.tree.add_command(st)
 
 fa=app_commands.Group(name="fa",description="Free agents")
 @fa.command(name="register",description="Register")
