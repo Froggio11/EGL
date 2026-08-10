@@ -9,7 +9,7 @@ from discord.ext import commands,tasks
 logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(message)s")
 log=logging.getLogger(__name__)
 TOKEN=os.environ.get("DISCORD_BOT_TOKEN","")
-DB="league.db";DEFAULT_MMR=1000;MAX_TEAM=3;SEASON_WEEKS=8
+DB="league.db";DEFAULT_MMR=1000;MAX_TEAM=4;SEASON_WEEKS=8
 ADMIN_ROLE="League Admin";TESTER_ROLE="EGL Tester"
 MAPS=["Chessboard","Portal Mayhem","Construction Site","Parking Lot"]
 SCHED_FMT="%d %b %H:%M";SCHED_HELP="DD Mon HH:MM or 8pm (e.g. 05 Aug 20:00 or 05 Aug 8pm)"
@@ -451,10 +451,10 @@ async def guide_cmd(i):
 @bot.tree.command(name="scrimguide",description="Post the scrim guide (League Admin)")
 async def scrimguide_cmd(i):
     if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
-    sg="\U0001f3ae **Scrims Guide**\n\n"
-    sg+="Scrims are casual practice matches — no league points, just fun.\n\n"
+    embed=discord.Embed(title="\U0001f3ae Scrims Guide",description="Casual practice matches - no league points, just fun.",color=0xe67e22)
+    embed.add_field(name="Mixed Scrims",value="`/create mixedscrim time:20:00 format:3v3`\n3v3 = 6 spots, Sign Up / Leave\n5 min before start: everyone pinged",inline=False)
     sg+="\u2501"*22+"\n"
-    sg+="**Mixed Scrims**\n"
+    embed.add_field(name="Team Scrims",value="`/teamscrim` in #team-scrims pings @TeamScrims (captains only)",inline=False)
     sg+="Anyone can create one: `/create mixedscrim time:20:00 format:3v3`\n"
     sg+="- 3v3 = 6 spots\n"
     sg+="- People click **Sign Up** to join (leave anytime)\n"
@@ -462,7 +462,8 @@ async def scrimguide_cmd(i):
     sg+="- 5 minutes before start, everyone gets pinged\n\n"
     sg+="**Time formats:** `20:00`, `8pm`, `8:30pm`\n\n"
     sg+="\u2501"*22+"\n"
-    sg+="**Team Scrims**\n"
+    embed.add_field(name="Setup",value="`/scrimbot setup` / `/scrimbot reset`",inline=False)
+    embed.set_footer(text="Use /scrimguide anytime to repost")
     sg+="Captains use `/teamscrim` in #team-scrims to find opponents.\n"
     sg+="This pings @TeamScrims with your team name.\n\n"
     sg+="\u2501"*22+"\n"
