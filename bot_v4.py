@@ -453,23 +453,7 @@ async def scrimguide_cmd(i):
     if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
     embed=discord.Embed(title="\U0001f3ae Scrims Guide",description="Casual practice matches - no league points, just fun.",color=0xe67e22)
     embed.add_field(name="Mixed Scrims",value="`/create mixedscrim time:20:00 format:3v3`\n3v3 = 6 spots, Sign Up / Leave\n5 min before start: everyone pinged",inline=False)
-    sg+="\u2501"*22+"\n"
-    embed.add_field(name="Team Scrims",value="`/teamscrim` in #team-scrims pings @TeamScrims (captains only)",inline=False)
-    sg+="Anyone can create one: `/create mixedscrim time:20:00 format:3v3`\n"
-    sg+="- 3v3 = 6 spots\n"
-    sg+="- People click **Sign Up** to join (leave anytime)\n"
-    sg+="- Embed auto-updates with the player list\n"
-    sg+="- 5 minutes before start, everyone gets pinged\n\n"
-    sg+="**Time formats:** `20:00`, `8pm`, `8:30pm`\n\n"
-    sg+="\u2501"*22+"\n"
-    embed.add_field(name="Setup",value="`/scrimbot setup` / `/scrimbot reset`",inline=False)
-    embed.set_footer(text="Use /scrimguide anytime to repost")
-    sg+="Captains use `/teamscrim` in #team-scrims to find opponents.\n"
-    sg+="This pings @TeamScrims with your team name.\n\n"
-    sg+="\u2501"*22+"\n"
-    sg+="**Setup:** Run `/scrimbot setup` first to create the Scrims channels.\n"
-    sg+="**Guide:** Use `/scrimguide` to repost this anytime."
-    await i.response.send_message(sg)
+    await i.response.send_message(embed=embed)
 
 # ===== /setup /setchannel /league /team /disband /teaminfo /captain /match /stats /fa /mmr /test /schedule /reschedule /backup /restore =====
 setup=app_commands.Group(name="setup",description="Bot setup")
