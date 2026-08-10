@@ -1,6 +1,6 @@
 # Elements Divided League Bot v5 — Elite Goon League
 # pip install discord.py aiosqlite
-# 2v2 league, max 3 players/team, rank-based system
+# 3v3 league, max 4 players/team, rank-based system
 import asyncio,logging,os,uuid,random
 from datetime import datetime,timezone,timedelta
 import aiosqlite,discord
@@ -433,8 +433,8 @@ async def gen_matches(guild,c,force=False):
 @bot.tree.command(name="guide",description="Post the league guide (League Admin only)")
 async def guide_cmd(i):
     if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
-    embed1=discord.Embed(title="\U0001f4d6 EGL - Elite Goon League",description="Welcome to the EGL, our own 2v2 competitive league for Elements Divided.",color=0x5865F2)
-    embed1.add_field(name="\U0001f3c6 League Format",value="- Teams of **up to 3 players**\n- **8-week season** - every team plays every other team\n- Matches every **Sunday 10pm GMT**\n- Captains vote on map (coin flip on tie)\n- **Top 4** advance to Finals, then Grand Final!",inline=False)
+    embed1=discord.Embed(title="\U0001f4d6 EGL - Elite Goon League",description="Welcome to the EGL, our own 3v3 competitive league for Elements Divided.",color=0x5865F2)
+    embed1.add_field(name="\U0001f3c6 League Format",value="- Teams of **up to 4 players**\n- **8-week season** - every team plays every other team\n- Matches every **Sunday 10pm GMT**\n- Captains vote on map (coin flip on tie)\n- **Top 4** advance to Finals, then Grand Final!",inline=False)
     embed1.add_field(name="\U0001f4ca Ranks",value="\U0001f7e4 Adept\n\u26aa Lotus\n\U0001f7e1 **Monk** *(start)*\n\U0001f7e2 Warden\n\U0001f535 Avatar\n\U0001f451 Raava",inline=True)
     embed1.add_field(name="MMR System",value="Win vs stronger = **more MMR**\nWin vs weaker = **less MMR**\nLose vs stronger = **less lost**\nLose vs weaker = **more lost**\nEqual teams = **~25 MMR**",inline=True)
     embed1.add_field(name="\u23f1\ufe0f Rules",value="- **24h cooldown** after leaving/disbanding\n- Max **1 Free Agent** sub per match\n- Returning players inherit **old team's MMR**",inline=False)
@@ -456,7 +456,7 @@ async def scrimguide_cmd(i):
     sg+="\u2501"*22+"\n"
     sg+="**Mixed Scrims**\n"
     sg+="Anyone can create one: `/create mixedscrim time:20:00 format:3v3`\n"
-    sg+="- 3v3 = 6 spots | 2v2 = 4 spots\n"
+    sg+="- 3v3 = 6 spots\n"
     sg+="- People click **Sign Up** to join (leave anytime)\n"
     sg+="- Embed auto-updates with the player list\n"
     sg+="- 5 minutes before start, everyone gets pinged\n\n"
@@ -1004,7 +1004,7 @@ async def reschedule_cmd(i,datetime_str:str):
 create_grp=app_commands.Group(name="create",description="Create scrims")
 @create_grp.command(name="mixedscrim",description="Create a mixed scrim")
 @app_commands.describe(time="Start time HH:MM GMT (e.g. 20:00)",format="Match format")
-@app_commands.choices(format=[app_commands.Choice(name="3v3 (6 players)",value="3v3"),app_commands.Choice(name="2v2 (4 players)",value="2v2")])
+@app_commands.choices(format=[app_commands.Choice(name="3v3 (6 players)",value="3v3")])
 async def create_mixedscrim(i,time:str,format:str):
     # Accept: 20:00, 20.00, 8pm, 8:30pm, 8.30pm, 20, 8pm
     import re
