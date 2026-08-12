@@ -34,7 +34,7 @@ async def init_db():
     async with aiosqlite.connect(DB)as db:
         await db.executescript("""
         CREATE TABLE IF NOT EXISTS config(guild_id TEXT PRIMARY KEY,name TEXT,admin_id TEXT,announcements_ch TEXT,matches_ch TEXT,results_ch TEXT,general_ch TEXT,fa_ch TEXT,teams_ch TEXT,created_at TEXT);
-        CREATE TABLE IF NOT EXISTS teams(guild_id TEXT,name TEXT,display TEXT,captain_id TEXT,wins INT DEFAULT 0,losses INT DEFAULT 0,mmr INT DEFAULT 1000,thread_id TEXT,role_id TEXT,created_at TEXT,PRIMARY KEY(guild_id,name));
+        CREATE TABLE IF NOT EXISTS teams(guild_id TEXT,name TEXT,display TEXT,captain_id TEXT,wins INT DEFAULT 0,losses INT DEFAULT 0,mmr INT DEFAULT 1000,thread_id TEXT,role_id TEXT,created_at TEXT,clantag TEXT,PRIMARY KEY(guild_id,name));
         CREATE TABLE IF NOT EXISTS members(guild_id TEXT,team_name TEXT,user_id TEXT,PRIMARY KEY(guild_id,team_name,user_id));
         CREATE TABLE IF NOT EXISTS fa(guild_id TEXT,user_id TEXT,username TEXT,joined_at TEXT,PRIMARY KEY(guild_id,user_id));
         CREATE TABLE IF NOT EXISTS matches(id TEXT PRIMARY KEY,guild_id TEXT,week INT,team1 TEXT,team2 TEXT,score TEXT,winner TEXT,reporter TEXT,created_at TEXT,thread_id TEXT,is_finals INT DEFAULT 0,map TEXT,scheduled TEXT,reschedule_by TEXT,reschedule_to TEXT);
@@ -45,6 +45,9 @@ async def init_db():
         CREATE TABLE IF NOT EXISTS scrim_sessions(guild_id TEXT,date TEXT,thread_id TEXT,msg_id TEXT,max_players INT DEFAULT 6,PRIMARY KEY(guild_id,date));
         CREATE TABLE IF NOT EXISTS scrim_signups(guild_id TEXT,date TEXT,user_id TEXT,position INT,PRIMARY KEY(guild_id,date,user_id));
         """)
+        # Migrate: add clantag column if missing
+        try:await db.execute("ALTER TABLE teams ADD COLUMN clantag TEXT")
+        except:pass
         # Migrate: add new columns to scrim_sessions if missing
         for col,typ in [("max_players","INT DEFAULT 6"),("scrim_title","TEXT"),("unix_time","INT")]:
             try:await db.execute(f"ALTER TABLE scrim_sessions ADD COLUMN {col} {typ}")
@@ -698,15 +701,18 @@ class InviteView(discord.ui.View):
 
 team=app_commands.Group(name="team",description="Team management")
 @team.command(name="create",description="Create team")
-@app_commands.describe(name="Team name")
-async def team_create(i,name:str):
+@app_commands.describe(name="Team name",clantag="Clan tag (max 4 characters)")
+async def team_create(i,name:str,clantag:str=None):
     gid=str(i.guild_id);uid=str(i.user.id)
+    if clantag:
+        clantag=clantag.strip().upper()
+        if len(clantag)>4:await i.response.send_message("\u274c Clan tag max 4 characters.",ephemeral=True);return
     if ex:=await team_by_player(gid,uid):await i.response.send_message(f"\u274c On **{ex['display']}**.",ephemeral=True);return
     if await team_get(gid,name):await i.response.send_message(f"\u274c Exists.",ephemeral=True);return
     if await is_on_cooldown(gid,uid):await i.response.send_message("\u274c 24h cooldown.",ephemeral=True);return
     start_mmr=await get_player_mmr(gid,uid)
     await i.response.defer()
-    async with aiosqlite.connect(DB)as db:await db.execute("INSERT INTO teams VALUES(?,?,?,?,0,0,?,NULL,NULL,?)",(gid,name.lower(),name,uid,start_mmr,datetime.now(timezone.utc).isoformat()));await db.execute("INSERT INTO members VALUES(?,?,?)",(gid,name.lower(),uid));await db.execute("DELETE FROM fa WHERE guild_id=? AND user_id=?",(gid,uid));await db.commit()
+    async with aiosqlite.connect(DB)as db:await db.execute("INSERT INTO teams VALUES(?,?,?,?,0,0,?,NULL,NULL,?,?)",(gid,name.lower(),name,uid,start_mmr,datetime.now(timezone.utc).isoformat(),clantag));await db.execute("INSERT INTO members VALUES(?,?,?)",(gid,name.lower(),uid));await db.execute("DELETE FROM fa WHERE guild_id=? AND user_id=?",(gid,uid));await db.commit()
     c=await cfg_get(gid);tr=await add_roles(i.guild,i.user,name,captain=True)
     role_id=str(tr.id)if tr else None;thread_id=None
     target_ch=None
@@ -724,13 +730,16 @@ async def team_create(i,name:str):
     if target_ch is None and isinstance(i.channel,discord.TextChannel):target_ch=i.channel
     if isinstance(target_ch,discord.TextChannel):
         try:
-            th=await target_ch.create_thread(name=name,type=discord.ChannelType.private_thread,auto_archive_duration=10080)
+            th=await target_ch.create_thread(name=f"{name} [{clantag}]"if clantag else name,type=discord.ChannelType.private_thread,auto_archive_duration=10080)
             thread_id=str(th.id);await th.add_user(i.user)
-            await th.send(f"\u2694\ufe0f **{name}** thread!\nCaptain:{i.user.mention}\n`/team invite @player`")
+            tip=""
+            if clantag:
+                tip=f"\n\n\U0001f3ae **Team tip:** Add `[{clantag}]` to your in-game name and rock a matching team shader to represent your team!"
+            await th.send(f"\u2694\ufe0f **{name}** thread!{' (clan tag: '+clantag+')' if clantag else ''}\nCaptain:{i.user.mention}\n`/team invite @player`{tip}")
         except Exception as e:log.warning("THREAD ERROR: %s",e)
     async with aiosqlite.connect(DB)as db:await db.execute("UPDATE teams SET role_id=?,thread_id=? WHERE guild_id=? AND name=?",(role_id,thread_id,gid,name.lower()));await db.commit()
     extra=f"\n\U0001f4cc <#{thread_id}>"if thread_id else""
-    await i.followup.send(f"\u2694\ufe0f **{name}** created!\nCaptain:{i.user.mention}|Rank:{get_rank(start_mmr)}|1/{MAX_TEAM}{extra}")
+    await i.followup.send(f"\u2694\ufe0f **{name}** created!\nCaptain:{i.user.mention}|Rank:{get_rank(start_mmr)}|1/{MAX_TEAM}{' | Clan tag: '+clantag if clantag else ''}{extra}")
 @team.command(name="invite",description="Invite (captain)")
 @app_commands.describe(player="Player")
 async def team_invite(i,player:discord.Member):
