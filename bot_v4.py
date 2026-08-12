@@ -464,10 +464,10 @@ setup=app_commands.Group(name="setup",description="Bot setup")
 async def setup_run(i):
     if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
     gid=str(i.guild_id)
+    await i.response.defer()
     async with aiosqlite.connect(DB)as db:
         async with db.execute("SELECT guild_id FROM setup_data WHERE guild_id=?",(gid,))as cur:
-            if await cur.fetchone():await i.response.send_message("\u274c Already set up. Use `/setup reset` first.",ephemeral=True);return
-    await i.response.defer()
+            if await cur.fetchone():await i.followup.send("\u274c Already set up. Use `/setup reset` first.",ephemeral=True);return
     ev=i.guild.default_role;ar=discord.utils.get(i.guild.roles,name=ADMIN_ROLE)
     bot_override=discord.PermissionOverwrite(send_messages=True,read_messages=True)
     admin_only={ev:discord.PermissionOverwrite(send_messages=False,read_messages=True),i.guild.me:bot_override}
@@ -504,11 +504,11 @@ async def setup_run(i):
 async def setup_reset(i):
     if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
     gid=str(i.guild_id)
+    await i.response.defer()
     async with aiosqlite.connect(DB)as db:
         db.row_factory=aiosqlite.Row
         async with db.execute("SELECT * FROM setup_data WHERE guild_id=?",(gid,))as cur:row=await cur.fetchone()
-    if not row:await i.response.send_message("\u274c Not set up yet.",ephemeral=True);return
-    await i.response.defer()
+    if not row:await i.followup.send("\u274c Not set up yet.",ephemeral=True);return
     row=dict(row)
     for cat_id in[row["league_category_id"],row["matches_category_id"]]:
         try:
