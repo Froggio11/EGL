@@ -702,11 +702,11 @@ class InviteView(discord.ui.View):
 team=app_commands.Group(name="team",description="Team management")
 @team.command(name="create",description="Create team")
 @app_commands.describe(name="Team name",clantag="Clan tag (max 4 characters)")
-async def team_create(i,name:str,clantag:str=None):
+async def team_create(i,name:str,clantag:str):
     gid=str(i.guild_id);uid=str(i.user.id)
-    if clantag:
-        clantag=clantag.strip().upper()
-        if len(clantag)>4:await i.response.send_message("\u274c Clan tag max 4 characters.",ephemeral=True);return
+    clantag=clantag.strip().upper()
+    if not clantag:await i.response.send_message("\u274c Clan tag is required.",ephemeral=True);return
+    if len(clantag)>4:await i.response.send_message("\u274c Clan tag max 4 characters.",ephemeral=True);return
     if ex:=await team_by_player(gid,uid):await i.response.send_message(f"\u274c On **{ex['display']}**.",ephemeral=True);return
     if await team_get(gid,name):await i.response.send_message(f"\u274c Exists.",ephemeral=True);return
     if await is_on_cooldown(gid,uid):await i.response.send_message("\u274c 24h cooldown.",ephemeral=True);return
