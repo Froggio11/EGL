@@ -84,16 +84,6 @@ async def teams_all(gid):
             names=[x[0]for x in await c.fetchall()]
     return[t for n in names if(t:=await team_get(gid,n))]
 
-async def fa_exists(gid,uid):
-    async with aiosqlite.connect(DB)as db:
-        async with db.execute("SELECT 1 FROM fa WHERE guild_id=? AND user_id=?",(gid,uid))as c:
-            return bool(await c.fetchone())
-
-async def fa_all(gid):
-    async with aiosqlite.connect(DB)as db:
-        async with db.execute("SELECT user_id,username FROM fa WHERE guild_id=?",(gid,))as c:
-            return[{"user_id":r[0],"username":r[1]}for r in await c.fetchall()]
-
 async def get_scrim_session(gid,date):
     async with aiosqlite.connect(DB)as db:
         db.row_factory=aiosqlite.Row
@@ -168,8 +158,6 @@ def rank_progress(mmr):
 
 async def add_roles(guild,member,team_display,captain=False):
     try:
-        fa=find_role(guild,"Free Agent")
-        if fa and fa in member.roles:await member.remove_roles(fa)
         p=find_role(guild,"Player")
         if p:await member.add_roles(p)
         tr=find_role(guild,team_display)or await guild.create_role(name=team_display,mentionable=True,hoist=True)
@@ -213,95 +201,6 @@ async def need_captain(i):
     return t["display"]
 
 # ===== Views =====
-class FAButtonView(discord.ui.View):
-    def __init__(self,tn,cid,gid,fa_ch):
-        super().__init__(timeout=121);self.tn=tn;self.cid=cid;self.gid=gid;self.fa_ch=fa_ch;self.responded=set()
-    @discord.ui.button(label="I'm Available!",style=discord.ButtonStyle.green,emoji="\u2795")
-    async def avail(self,i,btn):
-        uid=str(i.user.id)
-        if not await fa_exists(self.gid,uid):await i.response.send_message("Not a FA.",ephemeral=True);return
-        if uid==self.cid:await i.response.send_message("Your own request.",ephemeral=True);return
-        self.responded.add(uid);await i.response.send_message("Listed!",ephemeral=True)
-    async def on_timeout(self):
-        for c in self.children:c.disabled=True
-        if hasattr(self,"msg")and self.msg:
-            try:await self.msg.edit(content=f"Time up! {len(self.responded)} FA(s).",view=self)
-            except:pass
-        if not self.responded:
-            g=bot.get_guild(int(self.gid))
-            if self.fa_ch and g:
-                ch=g.get_channel(int(self.fa_ch))
-                if ch:await ch.send(f"No FAs responded to **{self.tn}** sub request.")
-            return
-        opts=[]
-        g=bot.get_guild(int(self.gid))
-        if not g:return
-        for uid in self.responded:
-            m=g.get_member(int(uid))
-            if m:opts.append(discord.SelectOption(label=m.display_name,value=uid))
-        if not opts:return
-        v=FASelectView(self.tn,self.cid,self.gid,opts,self.fa_ch)
-        if self.fa_ch:
-            ch=g.get_channel(int(self.fa_ch))
-            cap=g.get_member(int(self.cid))
-            if ch:
-                try:await ch.send(f"{cap.mention if cap else ''} Pick a sub for **{self.tn}**:",view=v)
-                except:pass
-
-class FASubThreadView(discord.ui.View):
-    def __init__(self,thread_id,captain_id,fa_id):
-        super().__init__(timeout=None);self.thread_id=thread_id;self.captain_id=captain_id;self.fa_id=fa_id;self.left=set()
-    @discord.ui.button(label="Leave Thread",style=discord.ButtonStyle.gray,emoji="\U0001f44b")
-    async def leave(self,i,btn):
-        uid=str(i.user.id)
-        if uid not in(self.captain_id,self.fa_id):await i.response.send_message("\u274c You're not in this FA thread.",ephemeral=True);return
-        if uid in self.left:await i.response.send_message("\u274c You already left.",ephemeral=True);return
-        self.left.add(uid)
-        await i.response.send_message("\u2705 You've left. Thread closes when both parties leave.",ephemeral=True)
-        if self.captain_id in self.left and self.fa_id in self.left:
-            th=i.guild.get_thread(int(self.thread_id))
-            if th:
-                try:await th.send("\U0001f512 **Both parties left. Closing thread.**")
-                except:pass
-                try:await th.edit(archived=True,locked=True)
-                except:pass
-            for c in self.children:c.disabled=True
-            try:await i.edit_original_response(content="Thread closed.",view=None)
-            except:pass
-
-class FASelectView(discord.ui.View):
-    def __init__(self,tn,cid,gid,opts,fa_ch,match_thread_id=None):
-        super().__init__(timeout=300);self.tn=tn;self.cid=cid;self.gid=gid;self.fa_ch=fa_ch;self.match_thread_id=match_thread_id
-        self.sel.options=opts
-    @discord.ui.select(placeholder="Choose FA...",min_values=1,max_values=1)
-    async def sel(self,i,menu):
-        if str(i.user.id)!=self.cid:await i.response.send_message("Not for you.",ephemeral=True);return
-        uid=menu.values[0];g=i.guild;t=await team_get(self.gid,self.tn)
-        if not t:await i.response.send_message("Team gone.",ephemeral=True);return
-        p=g.get_member(int(uid))
-        if not p:await i.response.send_message("Left server.",ephemeral=True);return
-        for c in self.children:c.disabled=True
-        await i.response.edit_message(content=f"\u2705 {p.mention} is subbing for **{t['display']}**!",view=self)
-        # Create a separate private FA thread for this match
-        fa_thread_ch=None
-        if self.match_thread_id:
-            # Try to find the match thread's parent channel
-            mt=g.get_thread(int(self.match_thread_id))
-            if mt:fa_thread_ch=mt.parent
-        if not fa_thread_ch:
-            # Fallback: use FA channel
-            if self.fa_ch:fa_thread_ch=g.get_channel(int(self.fa_ch))
-        if fa_thread_ch and isinstance(fa_thread_ch,discord.TextChannel):
-            try:
-                fa_th=await fa_thread_ch.create_thread(name=f"FA Sub - {p.display_name} for {t['display']}",type=discord.ChannelType.private_thread,auto_archive_duration=1440)
-                cap=g.get_member(int(t["captain_id"]))
-                if cap:await fa_th.add_user(cap)
-                await fa_th.add_user(p)
-                view=FASubThreadView(str(fa_th.id),str(t["captain_id"]),uid)
-                await fa_th.send(f"\U0001f91d **FA Sub Thread**\n\n{p.mention} is subbing for **{t['display']}** this match.\n\nCaptain: {cap.mention if cap else ''}\n\n*Click Leave Thread when the match is done. The thread closes when both parties leave.*",view=view)
-            except Exception as e:log.warning("FA thread: %s",e)
-        if self.fa_ch and(ch:=g.get_channel(int(self.fa_ch))):await ch.send(f"\u2705 {p.mention} subbing for **{self.tn}**!")
-
 class ScheduleConfirmView(discord.ui.View):
     def __init__(self,ocid,sched,unix,thread_id):
         super().__init__(timeout=86400);self.ocid=ocid;self.sched=sched;self.unix=unix;self.thread_id=thread_id
@@ -536,11 +435,10 @@ async def guide_cmd(i):
     embed1.add_field(name="\U0001f3c6 League Format",value="- Teams of **up to 4 players**\n- **8-week season** - every team plays every other team\n- Matches every **Sunday 10pm GMT**\n- Captains vote on map (coin flip on tie)\n- **Top 4** advance to Finals, then Grand Final!",inline=False)
     embed1.add_field(name="\U0001f4ca Ranks",value="\U0001f7e4 Adept\n\u26aa Lotus\n\U0001f7e1 **Monk** *(start)*\n\U0001f7e2 Warden\n\U0001f535 Avatar\n\U0001f451 Raava",inline=True)
     embed1.add_field(name="MMR System",value="Win vs stronger = **more MMR**\nWin vs weaker = **less MMR**\nLose vs stronger = **less lost**\nLose vs weaker = **more lost**\nEqual teams = **~25 MMR**",inline=True)
-    embed1.add_field(name="\u23f1\ufe0f Rules",value="- **24h cooldown** after leaving/disbanding\n- Max **1 Free Agent** sub per match\n- Returning players inherit **old team's MMR**",inline=False)
+    embed1.add_field(name="\u23f1\ufe0f Rules",value="- **24h cooldown** after leaving/disbanding\n- Returning players inherit **old team's MMR**",inline=False)
     await i.response.send_message(embed=embed1)
     embed2=discord.Embed(title="\U0001f4cb Commands",color=0x5865F2)
     embed2.add_field(name="\u2694\ufe0f Team",value="`/team create` - Start a team (you become captain)\n`/team invite @player` - Invite someone\n`/team kick @player` - Remove someone\n`/team leave` - Leave your team\n`/disband` - Delete your team\n`/captain swap @player` - Transfer captain\n`/teaminfo name:Name` - Look up any team",inline=False)
-    embed2.add_field(name="\U0001f91d Free Agents",value="`/fa register` - Become a sub\n`/fa unregister` - Remove yourself\n`/fa list` - See available subs\n`/fa request` - Ping FAs for a sub *(captain)*",inline=False)
     embed2.add_field(name="\U0001f4c5 Match *(captains only, in match thread)*",value="`/schedule 05 Aug 19:00` - Set match time\n`/reschedule 05 Aug 20:00` - Change time (other captain approves)\n`/match result opponent:Name score:2-1` - Report result",inline=False)
     embed2.add_field(name="\U0001f4ca Stats",value="`/teaminfo name:Name` - Rank, MMR, progress bar\n`/leaderboard` - Full leaderboard (live)\n`/league status` - Season progress + top 4",inline=False)
     embed2.set_footer(text="Questions? Ask a League Admin. Good luck, Goons!")
@@ -576,21 +474,19 @@ async def setup_run(i):
         guide_ch=await i.guild.create_text_channel("guide",category=lcat,overwrites=admin_only)
         gen=await i.guild.create_text_channel("general",category=lcat)
         tch=await i.guild.create_text_channel("teams",category=lcat)
-        fa=await i.guild.create_text_channel("free-agent",category=lcat)
         mcat=await i.guild.create_category("Matches")
         mat=await i.guild.create_text_channel("matches",category=mcat,overwrites=react_only)
         res=await i.guild.create_text_channel("results",category=mcat,overwrites=react_only)
         lb=await i.guild.create_text_channel("leaderboard",category=mcat,overwrites=admin_only)
     except Exception as e:await i.followup.send(f"\u274c Failed: {e}");return
     async with aiosqlite.connect(DB)as db:
-        await db.execute("INSERT INTO setup_data VALUES(?,?,?,?,?,?,?,?,?,?)",(gid,"EGL",str(lcat.id),str(mcat.id),str(ann.id),str(gen.id),str(tch.id),str(fa.id),str(mat.id),str(res.id)))
+        await db.execute("INSERT INTO setup_data VALUES(?,?,?,?,?,?,?,?,?,?)",(gid,"EGL",str(lcat.id),str(mcat.id),str(ann.id),str(gen.id),str(tch.id),"",str(mat.id),str(res.id)))
         await db.commit()
     msg="\u2694\ufe0f **Elite Goon League is live.**\nAll channels and permissions have been configured.\n\n"
     msg+=f"{ann.mention} \u2014 Announcements\n"
     msg+=f"{guide_ch.mention} \u2014 Player guide\n"
     msg+=f"{gen.mention} \u2014 General chat\n"
     msg+=f"{tch.mention} \u2014 Team threads\n"
-    msg+=f"{fa.mention} \u2014 Free agents\n"
     msg+=f"{mat.mention} \u2014 Match schedule\n"
     msg+=f"{res.mention} \u2014 Results\n"
     msg+=f"{lb.mention} \u2014 Leaderboard\n\n"
@@ -967,47 +863,6 @@ async def match_report(i,opponent:str,score:str):
     await i.response.send_message(f"\u26a1 {i.user.mention} reports: **{d} {score} {opp['display']}** - Winner: **{winner}**\n{d}({get_rank(my_mmr)}) {su}{delta} | {opp['display']}({get_rank(opp_mmr)}) {st}{delta}\n\n{oc.mention} please confirm:",view=v)
 bot.tree.add_command(mat)
 
-fa=app_commands.Group(name="fa",description="Free agents")
-@fa.command(name="register",description="Register")
-async def fa_register(i):
-    gid=str(i.guild_id);uid=str(i.user.id)
-    if await team_by_player(gid,uid):await i.response.send_message("\u274c On team.",ephemeral=True);return
-    if await fa_exists(gid,uid):await i.response.send_message("\u274c Already.",ephemeral=True);return
-    async with aiosqlite.connect(DB)as db:await db.execute("INSERT INTO fa VALUES(?,?,?,?)",(gid,uid,i.user.display_name,datetime.now(timezone.utc).isoformat()));await db.commit()
-    if r:=find_role(i.guild,"Free Agent"):
-        try:await i.user.add_roles(r)
-        except:pass
-    await i.response.send_message(f"\U0001f7e2 {i.user.mention} is a **Free Agent**!")
-@fa.command(name="unregister",description="Leave")
-async def fa_unregister(i):
-    gid=str(i.guild_id);uid=str(i.user.id)
-    if not await fa_exists(gid,uid):await i.response.send_message("\u274c Not FA.",ephemeral=True);return
-    async with aiosqlite.connect(DB)as db:await db.execute("DELETE FROM fa WHERE guild_id=? AND user_id=?",(gid,uid));await db.commit()
-    if r:=find_role(i.guild,"Free Agent"):
-        try:await i.user.remove_roles(r)
-        except:pass
-    await i.response.send_message(f"\U0001f534 {i.user.mention} removed.")
-@fa.command(name="list",description="List")
-async def fa_list(i):
-    pool=await fa_all(str(i.guild_id))
-    if not pool:await i.response.send_message("None.");return
-    await i.response.send_message("\U0001f91d **Free Agents**\n\n"+"\n".join(f"\u2022 <@{p['user_id']}>"for p in pool))
-@fa.command(name="request",description="Request sub (captain, 2min)")
-async def fa_request(i):
-    d=await need_captain(i)
-    if not d:return
-    gid=str(i.guild_id);pool=await fa_all(gid)
-    if not pool:await i.response.send_message("\u274c No FAs.",ephemeral=True);return
-    c=await cfg_get(gid);fa_ch_id=c.get("fa_ch")if c else None;view=FAButtonView(d,str(i.user.id),gid,fa_ch_id)
-    if fa_ch_id and(ch:=i.guild.get_channel(int(fa_ch_id))):
-        pings=' '.join(f'<@{p["user_id"]}>'for p in pool)
-        msg=await ch.send(f"\U0001f4e2 **{d}** needs a sub!\n{pings}\n\n*FA's: click the button if you're available. Wait until the captain picks.*",view=view);view.msg=msg
-        await i.response.send_message(f"\u2705 Posted in {ch.mention}.",ephemeral=True)
-    else:
-        pings=' '.join(f'<@{p["user_id"]}>'for p in pool)
-        msg=await i.response.send_message(f"\U0001f4e2 **{d}** needs sub!\n{pings}\n\n*FA's: click the button if you're available. Wait until the captain picks.*",view=view);view.msg=(await i.original_response())
-bot.tree.add_command(fa)
-
 mmr=app_commands.Group(name="mmr",description="MMR (Admin)")
 @mmr.command(name="adjust",description="Adjust rank (admin)")
 @app_commands.describe(team="Team",amount="+/- change")
@@ -1304,7 +1159,6 @@ async def on_guild_join(guild):
     required=[
         (ADMIN_ROLE,discord.Color.red()),
         ("Captain",discord.Color.yellow()),
-        ("Free Agent",discord.Color.blue()),
         ("Player",discord.Color.green()),
         ("TeamScrims",discord.Color.orange()),
         (TESTER_ROLE,discord.Color.from_rgb(255,105,180)),
