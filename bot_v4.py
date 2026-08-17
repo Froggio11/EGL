@@ -984,7 +984,7 @@ async def teamscrim_ping(i):
     if i.channel.id!=tsc.id:await i.response.send_message(f"\u274c Use in {tsc.mention}.",ephemeral=True);return
     await i.response.send_message(f"{role.mention} {i.user.mention} from **{d}** is looking for a team scrim!")
 
-bot.tree.add_command(create_grp)
+# bot.tree.add_command(create_grp)  # disabled - mixed scrims temporarily hidden
 
 # ===== /leaderboard =====
 leaderboard_msg_ids={}
