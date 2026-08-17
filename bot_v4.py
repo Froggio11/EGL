@@ -249,8 +249,8 @@ class FAButtonView(discord.ui.View):
                 except:pass
 
 class FASelectView(discord.ui.View):
-    def __init__(self,tn,cid,gid,opts,fa_ch):
-        super().__init__(timeout=300);self.tn=tn;self.cid=cid;self.gid=gid;self.fa_ch=fa_ch
+    def __init__(self,tn,cid,gid,opts,fa_ch,match_thread_id=None):
+        super().__init__(timeout=300);self.tn=tn;self.cid=cid;self.gid=gid;self.fa_ch=fa_ch;self.match_thread_id=match_thread_id
         self.sel.options=opts
     @discord.ui.select(placeholder="Choose FA...",min_values=1,max_values=1)
     async def sel(self,i,menu):
@@ -261,12 +261,86 @@ class FASelectView(discord.ui.View):
         if not p:await i.response.send_message("Left server.",ephemeral=True);return
         for c in self.children:c.disabled=True
         await i.response.edit_message(content=f"\u2705 {p.mention} is subbing for **{t['display']}**!",view=self)
-        if t.get("thread_id"):
-            th=g.get_thread(int(t["thread_id"]))
-            if th:
-                try:await th.add_user(p);await th.send(f"\U0001f44b {p.mention} is subbing for **{t['display']}** this match!")
-                except:pass
+        # Create a separate private FA thread for this match
+        fa_thread_ch=None
+        if self.match_thread_id:
+            # Try to find the match thread's parent channel
+            mt=g.get_thread(int(self.match_thread_id))
+            if mt:fa_thread_ch=mt.parent
+        if not fa_thread_ch:
+            # Fallback: use FA channel
+            if self.fa_ch:fa_thread_ch=g.get_channel(int(self.fa_ch))
+        if fa_thread_ch and isinstance(fa_thread_ch,discord.TextChannel):
+            try:
+                fa_th=await fa_thread_ch.create_thread(name=f"FA Sub - {p.display_name} for {t['display']}",type=discord.ChannelType.private_thread,auto_archive_duration=1440)
+                cap=g.get_member(int(t["captain_id"]))
+                if cap:await fa_th.add_user(cap)
+                await fa_th.add_user(p)
+                await fa_th.send(f"\U0001f91d **FA Sub Thread**\n\n{p.mention} is subbing for **{t['display']}** this match.\n\nCaptain: {cap.mention if cap else ''}\n\n*This thread is temporary for this match only.*")
+            except Exception as e:log.warning("FA thread: %s",e)
         if self.fa_ch and(ch:=g.get_channel(int(self.fa_ch))):await ch.send(f"\u2705 {p.mention} subbing for **{self.tn}**!")
+
+class ScheduleConfirmView(discord.ui.View):
+    def __init__(self,ocid,sched,unix,thread_id):
+        super().__init__(timeout=86400);self.ocid=ocid;self.sched=sched;self.unix=unix;self.thread_id=thread_id
+    @discord.ui.button(label="\u2705 Confirm",style=discord.ButtonStyle.green)
+    async def confirm(self,i,btn):
+        if str(i.user.id)!=self.ocid:await i.response.send_message("Other captain only.",ephemeral=True);return
+        async with aiosqlite.connect(DB)as db:await db.execute("UPDATE matches SET scheduled=? WHERE thread_id=?",(self.sched,self.thread_id));await db.commit()
+        for c in self.children:c.disabled=True
+        await i.response.edit_message(content=f"\U0001f4c5 **Confirmed!** Match scheduled: **{self.sched}**\n\U0001f550 Your time: <t:{self.unix}:f>",view=self)
+    @discord.ui.button(label="\u274c Decline",style=discord.ButtonStyle.red)
+    async def decline(self,i,btn):
+        if str(i.user.id)!=self.ocid:await i.response.send_message("Other captain only.",ephemeral=True);return
+        for c in self.children:c.disabled=True
+        await i.response.edit_message(content="\u274c Schedule proposal declined.",view=self)
+
+class ResultConfirmView(discord.ui.View):
+    def __init__(self,ocid,d,opp_name,score,won,winner,delta,gid,cfg):
+        super().__init__(timeout=86400)
+        self.ocid=ocid;self.d=d;self.opp=opp_name;self.score=score
+        self.won=won;self.winner=winner;self.delta=delta;self.gid=gid;self.cfg=cfg
+    @discord.ui.button(label="\u2705 Confirm Result",style=discord.ButtonStyle.green)
+    async def confirm(self,i,btn):
+        if str(i.user.id)!=self.ocid:await i.response.send_message("Other captain only.",ephemeral=True);return
+        d=self.d;opp_name=self.opp;score=self.score;won=self.won;winner=self.winner;delta=self.delta;gid=self.gid
+        async with aiosqlite.connect(DB)as db:
+            if won:
+                await db.execute("UPDATE teams SET wins=wins+1,mmr=mmr+? WHERE guild_id=? AND name=?",(delta,gid,d.lower()))
+                await db.execute("UPDATE teams SET losses=losses+1,mmr=mmr-? WHERE guild_id=? AND name=?",(delta,gid,opp_name))
+            else:
+                await db.execute("UPDATE teams SET losses=losses+1,mmr=mmr-? WHERE guild_id=? AND name=?",(delta,gid,d.lower()))
+                await db.execute("UPDATE teams SET wins=wins+1,mmr=mmr+? WHERE guild_id=? AND name=?",(delta,gid,opp_name))
+            await db.execute("INSERT INTO matches VALUES(?,?,0,?,?,?,?,?,?,NULL,0,NULL,NULL,NULL,NULL)",(str(uuid.uuid4())[:8],gid,d,opp_name,score,winner,str(i.user.id),datetime.now(timezone.utc).isoformat()))
+            await db.commit()
+        c=self.cfg
+        if c and c.get("results_ch"):
+            rc=i.guild.get_channel(int(c["results_ch"]))
+            if rc:await rc.send(f"\u26a1 **{d} {score} {opp_name}**\nWinner:**{winner}**\nConfirmed by both captains.")
+        if c and c.get("matches_ch"):
+            mc=i.guild.get_channel(int(c["matches_ch"]))
+            if mc:
+                found_t=None
+                for t in mc.threads:
+                    if d.lower()in t.name.lower()and opp_name in t.name.lower():found_t=t;break
+                if not found_t:
+                    async for t in mc.archived_threads():
+                        if d.lower()in t.name.lower()and opp_name in t.name.lower():found_t=t;break
+                if found_t:
+                    try:
+                        if found_t.archived:await found_t.edit(archived=False,locked=False)
+                        await found_t.send(f"\u2705 **{d} {score} {opp_name}** - {winner} wins!")
+                        await found_t.edit(archived=True,locked=True)
+                    except:pass
+        my_t=await team_get(gid,d);opp_t=await team_get(gid,opp_name)
+        su="+"if won else"-";st="-"if won else"+"
+        for c2 in self.children:c2.disabled=True
+        await i.response.edit_message(content=f"\u26a1 **Result confirmed!**\n**{d} {score} {opp_name}** - Winner: **{winner}**\n{d}({get_rank(my_t['mmr'])}) {su}{delta} | {opp_name}({get_rank(opp_t['mmr'])}) {st}{delta}",view=self)
+    @discord.ui.button(label="\u26a0\ufe0f Dispute",style=discord.ButtonStyle.red)
+    async def dispute(self,i,btn):
+        if str(i.user.id)!=self.ocid:await i.response.send_message("Other captain only.",ephemeral=True);return
+        for c in self.children:c.disabled=True
+        await i.response.edit_message(content="\u26a0\ufe0f **Result disputed!** Contact a League Admin to resolve.",view=self)
 
 class ScrimSignupView(discord.ui.View):
     def __init__(self,gid,date):
@@ -863,36 +937,12 @@ async def match_report(i,opponent:str,score:str):
     if my_mmr==opp_mmr:expected=0.5
     else:expected=1/(1+10**((opp_mmr-my_mmr)/400))
     delta=round(50*(1-expected))if won else round(50*(0-expected))
-    su="+"if won else"-";st="-"if won else"+"
-    async with aiosqlite.connect(DB)as db:
-        if won:
-            await db.execute("UPDATE teams SET wins=wins+1,mmr=mmr+? WHERE guild_id=? AND name=?",(delta,gid,d.lower()))
-            await db.execute("UPDATE teams SET losses=losses+1,mmr=mmr-? WHERE guild_id=? AND name=?",(delta,gid,opp["name"]))
-        else:
-            await db.execute("UPDATE teams SET losses=losses+1,mmr=mmr-? WHERE guild_id=? AND name=?",(delta,gid,d.lower()))
-            await db.execute("UPDATE teams SET wins=wins+1,mmr=mmr+? WHERE guild_id=? AND name=?",(delta,gid,opp["name"]))
-        await db.execute("INSERT INTO matches VALUES(?,?,0,?,?,?,?,?,?,NULL,0,NULL,NULL,NULL,NULL)",(str(uuid.uuid4())[:8],gid,d,opp["display"],score,winner,str(i.user.id),datetime.now(timezone.utc).isoformat()))
-        await db.commit()
     c=await cfg_get(gid)
-    if c and c.get("matches_ch"):
-        mc=i.guild.get_channel(int(c["matches_ch"]))
-        if mc:
-            found_t=None
-            for t in mc.threads:
-                if d.lower()in t.name.lower()and opp["name"]in t.name.lower():found_t=t;break
-            if not found_t:
-                async for t in mc.archived_threads():
-                    if d.lower()in t.name.lower()and opp["name"]in t.name.lower():found_t=t;break
-            if found_t:
-                try:
-                    if found_t.archived:await found_t.edit(archived=False,locked=False)
-                    await found_t.send(f"\u2705 **{d} {score} {opp['display']}** - {winner} wins!")
-                    await found_t.edit(archived=True,locked=True)
-                except:pass
-    if c and c.get("results_ch"):
-        rc=i.guild.get_channel(int(c["results_ch"]))
-        if rc:await rc.send(f"\u26a1 **{d} {score} {opp['display']}**\nWinner:**{winner}**\nBy {i.user.mention}")
-    await i.response.send_message(f"\u26a1 **{d} {score} {opp['display']}**\nWinner:**{winner}**\n{d}({get_rank(my_t['mmr'])}) +{delta}|{opp['display']}({get_rank(opp_t['mmr'])}) -{delta}")
+    oc=i.guild.get_member(int(opp_t["captain_id"]))
+    if not oc:await i.response.send_message("\u274c Other captain not found.",ephemeral=True);return
+    su="+"if won else"-";st="-"if won else"+"
+    v=ResultConfirmView(opp_t["captain_id"],d,opp["name"],score,won,winner,delta,gid,c)
+    await i.response.send_message(f"\u26a1 {i.user.mention} reports: **{d} {score} {opp['display']}** - Winner: **{winner}**\n{d}({get_rank(my_mmr)}) {su}{delta} | {opp['display']}({get_rank(opp_mmr)}) {st}{delta}\n\n{oc.mention} please confirm:",view=v)
 bot.tree.add_command(mat)
 
 fa=app_commands.Group(name="fa",description="Free agents")
@@ -968,8 +1018,19 @@ async def schedule_cmd(i,datetime_str:str):
         dt=parse_schedule(datetime_str)
         sched=dt.strftime(SCHED_FMT+" GMT");unix=int(dt.timestamp())
     except Exception as ex:await i.response.send_message(f"\u274c {ex}. Try: 05 Aug 20:00 or 05 Aug 8pm",ephemeral=True);return
-    async with aiosqlite.connect(DB)as db:await db.execute("UPDATE matches SET scheduled=? WHERE thread_id=?",(sched,str(i.channel.id)));await db.commit()
-    await i.response.send_message(f"\U0001f4c5 Scheduled: **{sched}**\n\U0001f550 Your time: <t:{unix}:f>")
+    gid=str(i.guild_id)
+    async with aiosqlite.connect(DB)as db:
+        db.row_factory=aiosqlite.Row
+        async with db.execute("SELECT * FROM matches WHERE thread_id=? AND guild_id=?",(str(i.channel.id),gid))as cur:row=await cur.fetchone()
+    if not row:await i.response.send_message("\u274c No match here.",ephemeral=True);return
+    row=dict(row)
+    other=row["team2"]if d==row["team1"]else row["team1"]
+    ot=await team_get(gid,other)
+    if not ot:await i.response.send_message("\u274c Other team gone.",ephemeral=True);return
+    oc=i.guild.get_member(int(ot["captain_id"]))
+    if not oc:await i.response.send_message("\u274c Other captain not found.",ephemeral=True);return
+    v=ScheduleConfirmView(ot["captain_id"],sched,unix,str(i.channel.id))
+    await i.response.send_message(f"\U0001f4c5 {i.user.mention} proposes: **{sched}**\n\U0001f550 Your time: <t:{unix}:f>\n\n{oc.mention} please confirm:",view=v)
 
 @bot.tree.command(name="reschedule",description="Reschedule (other captain approves)")
 @app_commands.describe(datetime_str=SCHED_HELP)
