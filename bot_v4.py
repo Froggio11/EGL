@@ -248,6 +248,27 @@ class FAButtonView(discord.ui.View):
                 try:await ch.send(f"{cap.mention if cap else ''} Pick a sub for **{self.tn}**:",view=v)
                 except:pass
 
+class FASubThreadView(discord.ui.View):
+    def __init__(self,thread_id,captain_id,fa_id):
+        super().__init__(timeout=None);self.thread_id=thread_id;self.captain_id=captain_id;self.fa_id=fa_id;self.left=set()
+    @discord.ui.button(label="Leave Thread",style=discord.ButtonStyle.gray,emoji="\U0001f44b")
+    async def leave(self,i,btn):
+        uid=str(i.user.id)
+        if uid not in(self.captain_id,self.fa_id):await i.response.send_message("\u274c You're not in this FA thread.",ephemeral=True);return
+        if uid in self.left:await i.response.send_message("\u274c You already left.",ephemeral=True);return
+        self.left.add(uid)
+        await i.response.send_message("\u2705 You've left. Thread closes when both parties leave.",ephemeral=True)
+        if self.captain_id in self.left and self.fa_id in self.left:
+            th=i.guild.get_thread(int(self.thread_id))
+            if th:
+                try:await th.send("\U0001f512 **Both parties left. Closing thread.**")
+                except:pass
+                try:await th.edit(archived=True,locked=True)
+                except:pass
+            for c in self.children:c.disabled=True
+            try:await i.edit_original_response(content="Thread closed.",view=None)
+            except:pass
+
 class FASelectView(discord.ui.View):
     def __init__(self,tn,cid,gid,opts,fa_ch,match_thread_id=None):
         super().__init__(timeout=300);self.tn=tn;self.cid=cid;self.gid=gid;self.fa_ch=fa_ch;self.match_thread_id=match_thread_id
@@ -276,7 +297,8 @@ class FASelectView(discord.ui.View):
                 cap=g.get_member(int(t["captain_id"]))
                 if cap:await fa_th.add_user(cap)
                 await fa_th.add_user(p)
-                await fa_th.send(f"\U0001f91d **FA Sub Thread**\n\n{p.mention} is subbing for **{t['display']}** this match.\n\nCaptain: {cap.mention if cap else ''}\n\n*This thread is temporary for this match only.*")
+                view=FASubThreadView(str(fa_th.id),str(t["captain_id"]),uid)
+                await fa_th.send(f"\U0001f91d **FA Sub Thread**\n\n{p.mention} is subbing for **{t['display']}** this match.\n\nCaptain: {cap.mention if cap else ''}\n\n*Click Leave Thread when the match is done. The thread closes when both parties leave.*",view=view)
             except Exception as e:log.warning("FA thread: %s",e)
         if self.fa_ch and(ch:=g.get_channel(int(self.fa_ch))):await ch.send(f"\u2705 {p.mention} subbing for **{self.tn}**!")
 
@@ -979,11 +1001,11 @@ async def fa_request(i):
     c=await cfg_get(gid);fa_ch_id=c.get("fa_ch")if c else None;view=FAButtonView(d,str(i.user.id),gid,fa_ch_id)
     if fa_ch_id and(ch:=i.guild.get_channel(int(fa_ch_id))):
         pings=' '.join(f'<@{p["user_id"]}>'for p in pool)
-        msg=await ch.send(f"\U0001f4e2 **{d}** needs a sub! (2 min)\n{pings}",view=view);view.msg=msg
+        msg=await ch.send(f"\U0001f4e2 **{d}** needs a sub!\n{pings}\n\n*FA's: click the button if you're available. Wait until the captain picks.*",view=view);view.msg=msg
         await i.response.send_message(f"\u2705 Posted in {ch.mention}.",ephemeral=True)
     else:
         pings=' '.join(f'<@{p["user_id"]}>'for p in pool)
-        msg=await i.response.send_message(f"\U0001f4e2 **{d}** needs sub!\n{pings}",view=view);view.msg=(await i.original_response())
+        msg=await i.response.send_message(f"\U0001f4e2 **{d}** needs sub!\n{pings}\n\n*FA's: click the button if you're available. Wait until the captain picks.*",view=view);view.msg=(await i.original_response())
 bot.tree.add_command(fa)
 
 mmr=app_commands.Group(name="mmr",description="MMR (Admin)")
