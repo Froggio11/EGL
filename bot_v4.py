@@ -490,7 +490,6 @@ async def setup_run(i):
     msg+=f"{mat.mention} \u2014 Match schedule\n"
     msg+=f"{res.mention} \u2014 Results\n"
     msg+=f"{lb.mention} \u2014 Leaderboard\n\n"
-    msg+="Run `/league create` to start your first season.\nWant scrims? `/scrimbot setup` to add those channels."
     await i.followup.send(msg)
 @setup.command(name="reset",description="Delete all bot channels and reset")
 async def setup_reset(i):
