@@ -480,18 +480,29 @@ async def setup_run(i):
         async with db.execute("SELECT guild_id FROM setup_data WHERE guild_id=?",(gid,))as cur:
             if await cur.fetchone():await i.followup.send("\u274c Already set up. Use `/setup reset` first.",ephemeral=True);return
     ev=i.guild.default_role;ar=discord.utils.get(i.guild.roles,name=ADMIN_ROLE)
+    goon=discord.utils.get(i.guild.roles,name="Regular Goon")
     bot_override=discord.PermissionOverwrite(send_messages=True,read_messages=True)
-    admin_only={ev:discord.PermissionOverwrite(send_messages=False,read_messages=True),i.guild.me:bot_override}
-    if ar:admin_only[ar]=discord.PermissionOverwrite(send_messages=True,read_messages=True)
-    react_only={ev:discord.PermissionOverwrite(send_messages=False,add_reactions=True,read_messages=True),i.guild.me:bot_override}
-    if ar:react_only[ar]=discord.PermissionOverwrite(send_messages=True,read_messages=True)
+    everyone_deny=discord.PermissionOverwrite(read_messages=False,send_messages=False,add_reactions=False)
+    def _base():
+        d={ev:everyone_deny,i.guild.me:bot_override}
+        if ar:d[ar]=discord.PermissionOverwrite(send_messages=True,read_messages=True)
+        return d
+    admin_only=_base()
+    if goon:admin_only[goon]=discord.PermissionOverwrite(read_messages=True,send_messages=False)
+    react_only=_base()
+    if goon:react_only[goon]=discord.PermissionOverwrite(read_messages=True,send_messages=False,add_reactions=True)
+    open_perm=_base()
+    if goon:open_perm[goon]=discord.PermissionOverwrite(read_messages=True,send_messages=True)
+    cat_perm=_base()
+    if goon:cat_perm[goon]=discord.PermissionOverwrite(read_messages=True)
     try:
-        lcat=await i.guild.create_category("EGL")
+        lcat=await i.guild.create_category("EGL",overwrites=cat_perm)
         ann=await i.guild.create_text_channel("announcements",category=lcat,overwrites=admin_only)
         guide_ch=await i.guild.create_text_channel("guide",category=lcat,overwrites=admin_only)
-        gen=await i.guild.create_text_channel("general",category=lcat)
-        tch=await i.guild.create_text_channel("teams",category=lcat)
-        mcat=await i.guild.create_category("Matches")
+        gen=await i.guild.create_text_channel("general",category=lcat,overwrites=open_perm)
+        tch=await i.guild.create_text_channel("teams",category=lcat,overwrites=open_perm)
+        rec=await i.guild.create_forum("recruiting",category=lcat,overwrites=open_perm)
+        mcat=await i.guild.create_category("Matches",overwrites=cat_perm)
         mat=await i.guild.create_text_channel("matches",category=mcat,overwrites=react_only)
         res=await i.guild.create_text_channel("results",category=mcat,overwrites=react_only)
         lb=await i.guild.create_text_channel("leaderboard",category=mcat,overwrites=admin_only)
@@ -505,6 +516,7 @@ async def setup_run(i):
     msg+=f"{guide_ch.mention} \u2014 Player guide\n"
     msg+=f"{gen.mention} \u2014 General chat\n"
     msg+=f"{tch.mention} \u2014 Team threads\n"
+    msg+=f"{rec.mention} \u2014 Recruiting (looking for team)\n"
     msg+=f"{mat.mention} \u2014 Match schedule\n"
     msg+=f"{res.mention} \u2014 Results\n"
     msg+=f"{lb.mention} \u2014 Leaderboard\n"
