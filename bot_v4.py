@@ -359,7 +359,8 @@ async def gen_matches(guild,c,force=False):
     week=row["weeks_done"]+1
     if week>SEASON_WEEKS and not force:return
     ts=await teams_all(gid)
-    names=[t["display"]for t in ts]
+    eligible=[t for t in ts if len(t.get("members",[]))>=3]
+    names=[t["display"]for t in eligible]
     if len(names)<2:return
     pairs=make_pairs(names,week)
     if not pairs:return
@@ -437,6 +438,11 @@ async def guide_cmd(i):
     embed1.add_field(name="MMR System",value="Win vs stronger = **more MMR**\nWin vs weaker = **less MMR**\nLose vs stronger = **less lost**\nLose vs weaker = **more lost**\nEqual teams = **~25 MMR**",inline=True)
     embed1.add_field(name="\u23f1\ufe0f Rules",value="- **24h cooldown** after leaving/disbanding\n- Returning players inherit **old team's MMR**",inline=False)
     await i.response.send_message(embed=embed1)
+    flow_embed=discord.Embed(title="\U0001f451 Captain's Role & How a Match Works",color=0xe67e22)
+    flow_embed.add_field(name="What is the Captain?",value="The **captain** is the team leader. They:\n- Created the team\n- Invite & kick players\n- Vote on the map\n- Schedule matches\n- Report results\n\n*Only the captain can do these things!*",inline=False)
+    flow_embed.add_field(name="\U0001f504 Match Flow - Step by Step",value="**1.** Matches are generated every **Sunday 10pm GMT**\n**2.** A private thread appears in #matches for your team\n**3.** Both captains **vote on the map** in that thread\n**4.** Captain picks a time with `/schedule` - other captain confirms\n**5.** Play the match! (BO5, first to **3 wins**)\n**6.** Winning captain reports with `/match result` - other captain confirms\n**7.** Result posts to #results, MMR updates, done!\n",inline=False)
+    flow_embed.set_footer(text="If you're ever confused, ask a League Admin!")
+    await i.followup.send(embed=flow_embed)
     embed2=discord.Embed(title="\U0001f4cb Commands",color=0x5865F2)
     embed2.add_field(name="\u2694\ufe0f Team",value="`/team create` - Start a team (you become captain)\n`/team invite @player` - Invite someone\n`/team kick @player` - Remove someone\n`/team leave` - Leave your team\n`/disband` - Delete your team\n`/captain swap @player` - Transfer captain\n`/teaminfo name:Name` - Look up any team",inline=False)
     embed2.add_field(name="\U0001f4c5 Match *(captains only, in match thread)*",value="`/schedule 05 Aug 19:00` - Set match time\n`/reschedule 05 Aug 20:00` - Change time (other captain approves)\n`/match result opponent:Name score:2-1` - Report result",inline=False)
