@@ -443,7 +443,7 @@ async def guide_cmd(i):
     embed1=discord.Embed(title="\U0001f4d6 EGL - Elite Goon League",description="Welcome to the EGL, our own 3v3 competitive league for Elements Divided.",color=0x5865F2)
     embed1.add_field(name="\U0001f3c6 League Format",value="- Teams of **up to 4 players**\n- Season lasts **8 weeks**\n- Matches every **Sunday 10pm GMT**\n- You play **1 match a week** - sometimes **2** if there are lots of teams, so everyone gets to play everyone\n- Captains vote on map (coin flip on tie)\n- **Top 4** advance to Finals, then Grand Final!",inline=False)
     embed1.add_field(name="\U0001f4ca Ranks",value="\U0001f7e4 Awakened\n\u26aa Adept\n\U0001f7e1 **Elementalist** *(start)*\n\U0001f7e2 Master\n\U0001f535 Ascendant\n\U0001f451 Avatar",inline=True)
-    embed1.add_field(name="MMR System",value="Win vs stronger = **more MMR**\nWin vs weaker = **less MMR**\nLose vs stronger = **less lost**\nLose vs weaker = **more lost**\nEqual teams = **~25 MMR**",inline=True)
+    embed1.add_field(name="MMR System",value="Every team has a hidden MMR that decides your rank.\n\n**Who you play matters:**\nWin vs a stronger team = **bigger gain**\nWin vs a weaker team = **smaller gain**\nLose vs a stronger team = **smaller loss**\nLose vs a weaker team = **bigger loss**\n\n**How you play matters too:**\nSweep (3-0) = **bigger reward**\nClose game (3-2) = **smaller reward**",inline=True)
     embed1.add_field(name="\u23f1\ufe0f Rules",value="- **24h cooldown** after leaving/disbanding\n- Returning players inherit **old team's MMR**",inline=False)
     await i.response.send_message(embed=embed1)
     flow_embed=discord.Embed(title="\U0001f451 Captain's Role & How a Match Works",color=0xe67e22)
@@ -878,7 +878,7 @@ bot.tree.add_command(cap)
 
 mat=app_commands.Group(name="match",description="Match")
 @mat.command(name="result",description="Report result (captain)")
-@app_commands.describe(opponent="Opponent",score="e.g. 2-1")
+@app_commands.describe(opponent="Opponent",score="e.g. 3-0")
 async def match_report(i,opponent:str,score:str):
     d=await need_captain(i)
     if not d:return
@@ -886,13 +886,18 @@ async def match_report(i,opponent:str,score:str):
     if not opp:await i.response.send_message("\u274c Not found.",ephemeral=True);return
     if opp["name"]==d.lower():await i.response.send_message("\u274c Self.",ephemeral=True);return
     try:our,their=map(int,score.strip().split("-"))
-    except:await i.response.send_message("\u274c 2-1",ephemeral=True);return
+    except:await i.response.send_message("\u274c 3-0 / 3-1 / 3-2",ephemeral=True);return
     won=our>their;winner=d if won else opp["display"]
     my_t=await team_get(gid,d);opp_t=await team_get(gid,opp["name"])
     my_mmr=int(my_t["mmr"]);opp_mmr=int(opp_t["mmr"])
     if my_mmr==opp_mmr:expected=0.5
     else:expected=1/(1+10**((opp_mmr-my_mmr)/400))
-    delta=round(50*(1-expected))if won else round(50*(0-expected))
+    # Base MMR swing: beating stronger = more, beating weaker = less
+    base=50*(1-expected)if won else 50*expected
+    # BO5 margin bonus: sweep (3-0) = more, close (3-2) = less
+    margin=abs(our-their)
+    mult={3:1.25,2:1.0,1:0.75}.get(margin,1.0)
+    delta=round(base*mult)
     c=await cfg_get(gid)
     oc=i.guild.get_member(int(opp_t["captain_id"]))
     if not oc:await i.response.send_message("\u274c Other captain not found.",ephemeral=True);return
