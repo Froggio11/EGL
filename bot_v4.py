@@ -455,7 +455,7 @@ async def guide_cmd(i):
 async def matchrules_cmd(i):
     if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
     rules_embed=discord.Embed(title="\U0001f4dc Match Rules",color=0x9b59b6)
-    rules_embed.add_field(name="\U0001f525 Element Rules",value="- Play **whatever elements you want**\n- Just **no copies** on the same team - every player uses a different element\n- e.g. 1 fire + 1 explosion + 1 lightning, or 1 water + 1 blood + 1 plant",inline=False)
+    rules_embed.add_field(name="\U0001f525 Element Rules",value="Play **anything you want**, as long as there are no copies.\n- Example: You can't play 2x fire, but you can play fire and explosion.",inline=False)
     rules_embed.add_field(name="\U0001f3ae Game Rules",value="- **Control point:** OFF\n- **Damage zone:** ON\n- **Game mode:** Rounds\n- **Rounds to win:** 3 (BO5)\n- **Stage hazards:** ON\n- **Off map damage:** ON\n- **Multipliers:** All x1",inline=False)
     rules_embed.add_field(name="\U0001f5fa\ufe0f Map",value="Voted on when the match is being made.",inline=False)
     rules_embed.add_field(name="\u26a1 Toggles",value="- Powerups: OFF\n- Ultimates: ON\n- Techniques: ON\n- Blocking: ON\n- Perfect blocking: ON\n- Dashing: ON",inline=False)
