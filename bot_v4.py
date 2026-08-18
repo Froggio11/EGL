@@ -437,18 +437,23 @@ async def guide_cmd(i):
     embed1.add_field(name="MMR System",value="Win vs stronger = **more MMR**\nWin vs weaker = **less MMR**\nLose vs stronger = **less lost**\nLose vs weaker = **more lost**\nEqual teams = **~25 MMR**",inline=True)
     embed1.add_field(name="\u23f1\ufe0f Rules",value="- **24h cooldown** after leaving/disbanding\n- Returning players inherit **old team's MMR**",inline=False)
     await i.response.send_message(embed=embed1)
-    rules_embed=discord.Embed(title="\U0001f4dc Match Rules",color=0x9b59b6)
-    rules_embed.add_field(name="\U0001f525 Element Rules",value="- No element limitations for now\n- **No duplicate ultimates** on a team (e.g. 3 waters = 3 different ults)",inline=False)
-    rules_embed.add_field(name="\U0001f3ae Game Rules",value="- **Control point:** OFF\n- **Damage zone:** ON\n- **Game mode:** Rounds\n- **Rounds to win:** 3 (BO5)\n- **Stage hazards:** ON\n- **Off map damage:** ON\n- **Multipliers:** All x1",inline=False)
-    rules_embed.add_field(name="\U0001f5fa\ufe0f Map",value="Voted on when the match is being made.",inline=False)
-    rules_embed.add_field(name="\u26a1 Toggles",value="- Powerups: OFF\n- Ultimates: ON\n- Techniques: ON\n- Blocking: ON\n- Perfect blocking: ON\n- Dashing: ON",inline=False)
-    await i.followup.send(embed=rules_embed)
     embed2=discord.Embed(title="\U0001f4cb Commands",color=0x5865F2)
     embed2.add_field(name="\u2694\ufe0f Team",value="`/team create` - Start a team (you become captain)\n`/team invite @player` - Invite someone\n`/team kick @player` - Remove someone\n`/team leave` - Leave your team\n`/disband` - Delete your team\n`/captain swap @player` - Transfer captain\n`/teaminfo name:Name` - Look up any team",inline=False)
     embed2.add_field(name="\U0001f4c5 Match *(captains only, in match thread)*",value="`/schedule 05 Aug 19:00` - Set match time\n`/reschedule 05 Aug 20:00` - Change time (other captain approves)\n`/match result opponent:Name score:2-1` - Report result",inline=False)
     embed2.add_field(name="\U0001f4ca Stats",value="`/teaminfo name:Name` - Rank, MMR, progress bar\n`/leaderboard` - Full leaderboard (live)\n`/league status` - Season progress + top 4",inline=False)
     embed2.set_footer(text="Questions? Ask a League Admin. Good luck, Goons!")
     await i.followup.send(embed=embed2)
+
+# ===== /matchrules =====
+@bot.tree.command(name="matchrules",description="Post the match rules in this channel (League Admin)")
+async def matchrules_cmd(i):
+    if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
+    rules_embed=discord.Embed(title="\U0001f4dc Match Rules",color=0x9b59b6)
+    rules_embed.add_field(name="\U0001f525 Element Rules",value="- No element limitations for now\n- **No duplicate ultimates** on a team (e.g. 3 waters = 3 different ults)",inline=False)
+    rules_embed.add_field(name="\U0001f3ae Game Rules",value="- **Control point:** OFF\n- **Damage zone:** ON\n- **Game mode:** Rounds\n- **Rounds to win:** 3 (BO5)\n- **Stage hazards:** ON\n- **Off map damage:** ON\n- **Multipliers:** All x1",inline=False)
+    rules_embed.add_field(name="\U0001f5fa\ufe0f Map",value="Voted on when the match is being made.",inline=False)
+    rules_embed.add_field(name="\u26a1 Toggles",value="- Powerups: OFF\n- Ultimates: ON\n- Techniques: ON\n- Blocking: ON\n- Perfect blocking: ON\n- Dashing: ON",inline=False)
+    await i.response.send_message(embed=rules_embed)
 
 # ===== /scrimguide =====
 @bot.tree.command(name="scrimguide",description="Post the scrim guide (League Admin)")
@@ -484,6 +489,7 @@ async def setup_run(i):
         mat=await i.guild.create_text_channel("matches",category=mcat,overwrites=react_only)
         res=await i.guild.create_text_channel("results",category=mcat,overwrites=react_only)
         lb=await i.guild.create_text_channel("leaderboard",category=mcat,overwrites=admin_only)
+        mr=await i.guild.create_text_channel("match-rules",category=mcat,overwrites=admin_only)
     except Exception as e:await i.followup.send(f"\u274c Failed: {e}");return
     async with aiosqlite.connect(DB)as db:
         await db.execute("INSERT INTO setup_data VALUES(?,?,?,?,?,?,?,?,?,?)",(gid,"EGL",str(lcat.id),str(mcat.id),str(ann.id),str(gen.id),str(tch.id),"",str(mat.id),str(res.id)))
@@ -495,7 +501,8 @@ async def setup_run(i):
     msg+=f"{tch.mention} \u2014 Team threads\n"
     msg+=f"{mat.mention} \u2014 Match schedule\n"
     msg+=f"{res.mention} \u2014 Results\n"
-    msg+=f"{lb.mention} \u2014 Leaderboard\n\n"
+    msg+=f"{lb.mention} \u2014 Leaderboard\n"
+    msg+=f"{mr.mention} \u2014 Match rules\n\n"
     await i.followup.send(msg)
 @setup.command(name="reset",description="Delete all bot channels and reset")
 async def setup_reset(i):
