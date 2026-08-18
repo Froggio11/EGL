@@ -26,7 +26,7 @@ def parse_schedule(s):
     else:raise ValueError(f"Invalid time: {t}")
     yr=datetime.now(timezone.utc).year
     return datetime.strptime(f"{day:02d} {mon} {yr} {h:02d}:{mi:02d}","%d %b %Y %H:%M").replace(tzinfo=timezone.utc)
-RANKS=[(0,"Adept"),(900,"Lotus"),(1000,"Monk"),(1050,"Warden"),(1100,"Avatar"),(1150,"Raava")]
+RANKS=[(0,"Awakened"),(900,"Adept"),(1000,"Elementalist"),(1050,"Master"),(1100,"Ascendant"),(1150,"Avatar")]
 intents=discord.Intents.default();intents.members=True;intents.message_content=True
 bot=commands.Bot(command_prefix="!",intents=intents)
 
@@ -433,7 +433,7 @@ async def guide_cmd(i):
     if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
     embed1=discord.Embed(title="\U0001f4d6 EGL - Elite Goon League",description="Welcome to the EGL, our own 3v3 competitive league for Elements Divided.",color=0x5865F2)
     embed1.add_field(name="\U0001f3c6 League Format",value="- Teams of **up to 4 players**\n- **8-week season** - every team plays every other team\n- Matches every **Sunday 10pm GMT**\n- Captains vote on map (coin flip on tie)\n- **Top 4** advance to Finals, then Grand Final!",inline=False)
-    embed1.add_field(name="\U0001f4ca Ranks",value="\U0001f7e4 Adept\n\u26aa Lotus\n\U0001f7e1 **Monk** *(start)*\n\U0001f7e2 Warden\n\U0001f535 Avatar\n\U0001f451 Raava",inline=True)
+    embed1.add_field(name="\U0001f4ca Ranks",value="\U0001f7e4 Awakened\n\u26aa Adept\n\U0001f7e1 **Elementalist** *(start)*\n\U0001f7e2 Master\n\U0001f535 Ascendant\n\U0001f451 Avatar",inline=True)
     embed1.add_field(name="MMR System",value="Win vs stronger = **more MMR**\nWin vs weaker = **less MMR**\nLose vs stronger = **less lost**\nLose vs weaker = **more lost**\nEqual teams = **~25 MMR**",inline=True)
     embed1.add_field(name="\u23f1\ufe0f Rules",value="- **24h cooldown** after leaving/disbanding\n- Returning players inherit **old team's MMR**",inline=False)
     await i.response.send_message(embed=embed1)
