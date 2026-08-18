@@ -361,12 +361,20 @@ async def gen_matches(guild,c,force=False):
     ts=await teams_all(gid)
     eligible=[t for t in ts if len(t.get("members",[]))>=3]
     names=[t["display"]for t in eligible]
-    if len(names)<2:return
-    pairs=make_pairs(names,week)
-    if not pairs:return
+    n=len(names)
+    if n<2:return
+    # Adaptive: 1 match/week normally, 2/week for big leagues. Always runs 8 weeks;
+    # make_pairs wraps around so remaining weeks become rematches.
+    rounds_needed=n if n%2 else n-1
+    mpw=1 if rounds_needed<=SEASON_WEEKS else 2
+    start_round=(week-1)*mpw+1
+    all_pairs=[]
+    for r in range(mpw):
+        all_pairs+=make_pairs(names,start_round+r)
+    if not all_pairs:return
     match_ids=[]
     async with aiosqlite.connect(DB)as db:
-        for a,b in pairs:
+        for a,b in all_pairs:
             mid=str(uuid.uuid4())[:8]
             await db.execute("INSERT INTO matches VALUES(?,?,?,?,?,NULL,NULL,NULL,?,NULL,0,NULL,NULL,NULL,NULL)",(mid,gid,week,a,b,datetime.now(timezone.utc).isoformat()))
             match_ids.append((mid,a,b))
@@ -433,7 +441,7 @@ async def gen_matches(guild,c,force=False):
 async def guide_cmd(i):
     if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
     embed1=discord.Embed(title="\U0001f4d6 EGL - Elite Goon League",description="Welcome to the EGL, our own 3v3 competitive league for Elements Divided.",color=0x5865F2)
-    embed1.add_field(name="\U0001f3c6 League Format",value="- Teams of **up to 4 players**\n- **8-week season** - every team plays every other team\n- Matches every **Sunday 10pm GMT**\n- Captains vote on map (coin flip on tie)\n- **Top 4** advance to Finals, then Grand Final!",inline=False)
+    embed1.add_field(name="\U0001f3c6 League Format",value="- Teams of **up to 4 players**\n- Season lasts **8 weeks**\n- Matches every **Sunday 10pm GMT**\n- You play **1 match a week** - sometimes **2** if there are lots of teams, so everyone gets to play everyone\n- Captains vote on map (coin flip on tie)\n- **Top 4** advance to Finals, then Grand Final!",inline=False)
     embed1.add_field(name="\U0001f4ca Ranks",value="\U0001f7e4 Awakened\n\u26aa Adept\n\U0001f7e1 **Elementalist** *(start)*\n\U0001f7e2 Master\n\U0001f535 Ascendant\n\U0001f451 Avatar",inline=True)
     embed1.add_field(name="MMR System",value="Win vs stronger = **more MMR**\nWin vs weaker = **less MMR**\nLose vs stronger = **less lost**\nLose vs weaker = **more lost**\nEqual teams = **~25 MMR**",inline=True)
     embed1.add_field(name="\u23f1\ufe0f Rules",value="- **24h cooldown** after leaving/disbanding\n- Returning players inherit **old team's MMR**",inline=False)
