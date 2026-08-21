@@ -470,7 +470,7 @@ async def matchrules_cmd(i):
     await i.response.send_message(embed=rules_embed)
 
 # ===== /scrimguide =====
-@bot.tree.command(name="scrimguide",description="Post the scrim guide (League Admin)")
+# @bot.tree.command(name="scrimguide",description="Post the scrim guide (League Admin)")
 async def scrimguide_cmd(i):
     if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
     embed=discord.Embed(title="\U0001f3ae Scrims Guide",description="Casual practice matches - no league points, just fun.",color=0xe67e22)
@@ -737,6 +737,7 @@ async def team_create(i,name:str,clantag:str):
     clantag=clantag.strip().upper()
     if not clantag:await i.response.send_message("\u274c Clan tag is required.",ephemeral=True);return
     if len(clantag)>4:await i.response.send_message("\u274c Clan tag max 4 characters.",ephemeral=True);return
+    if len(name)>15:await i.response.send_message("\u274c Team name max 15 characters.",ephemeral=True);return
     if ex:=await team_by_player(gid,uid):await i.response.send_message(f"\u274c On **{ex['display']}**.",ephemeral=True);return
     if await team_get(gid,name):await i.response.send_message(f"\u274c Exists.",ephemeral=True);return
     if await is_on_cooldown(gid,uid):await i.response.send_message("\u274c 24h cooldown.",ephemeral=True);return
@@ -840,6 +841,42 @@ async def disband(i):
         if not is_tester(m):await set_cooldown(gid,uid,t["mmr"])
     async with aiosqlite.connect(DB)as db:await db.execute("DELETE FROM members WHERE guild_id=? AND team_name=?",(gid,t["name"]));await db.execute("DELETE FROM teams WHERE guild_id=? AND name=?",(gid,t["name"]));await db.commit()
     await i.followup.send(f"\U0001f5d1\ufe0f **{t['display']}** disbanded.")
+
+@bot.tree.command(name="deleteteam",description="Delete a team by name (League Admin only)")
+@app_commands.describe(name="Team name")
+async def deleteteam(i,name:str):
+    if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
+    gid=str(i.guild_id);t=await team_get(gid,name)
+    if not t:await i.response.send_message("\u274c Not found.",ephemeral=True);return
+    await i.response.defer()
+    if t.get("thread_id"):
+        th=i.guild.get_thread(int(t["thread_id"]))
+        if th:
+            try:await th.edit(archived=True,locked=True)
+            except:pass
+    if t.get("role_id"):
+        role=i.guild.get_role(int(t["role_id"]))
+        if role:
+            try:await role.delete(reason="Deleted by admin")
+            except:pass
+    for uid in t["members"]:
+        m=i.guild.get_member(int(uid))
+        if m:await rem_roles(i.guild,m,t["display"],uid==t["captain_id"])
+    async with aiosqlite.connect(DB)as db:
+        await db.execute("DELETE FROM members WHERE guild_id=? AND team_name=?",(gid,t["name"]))
+        await db.execute("DELETE FROM teams WHERE guild_id=? AND name=?",(gid,t["name"]))
+        await db.commit()
+    await i.followup.send(f"\U0001f5d1\ufe0f **{t['display']}** deleted by admin.")
+
+@bot.tree.command(name="resetteams",description="Reset all teams' MMR + record (League Admin only)")
+async def resetteams(i):
+    if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
+    gid=str(i.guild_id)
+    await i.response.defer()
+    async with aiosqlite.connect(DB)as db:
+        await db.execute("UPDATE teams SET mmr=1000,wins=0,losses=0 WHERE guild_id=?",(gid,))
+        await db.commit()
+    await i.followup.send("\u2705 All teams reset to 1000 MMR, 0W/0L.")
 
 @bot.tree.command(name="teaminfo",description="Team info")
 @app_commands.describe(team="Team name")
@@ -1012,7 +1049,7 @@ async def create_mixedscrim(i,time:str,format:str):
     async with aiosqlite.connect(DB)as db:await db.execute("INSERT OR REPLACE INTO scrim_sessions VALUES(?,?,NULL,?,?,?,?)",(gid,today,str(msg.id),max_p,title,unix));await db.commit()
     await i.followup.send(f"\u2705 Mixed {format} scrim created! ({scrim_time})",ephemeral=True)
 
-@bot.tree.command(name="teamscrim",description="Ping @TeamScrims for scrim (Captain only, in #team-scrims)")
+# @bot.tree.command(name="teamscrim",description="Ping @TeamScrims for scrim (Captain only, in #team-scrims)")
 async def teamscrim_ping(i):
     d=await need_captain(i)
     if not d:return
@@ -1227,7 +1264,7 @@ async def on_ready():
     match_reminders.start()
     leaderboard_refresh.start()
 
-bot.tree.add_command(scrimbot_grp)
+# bot.tree.add_command(scrimbot_grp)  # disabled - scrims removed
 bot.tree.add_command(setup)
 
 if __name__=="__main__":
