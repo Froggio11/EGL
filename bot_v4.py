@@ -1161,14 +1161,13 @@ async def refresh_rosters(guild):
     if not ts:return
     lines=[]
     for t in ts[:25]:
-        names=[]
-        for uid in t["members"]:
+        cap_id=t["captain_id"]
+        sorted_uids=sorted(t["members"],key=lambda u:0 if u==cap_id else 1)
+        lines.append(f"**{t['display']}** ({len(t['members'])}/{MAX_TEAM}) \u00b7 {get_rank(t['mmr'])}")
+        for uid in sorted_uids:
             m=guild.get_member(int(uid))
             nm=m.display_name if m else f"<@{uid}>"
-            if uid==t["captain_id"]:nm="\U0001f451 "+nm
-            names.append(nm)
-        lines.append(f"**{t['display']}** ({len(t['members'])}/{MAX_TEAM})")
-        lines.append("\u00b7 ".join(names)if names else"*No members*")
+            lines.append(f"\U0001f451 {nm}"if uid==cap_id else f"\u00b7 {nm}")
         lines.append("")
     c=await cfg_get(gid)
     season_name=c["name"]if c else "EGL"
@@ -1193,14 +1192,13 @@ async def teaminfoall_cmd(i):
     if not ts:await i.response.send_message("No teams yet.",ephemeral=True);return
     lines=[]
     for t in ts[:25]:
-        names=[]
-        for uid in t["members"]:
+        cap_id=t["captain_id"]
+        sorted_uids=sorted(t["members"],key=lambda u:0 if u==cap_id else 1)
+        lines.append(f"**{t['display']}** ({len(t['members'])}/{MAX_TEAM}) \u00b7 {get_rank(t['mmr'])}")
+        for uid in sorted_uids:
             m=i.guild.get_member(int(uid))
             nm=m.display_name if m else f"<@{uid}>"
-            if uid==t["captain_id"]:nm="\U0001f451 "+nm
-            names.append(nm)
-        lines.append(f"**{t['display']}** ({len(t['members'])}/{MAX_TEAM})")
-        lines.append("\u00b7 ".join(names)if names else"*No members*")
+            lines.append(f"\U0001f451 {nm}"if uid==cap_id else f"\u00b7 {nm}")
         lines.append("")
     c=await cfg_get(gid)
     season_name=c["name"]if c else "EGL"
