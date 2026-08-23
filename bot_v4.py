@@ -773,6 +773,7 @@ async def team_create(i,name:str,clantag:str):
     extra=f"\n\U0001f4cc <#{thread_id}>"if thread_id else""
     await i.followup.send(f"\u2694\ufe0f **{name}** created!\nCaptain:{i.user.mention}|Rank:{get_rank(start_mmr)}|1/{MAX_TEAM}{' | Clan tag: '+clantag if clantag else ''}{extra}")
     await refresh_leaderboard(i.guild)
+    await refresh_rosters(i.guild)
 @team.command(name="invite",description="Invite (captain)")
 @app_commands.describe(player="Player")
 async def team_invite(i,player:discord.Member):
@@ -844,6 +845,7 @@ async def disband(i):
     async with aiosqlite.connect(DB)as db:await db.execute("DELETE FROM members WHERE guild_id=? AND team_name=?",(gid,t["name"]));await db.execute("DELETE FROM teams WHERE guild_id=? AND name=?",(gid,t["name"]));await db.commit()
     await i.followup.send(f"\U0001f5d1\ufe0f **{t['display']}** disbanded.")
     await refresh_leaderboard(i.guild)
+    await refresh_rosters(i.guild)
 
 @bot.tree.command(name="deleteteam",description="Delete a team by name (League Admin only)")
 @app_commands.describe(name="Team name")
@@ -871,6 +873,7 @@ async def deleteteam(i,name:str):
         await db.commit()
     await i.followup.send(f"\U0001f5d1\ufe0f **{t['display']}** deleted by admin.")
     await refresh_leaderboard(i.guild)
+    await refresh_rosters(i.guild)
 
 @bot.tree.command(name="resetteams",description="Reset all teams' MMR + record (League Admin only)")
 async def resetteams(i):
@@ -1086,14 +1089,16 @@ async def refresh_leaderboard(guild):
     ts=sorted(await teams_all(gid),key=lambda x:x["mmr"],reverse=True)
     if not ts:return
     medals=["\U0001f947","\U0001f948","\U0001f949"]
-    lines=[]
+    rows=[]
     for n,t in enumerate(ts[:25]):
-        pos=medals[n]if n<3 else f"{n+1}."
-        lines.append(f"{pos} **{t['display']}** \u00b7 {get_rank(t['mmr'])} \u00b7 {t['wins']}W {t['losses']}L")
-    if len(ts)>25:lines.append(f"\n*...and {len(ts)-25} more teams*")
+        pos=medals[n]if n<3 else f"{n+1:>2}."
+        name=t['display'][:15]
+        rec=f"{t['wins']}W {t['losses']}L"
+        rows.append(f"{pos} {name:<16}{rec:>8}  {t['mmr']:>4}")
+    if len(ts)>25:rows.append(f"...and {len(ts)-25} more")
     c=await cfg_get(gid)
     season_name=c["name"]if c else "EGL"
-    embed=discord.Embed(title=f"\U0001f4ca {season_name} Leaderboard",description="\n".join(lines),color=0x5865F2)
+    embed=discord.Embed(title=f"\U0001f4ca {season_name} Leaderboard",description="```\n"+"\n".join(rows)+"\n```",color=0x5865F2)
     embed.set_footer(text=f"{len(ts)} teams \u00b7 Updates automatically")
     try:
         msg=await ch.fetch_message(int(r[1]))
@@ -1114,14 +1119,16 @@ async def leaderboard_cmd(i):
     ts=sorted(await teams_all(gid),key=lambda x:x["mmr"],reverse=True)
     if not ts:await i.response.send_message("No teams yet.",ephemeral=True);return
     medals=["\U0001f947","\U0001f948","\U0001f949"]
-    lines=[]
+    rows=[]
     for n,t in enumerate(ts[:25]):
-        pos=medals[n]if n<3 else f"{n+1}."
-        lines.append(f"{pos} **{t['display']}** \u00b7 {get_rank(t['mmr'])} \u00b7 {t['wins']}W {t['losses']}L")
-    if len(ts)>25:lines.append(f"\n*...and {len(ts)-25} more teams*")
+        pos=medals[n]if n<3 else f"{n+1:>2}."
+        name=t['display'][:15]
+        rec=f"{t['wins']}W {t['losses']}L"
+        rows.append(f"{pos} {name:<16}{rec:>8}  {t['mmr']:>4}")
+    if len(ts)>25:rows.append(f"...and {len(ts)-25} more")
     c=await cfg_get(gid)
     season_name=c["name"]if c else"EGL"
-    embed=discord.Embed(title=f"\U0001f4ca {season_name} Leaderboard",description="\n".join(lines),color=0x5865F2)
+    embed=discord.Embed(title=f"\U0001f4ca {season_name} Leaderboard",description="```\n"+"\n".join(rows)+"\n```",color=0x5865F2)
     embed.set_footer(text=f"{len(ts)} teams \u00b7 Updates automatically")
     # Delete old message if exists
     async with aiosqlite.connect(DB)as db:
@@ -1141,10 +1148,86 @@ async def leaderboard_cmd(i):
         await db.commit()
     await i.response.send_message("\u2705 Leaderboard posted!",ephemeral=True)
 
+async def refresh_rosters(guild):
+    gid=str(guild.id)
+    async with aiosqlite.connect(DB)as db:
+        await db.execute("CREATE TABLE IF NOT EXISTS roster_state(guild_id TEXT PRIMARY KEY,ch TEXT,msg TEXT)")
+        async with db.execute("SELECT ch,msg FROM roster_state WHERE guild_id=?",(gid,))as cur:
+            r=await cur.fetchone()
+    if not r:return
+    ch=guild.get_channel(int(r[0]))
+    if not ch:return
+    ts=sorted(await teams_all(gid),key=lambda x:x["mmr"],reverse=True)
+    if not ts:return
+    lines=[]
+    for t in ts[:25]:
+        names=[]
+        for uid in t["members"]:
+            m=guild.get_member(int(uid))
+            nm=m.display_name if m else f"<@{uid}>"
+            if uid==t["captain_id"]:nm="\U0001f451 "+nm
+            names.append(nm)
+        lines.append(f"**{t['display']}** ({len(t['members'])}/{MAX_TEAM})")
+        lines.append("\u00b7 ".join(names)if names else"*No members*")
+        lines.append("")
+    c=await cfg_get(gid)
+    season_name=c["name"]if c else "EGL"
+    embed=discord.Embed(title=f"\U0001f4cb {season_name} Rosters",description="\n".join(lines),color=0x57F287)
+    embed.set_footer(text=f"{len(ts)} teams \u00b7 Updates automatically")
+    try:
+        msg=await ch.fetch_message(int(r[1]))
+        await msg.edit(embed=embed)
+    except:pass
+
+@bot.tree.command(name="teaminfoall",description="Post/refresh the team roster list (League Admin only)")
+async def teaminfoall_cmd(i):
+    if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
+    gid=str(i.guild_id)
+    ro_ch=None
+    for cat in i.guild.categories:
+        for ch in cat.text_channels:
+            if ch.name=="rosters":ro_ch=ch;break
+    if not ro_ch:await i.response.send_message("\u274c No #rosters channel. Create one first.",ephemeral=True);return
+    if i.channel.id!=ro_ch.id:await i.response.send_message(f"\u274c Use this in {ro_ch.mention}.",ephemeral=True);return
+    ts=sorted(await teams_all(gid),key=lambda x:x["mmr"],reverse=True)
+    if not ts:await i.response.send_message("No teams yet.",ephemeral=True);return
+    lines=[]
+    for t in ts[:25]:
+        names=[]
+        for uid in t["members"]:
+            m=i.guild.get_member(int(uid))
+            nm=m.display_name if m else f"<@{uid}>"
+            if uid==t["captain_id"]:nm="\U0001f451 "+nm
+            names.append(nm)
+        lines.append(f"**{t['display']}** ({len(t['members'])}/{MAX_TEAM})")
+        lines.append("\u00b7 ".join(names)if names else"*No members*")
+        lines.append("")
+    c=await cfg_get(gid)
+    season_name=c["name"]if c else "EGL"
+    embed=discord.Embed(title=f"\U0001f4cb {season_name} Rosters",description="\n".join(lines),color=0x57F287)
+    embed.set_footer(text=f"{len(ts)} teams \u00b7 Updates automatically")
+    async with aiosqlite.connect(DB)as db:
+        await db.execute("CREATE TABLE IF NOT EXISTS roster_state(guild_id TEXT PRIMARY KEY,ch TEXT,msg TEXT)")
+        async with db.execute("SELECT ch,msg FROM roster_state WHERE guild_id=?",(gid,))as cur:
+            old=await cur.fetchone()
+    if old and old[0]:
+        old_ch=i.guild.get_channel(int(old[0]))
+        if old_ch and old[1]:
+            try:
+                old_msg=await old_ch.fetch_message(int(old[1]))
+                await old_msg.delete()
+            except:pass
+    msg=await ro_ch.send(embed=embed)
+    async with aiosqlite.connect(DB)as db:
+        await db.execute("INSERT OR REPLACE INTO roster_state VALUES(?,?,?)",(gid,str(ro_ch.id),str(msg.id)))
+        await db.commit()
+    await i.response.send_message("\u2705 Rosters posted!",ephemeral=True)
+
 @tasks.loop(minutes=1)
 async def leaderboard_refresh():
     for g in bot.guilds:
         await refresh_leaderboard(g)
+        await refresh_rosters(g)
 @leaderboard_refresh.before_loop
 async def lb_bef():await bot.wait_until_ready()
 
