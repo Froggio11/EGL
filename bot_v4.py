@@ -1091,14 +1091,12 @@ async def refresh_leaderboard(guild):
     medals=["\U0001f947","\U0001f948","\U0001f949"]
     rows=[]
     for n,t in enumerate(ts[:25]):
-        pos=medals[n]if n<3 else f"{n+1:>2}."
-        name=t['display'][:15]
-        rec=f"{t['wins']}W {t['losses']}L"
-        rows.append(f"{pos} {name:<16}{rec:>8}  {t['mmr']:>4}")
-    if len(ts)>25:rows.append(f"...and {len(ts)-25} more")
+        pos=medals[n]if n<3 else f"`{n+1}.`"
+        rows.append(f"{pos} **{t['display']}** \u00b7 {t['wins']}W {t['losses']}L \u00b7 `{t['mmr']}`")
+    if len(ts)>25:rows.append(f"*...and {len(ts)-25} more teams*")
     c=await cfg_get(gid)
     season_name=c["name"]if c else "EGL"
-    embed=discord.Embed(title=f"\U0001f4ca {season_name} Leaderboard",description="```\n"+"\n".join(rows)+"\n```",color=0x5865F2)
+    embed=discord.Embed(title=f"\U0001f4ca {season_name} Leaderboard",description="\n".join(rows),color=0x5865F2)
     embed.set_footer(text=f"{len(ts)} teams \u00b7 Updates automatically")
     try:
         msg=await ch.fetch_message(int(r[1]))
