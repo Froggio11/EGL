@@ -1077,6 +1077,7 @@ leaderboard_msg_ids={}
 async def refresh_leaderboard(guild):
     gid=str(guild.id)
     async with aiosqlite.connect(DB)as db:
+        await db.execute("CREATE TABLE IF NOT EXISTS leaderboard_state(guild_id TEXT PRIMARY KEY,ch TEXT,msg TEXT)")
         async with db.execute("SELECT ch,msg FROM leaderboard_state WHERE guild_id=?",(gid,))as cur:
             r=await cur.fetchone()
     if not r:return
@@ -1124,6 +1125,7 @@ async def leaderboard_cmd(i):
     embed.set_footer(text=f"{len(ts)} teams \u00b7 Updates automatically")
     # Delete old message if exists
     async with aiosqlite.connect(DB)as db:
+        await db.execute("CREATE TABLE IF NOT EXISTS leaderboard_state(guild_id TEXT PRIMARY KEY,ch TEXT,msg TEXT)")
         async with db.execute("SELECT ch,msg FROM leaderboard_state WHERE guild_id=?",(gid,))as cur:
             old=await cur.fetchone()
     if old and old[0]:
