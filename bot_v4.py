@@ -41,6 +41,7 @@ async def init_db():
         CREATE TABLE IF NOT EXISTS season(guild_id TEXT PRIMARY KEY,weeks_done INT DEFAULT 0,finals_generated INT DEFAULT 0);
         CREATE TABLE IF NOT EXISTS player_history(guild_id TEXT,user_id TEXT,last_mmr INT DEFAULT 1000,cooldown_until TEXT,PRIMARY KEY(guild_id,user_id));
         CREATE TABLE IF NOT EXISTS guild_settings(guild_id TEXT PRIMARY KEY,teams_ch TEXT);
+        CREATE TABLE IF NOT EXISTS leaderboard_state(guild_id TEXT PRIMARY KEY,ch TEXT,msg TEXT);
         CREATE TABLE IF NOT EXISTS setup_data(guild_id TEXT PRIMARY KEY,league_name TEXT,league_category_id TEXT,matches_category_id TEXT,announcements_ch TEXT,general_ch TEXT,teams_ch TEXT,fa_ch TEXT,matches_ch TEXT,results_ch TEXT);
         CREATE TABLE IF NOT EXISTS scrim_sessions(guild_id TEXT,date TEXT,thread_id TEXT,msg_id TEXT,max_players INT DEFAULT 6,PRIMARY KEY(guild_id,date));
         CREATE TABLE IF NOT EXISTS scrim_signups(guild_id TEXT,date TEXT,user_id TEXT,position INT,PRIMARY KEY(guild_id,date,user_id));
@@ -771,6 +772,7 @@ async def team_create(i,name:str,clantag:str):
     async with aiosqlite.connect(DB)as db:await db.execute("UPDATE teams SET role_id=?,thread_id=? WHERE guild_id=? AND name=?",(role_id,thread_id,gid,name.lower()));await db.commit()
     extra=f"\n\U0001f4cc <#{thread_id}>"if thread_id else""
     await i.followup.send(f"\u2694\ufe0f **{name}** created!\nCaptain:{i.user.mention}|Rank:{get_rank(start_mmr)}|1/{MAX_TEAM}{' | Clan tag: '+clantag if clantag else ''}{extra}")
+    await refresh_leaderboard(i.guild)
 @team.command(name="invite",description="Invite (captain)")
 @app_commands.describe(player="Player")
 async def team_invite(i,player:discord.Member):
@@ -841,6 +843,7 @@ async def disband(i):
         if not is_tester(m):await set_cooldown(gid,uid,t["mmr"])
     async with aiosqlite.connect(DB)as db:await db.execute("DELETE FROM members WHERE guild_id=? AND team_name=?",(gid,t["name"]));await db.execute("DELETE FROM teams WHERE guild_id=? AND name=?",(gid,t["name"]));await db.commit()
     await i.followup.send(f"\U0001f5d1\ufe0f **{t['display']}** disbanded.")
+    await refresh_leaderboard(i.guild)
 
 @bot.tree.command(name="deleteteam",description="Delete a team by name (League Admin only)")
 @app_commands.describe(name="Team name")
@@ -867,6 +870,7 @@ async def deleteteam(i,name:str):
         await db.execute("DELETE FROM teams WHERE guild_id=? AND name=?",(gid,t["name"]))
         await db.commit()
     await i.followup.send(f"\U0001f5d1\ufe0f **{t['display']}** deleted by admin.")
+    await refresh_leaderboard(i.guild)
 
 @bot.tree.command(name="resetteams",description="Reset all teams' MMR + record (League Admin only)")
 async def resetteams(i):
@@ -1072,22 +1076,26 @@ leaderboard_msg_ids={}
 
 async def refresh_leaderboard(guild):
     gid=str(guild.id)
-    if gid not in leaderboard_msg_ids:return
-    msg_data=leaderboard_msg_ids[gid]
-    ch=guild.get_channel(int(msg_data["ch"]))
+    async with aiosqlite.connect(DB)as db:
+        async with db.execute("SELECT ch,msg FROM leaderboard_state WHERE guild_id=?",(gid,))as cur:
+            r=await cur.fetchone()
+    if not r:return
+    ch=guild.get_channel(int(r[0]))
     if not ch:return
     ts=sorted(await teams_all(gid),key=lambda x:x["mmr"],reverse=True)
     if not ts:return
+    medals=["\U0001f947","\U0001f948","\U0001f949"]
     lines=[]
     for n,t in enumerate(ts[:25]):
-        lines.append(f"`{n+1:>2}.` **{t['display']}** - {t['wins']}W/{t['losses']}L - {get_rank(t['mmr'])} `{t['mmr']} MMR`")
+        pos=medals[n]if n<3 else f"{n+1}."
+        lines.append(f"{pos} **{t['display']}** \u00b7 {get_rank(t['mmr'])} \u00b7 {t['wins']}W {t['losses']}L")
     if len(ts)>25:lines.append(f"\n*...and {len(ts)-25} more teams*")
     c=await cfg_get(gid)
     season_name=c["name"]if c else "EGL"
     embed=discord.Embed(title=f"\U0001f4ca {season_name} Leaderboard",description="\n".join(lines),color=0x5865F2)
-    embed.set_footer(text=f"{len(ts)} teams - Auto-refreshed")
+    embed.set_footer(text=f"{len(ts)} teams \u00b7 Updates automatically")
     try:
-        msg=await ch.fetch_message(int(msg_data["msg"]))
+        msg=await ch.fetch_message(int(r[1]))
         await msg.edit(embed=embed)
     except:pass
 
@@ -1104,26 +1112,31 @@ async def leaderboard_cmd(i):
     if i.channel.id!=lb_ch.id:await i.response.send_message(f"\u274c Use this in {lb_ch.mention}.",ephemeral=True);return
     ts=sorted(await teams_all(gid),key=lambda x:x["mmr"],reverse=True)
     if not ts:await i.response.send_message("No teams yet.",ephemeral=True);return
+    medals=["\U0001f947","\U0001f948","\U0001f949"]
     lines=[]
     for n,t in enumerate(ts[:25]):
-        lines.append(f"`{n+1:>2}.` **{t['display']}** - {t['wins']}W/{t['losses']}L - {get_rank(t['mmr'])} `{t['mmr']} MMR`")
+        pos=medals[n]if n<3 else f"{n+1}."
+        lines.append(f"{pos} **{t['display']}** \u00b7 {get_rank(t['mmr'])} \u00b7 {t['wins']}W {t['losses']}L")
     if len(ts)>25:lines.append(f"\n*...and {len(ts)-25} more teams*")
     c=await cfg_get(gid)
     season_name=c["name"]if c else"EGL"
     embed=discord.Embed(title=f"\U0001f4ca {season_name} Leaderboard",description="\n".join(lines),color=0x5865F2)
-    embed.set_footer(text=f"{len(ts)} teams - Auto-refreshed")
+    embed.set_footer(text=f"{len(ts)} teams \u00b7 Updates automatically")
     # Delete old message if exists
-    if gid in leaderboard_msg_ids:
-        try:
-            old_ch=i.guild.get_channel(int(leaderboard_msg_ids[gid]["ch"]))
-            if old_ch:
-                try:
-                    old_msg=await old_ch.fetch_message(int(leaderboard_msg_ids[gid]["msg"]))
-                    await old_msg.delete()
-                except:pass
-        except:pass
+    async with aiosqlite.connect(DB)as db:
+        async with db.execute("SELECT ch,msg FROM leaderboard_state WHERE guild_id=?",(gid,))as cur:
+            old=await cur.fetchone()
+    if old and old[0]:
+        old_ch=i.guild.get_channel(int(old[0]))
+        if old_ch and old[1]:
+            try:
+                old_msg=await old_ch.fetch_message(int(old[1]))
+                await old_msg.delete()
+            except:pass
     msg=await lb_ch.send(embed=embed)
-    leaderboard_msg_ids[gid]={"ch":str(lb_ch.id),"msg":str(msg.id)}
+    async with aiosqlite.connect(DB)as db:
+        await db.execute("INSERT OR REPLACE INTO leaderboard_state VALUES(?,?,?)",(gid,str(lb_ch.id),str(msg.id)))
+        await db.commit()
     await i.response.send_message("\u2705 Leaderboard posted!",ephemeral=True)
 
 @tasks.loop(minutes=1)
