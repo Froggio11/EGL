@@ -622,8 +622,8 @@ async def league_create(i,name:str):
     end_date=datetime.now(timezone.utc)+timedelta(weeks=SEASON_WEEKS)
     now=datetime.now(timezone.utc)
     days_until_sunday=(6-now.weekday())%7
-    next_sunday=now.replace(hour=18,minute=0,second=0)+timedelta(days=days_until_sunday if days_until_sunday>0 else 0)
-    if days_until_sunday==0 and now.hour>=18:next_sunday+=timedelta(days=7)
+    next_sunday=now.replace(hour=22,minute=0,second=0)+timedelta(days=days_until_sunday if days_until_sunday>0 else 0)
+    if days_until_sunday==0 and now.hour>=22:next_sunday+=timedelta(days=7)
     sun_unix=int(next_sunday.replace(tzinfo=timezone.utc).timestamp())
     if sd.get("announcements_ch"):
         ann=i.guild.get_channel(int(sd["announcements_ch"]))
@@ -1250,7 +1250,7 @@ async def restore_cmd(i,file:discord.Attachment):
 @tasks.loop(hours=1)
 async def weekly_check():
     now=datetime.now(timezone.utc)
-    if now.weekday()!=6 or now.hour!=18:return
+    if now.weekday()!=6 or now.hour!=22:return
     for g in bot.guilds:
         c=await cfg_get(str(g.id))
         if c:await gen_matches(g,c)
