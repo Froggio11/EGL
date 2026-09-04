@@ -885,6 +885,56 @@ async def resetteams(i):
         await db.commit()
     await i.followup.send("\u2705 All teams reset to 1000 MMR, 0W/0L.")
 
+@bot.tree.command(name="closematch",description="Force close a match (League Admin only, in match thread)")
+@app_commands.choices(result=[
+    app_commands.Choice(name="Team 1 wins",value="team1"),
+    app_commands.Choice(name="Team 2 wins",value="team2"),
+    app_commands.Choice(name="Cancel (no changes)",value="cancel"),
+    app_commands.Choice(name="Both forfeit (small MMR penalty, no W/L)",value="bothforfeit"),
+])
+async def closematch(i,result:str):
+    if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
+    if not isinstance(i.channel,discord.Thread):await i.response.send_message("\u274c Use inside the match thread.",ephemeral=True);return
+    gid=str(i.guild_id)
+    async with aiosqlite.connect(DB)as db:
+        db.row_factory=aiosqlite.Row
+        await db.execute("CREATE TABLE IF NOT EXISTS closed_matches(guild_id TEXT PRIMARY KEY)")
+        async with db.execute("SELECT * FROM matches WHERE thread_id=? AND guild_id=? AND winner IS NULL",(str(i.channel.id),gid))as cur:
+            row=await cur.fetchone()
+    if not row:await i.response.send_message("\u274c No open match in this thread (or already resolved).",ephemeral=True);return
+    row=dict(row);t1=row["team1"];t2=row["team2"]
+    await i.response.defer(ephemeral=True)
+    if result=="cancel":
+        async with aiosqlite.connect(DB)as db:
+            await db.execute("UPDATE matches SET score='canceled',winner='canceled',reporter=? WHERE id=?",(str(i.user.id),row["id"]))
+            await db.commit()
+        await i.followup.send(f"\u274c Match **{t1} vs {t2}** canceled. No MMR or W/L changes.",ephemeral=True)
+    elif result=="bothforfeit":
+        async with aiosqlite.connect(DB)as db:
+            await db.execute("UPDATE teams SET mmr=mmr-10 WHERE guild_id=? AND name IN (?,?)",(gid,t1.lower(),t2.lower()))
+            await db.execute("UPDATE matches SET score='forfeit',winner='both-forfeit',reporter=? WHERE id=?",(str(i.user.id),row["id"]))
+            await db.commit()
+        await i.followup.send(f"\u26a0\ufe0f **{t1} vs {t2}** closed: both forfeit (-10 MMR each, no W/L).",ephemeral=True)
+    else:
+        # team1 or team2 wins
+        winner=t1 if result=="team1" else t2
+        loser=t2 if result=="team1" else t1
+        wt=await team_get(gid,winner);lt=await team_get(gid,loser)
+        wmmr=int(wt["mmr"]);lmmr=int(lt["mmr"])
+        expected=0.5 if wmmr==lmmr else 1/(1+10**((lmmr-wmmr)/400))
+        delta=round(50*(1-expected))
+        async with aiosqlite.connect(DB)as db:
+            await db.execute("UPDATE teams SET wins=wins+1,mmr=mmr+? WHERE guild_id=? AND name=?",(delta,gid,winner.lower()))
+            await db.execute("UPDATE teams SET losses=losses+1,mmr=mmr-? WHERE guild_id=? AND name=?",(delta,gid,loser.lower()))
+            await db.execute("UPDATE matches SET score='forfeit',winner=?,reporter=? WHERE id=?",(winner,str(i.user.id),row["id"]))
+            await db.commit()
+        await i.followup.send(f"\U0001f3c6 **{winner}** wins by forfeit over **{loser}** ({delta} MMR).",ephemeral=True)
+    # Archive the thread
+    try:
+        await i.channel.send(f"\U0001f512 Match closed by {i.user.mention}.")
+        await i.channel.edit(archived=True,locked=True)
+    except:pass
+
 @bot.tree.command(name="teaminfo",description="Team info")
 @app_commands.describe(team="Team name")
 async def teaminfo(i,team:str):
