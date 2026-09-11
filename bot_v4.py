@@ -896,14 +896,14 @@ async def closematch(i,result:str):
     if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
     if not isinstance(i.channel,discord.Thread):await i.response.send_message("\u274c Use inside the match thread.",ephemeral=True);return
     gid=str(i.guild_id)
+    await i.response.defer(ephemeral=True)
     async with aiosqlite.connect(DB)as db:
         db.row_factory=aiosqlite.Row
         await db.execute("CREATE TABLE IF NOT EXISTS closed_matches(guild_id TEXT PRIMARY KEY)")
         async with db.execute("SELECT * FROM matches WHERE thread_id=? AND guild_id=? AND winner IS NULL",(str(i.channel.id),gid))as cur:
             row=await cur.fetchone()
-    if not row:await i.response.send_message("\u274c No open match in this thread (or already resolved).",ephemeral=True);return
+    if not row:await i.followup.send("\u274c No open match in this thread (or already resolved).",ephemeral=True);return
     row=dict(row);t1=row["team1"];t2=row["team2"]
-    await i.response.defer(ephemeral=True)
     if result=="cancel":
         async with aiosqlite.connect(DB)as db:
             await db.execute("UPDATE matches SET score='canceled',winner='canceled',reporter=? WHERE id=?",(str(i.user.id),row["id"]))
@@ -976,11 +976,12 @@ mat=app_commands.Group(name="match",description="Match")
 async def match_report(i,opponent:str,score:str):
     d=await need_captain(i)
     if not d:return
+    await i.response.defer(ephemeral=True)
     gid=str(i.guild_id);opp=await team_get(gid,opponent)
-    if not opp:await i.response.send_message("\u274c Not found.",ephemeral=True);return
-    if opp["name"]==d.lower():await i.response.send_message("\u274c Self.",ephemeral=True);return
+    if not opp:await i.followup.send("\u274c Not found.",ephemeral=True);return
+    if opp["name"]==d.lower():await i.followup.send("\u274c Self.",ephemeral=True);return
     try:our,their=map(int,score.strip().split("-"))
-    except:await i.response.send_message("\u274c 3-0 / 3-1 / 3-2",ephemeral=True);return
+    except:await i.followup.send("\u274c 3-0 / 3-1 / 3-2",ephemeral=True);return
     won=our>their;winner=d if won else opp["display"]
     my_t=await team_get(gid,d);opp_t=await team_get(gid,opp["name"])
     my_mmr=int(my_t["mmr"]);opp_mmr=int(opp_t["mmr"])
@@ -994,10 +995,10 @@ async def match_report(i,opponent:str,score:str):
     delta=round(base*mult)
     c=await cfg_get(gid)
     oc=i.guild.get_member(int(opp_t["captain_id"]))
-    if not oc:await i.response.send_message("\u274c Other captain not found.",ephemeral=True);return
+    if not oc:await i.followup.send("\u274c Other captain not found.",ephemeral=True);return
     su="+"if won else"-";st="-"if won else"+"
     v=ResultConfirmView(opp_t["captain_id"],d,opp["name"],score,won,winner,delta,gid,c)
-    await i.response.send_message(f"\u26a1 {i.user.mention} reports: **{d} {score} {opp['display']}** - Winner: **{winner}**\n{d}({get_rank(my_mmr)}) {su}{delta} | {opp['display']}({get_rank(opp_mmr)}) {st}{delta}\n\n{oc.mention} please confirm:",view=v)
+    await i.followup.send(f"\u26a1 {i.user.mention} reports: **{d} {score} {opp['display']}** - Winner: **{winner}**\n{d}({get_rank(my_mmr)}) {su}{delta} | {opp['display']}({get_rank(opp_mmr)}) {st}{delta}\n\n{oc.mention} please confirm:",view=v)
 bot.tree.add_command(mat)
 
 mmr=app_commands.Group(name="mmr",description="MMR (Admin)")
