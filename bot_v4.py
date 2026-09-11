@@ -202,16 +202,6 @@ async def need_captain(i):
     return t["display"]
 
 # ===== Views =====
-async def captain_team(gid,uid):
-    t=await team_by_player(gid,uid)
-    return t["display"]if t else None
-
-async def record_sched_event(gid,match_id,team,action,detail=""):
-    async with aiosqlite.connect(DB)as db:
-        await db.execute("CREATE TABLE IF NOT EXISTS sched_events(id INTEGER PRIMARY KEY AUTOINCREMENT,guild_id TEXT,match_id TEXT,team TEXT,action TEXT,detail TEXT,ts TEXT)")
-        await db.execute("INSERT INTO sched_events(guild_id,match_id,team,action,detail,ts) VALUES(?,?,?,?,?,?)",(gid,match_id,team,action,detail,datetime.now(timezone.utc).isoformat()))
-        await db.commit()
-
 class MapVoteView(discord.ui.View):
     def __init__(self,mid,th):
         super().__init__(timeout=604800);self.mid=mid;self.th=th;self.p={}
@@ -245,60 +235,30 @@ async def send_map_vote(channel,mid):
         btn.callback=cb;mv.add_item(btn)
     return await channel.send("**\U0001f5fa\ufe0f Map Vote:**",view=mv)
 
-class CounterModal(discord.ui.Modal,title="Counter-proposal"):
-    def __init__(self,view):
-        super().__init__();self.view=view
-        self.t=discord.ui.TextInput(label="New time (e.g. 12 Sep 20:00 or 8pm)",style=discord.TextStyle.short)
-        self.add_item(self.t)
-    async def on_submit(self,i):
-        try:
-            dt=parse_schedule(self.t.value)
-            ns=dt.strftime(SCHED_FMT+" GMT");unix=int(dt.timestamp())
-        except:
-            await i.response.send_message("Invalid time format.",ephemeral=True);return
-        gid=str(i.guild_id)
-        team=await captain_team(gid,self.view.actor_id)
-        await record_sched_event(gid,self.view.mid,team or "?","counter",ns)
-        self.view.done=True
-        other_member=i.guild.get_member(int(self.view.proposer_id))
-        nv=ScheduleConfirmView(self.view.mid,self.view.proposer_id,self.view.actor_id,ns,unix,self.view.thread_id)
-        await i.response.send_message(f"\U0001f504 {i.user.mention} counter-proposes **{ns}** (<t:{unix}:f>).\n{other_member.mention if other_member else ''} please reply:",view=nv)
-
 class ScheduleConfirmView(discord.ui.View):
-    def __init__(self,mid,actor_id,proposer_id,sched,unix,thread_id):
-        super().__init__(timeout=86400);self.mid=mid;self.actor_id=actor_id;self.proposer_id=proposer_id;self.sched=sched;self.unix=unix;self.thread_id=thread_id;self.done=False
-    async def _check(self,i):
-        if self.done:await i.response.send_message("Stale proposal.",ephemeral=True);return False
-        if str(i.user.id)!=self.actor_id:await i.response.send_message("Other captain only.",ephemeral=True);return False
-        return True
+    def __init__(self,ocid,sched,unix,thread_id,mid):
+        super().__init__(timeout=86400);self.ocid=ocid;self.sched=sched;self.unix=unix;self.thread_id=thread_id;self.mid=mid
     @discord.ui.button(label="\u2705 Confirm",style=discord.ButtonStyle.green)
     async def confirm(self,i,btn):
-        if not await self._check(i):return
         gid=str(i.guild_id)
         async with aiosqlite.connect(DB)as db:
             db.row_factory=aiosqlite.Row
-            async with db.execute("SELECT team1,team2 FROM matches WHERE id=?",(self.mid,))as cur:row=await cur.fetchone()
+            async with db.execute("SELECT team1,team2 FROM matches WHERE id=?",(self.mid,))as cur:
+                row=await cur.fetchone()
         if not row:await i.response.send_message("Match not found.",ephemeral=True);return
-        team=await captain_team(gid,self.actor_id)
-        await record_sched_event(gid,self.mid,team or "?","confirm",self.sched)
+        t1=await team_get(gid,row["team1"]);t2=await team_get(gid,row["team2"])
+        other=self.ocid
+        if str(i.user.id)!=other:await i.response.send_message("Other captain only.",ephemeral=True);return
         async with aiosqlite.connect(DB)as db:await db.execute("UPDATE matches SET scheduled=? WHERE thread_id=?",(self.sched,self.thread_id));await db.commit()
-        self.done=True
         for c in self.children:c.disabled=True
         await i.response.edit_message(content=f"\U0001f4c5 **Confirmed!** Match scheduled: **{self.sched}**\n\U0001f550 Your time: <t:{self.unix}:f>",view=None)
+        # Open map vote now that time is set
         await send_map_vote(i.channel,self.mid)
     @discord.ui.button(label="\u274c Decline",style=discord.ButtonStyle.red)
     async def decline(self,i,btn):
-        if not await self._check(i):return
-        gid=str(i.guild_id)
-        team=await captain_team(gid,self.actor_id)
-        await record_sched_event(gid,self.mid,team or "?","decline")
-        self.done=True
+        if str(i.user.id)!=self.ocid:await i.response.send_message("Other captain only.",ephemeral=True);return
         for c in self.children:c.disabled=True
         await i.response.edit_message(content="\u274c Schedule proposal declined.",view=self)
-    @discord.ui.button(label="\U0001f504 Counter",style=discord.ButtonStyle.blurple)
-    async def counter(self,i,btn):
-        if not await self._check(i):return
-        await i.response.send_modal(CounterModal(self))
 
 class ResultConfirmView(discord.ui.View):
     def __init__(self,ocid,d,opp_name,score,won,winner,delta,gid,cfg):
@@ -1025,7 +985,13 @@ async def schedulestatus(i):
     await i.response.defer(ephemeral=True)
     async with aiosqlite.connect(DB)as db:
         db.row_factory=aiosqlite.Row
-        async with db.execute("SELECT team1,team2,map,scheduled,week FROM matches WHERE guild_id=? AND winner IS NULL ORDER BY week",(gid,))as cur:
+        async with db.execute("SELECT MAX(week) AS wk FROM matches WHERE guild_id=? AND winner IS NULL",(gid,))as cur:
+            mrow=await cur.fetchone()
+    if not mrow or mrow["wk"] is None:await i.followup.send("\u2705 No open matches.",ephemeral=True);return
+    cur_week=mrow["wk"]
+    async with aiosqlite.connect(DB)as db:
+        db.row_factory=aiosqlite.Row
+        async with db.execute("SELECT team1,team2,map,scheduled,week FROM matches WHERE guild_id=? AND winner IS NULL AND week=? ORDER BY team1",(gid,cur_week))as cur:
             rows=await cur.fetchall()
     if not rows:await i.followup.send("\u2705 No open matches.",ephemeral=True);return
     lines=[]
@@ -1042,50 +1008,8 @@ async def schedulestatus(i):
             except:time_part=f"**{sched}**"
         mp=r.get("map")or"\u274c No map"
         lines.append(f"**W{r['week']}** {r['team1']} vs {r['team2']}\n\U0001f4c5 {time_part}\n\U0001f5fa\ufe0f {mp}")
-    embed=discord.Embed(title="\U0001f4c5 Schedule Status",description="\n\n".join(lines),color=0x5865F2)
-    embed.set_footer(text=f"{len(rows)} open matches")
-    await i.followup.send(embed=embed,ephemeral=True)
-
-@bot.tree.command(name="schedulereview",description="Analyze scheduling effort in this match thread (League Admin only)")
-async def schedulereview(i):
-    if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
-    if not isinstance(i.channel,discord.Thread):await i.response.send_message("\u274c Use inside the match thread.",ephemeral=True);return
-    gid=str(i.guild_id)
-    await i.response.defer(ephemeral=True)
-    async with aiosqlite.connect(DB)as db:
-        db.row_factory=aiosqlite.Row
-        async with db.execute("SELECT id,team1,team2 FROM matches WHERE thread_id=?",(str(i.channel.id),))as cur:
-            m=await cur.fetchone()
-    if not m:await i.followup.send("\u274c No match in this thread.",ephemeral=True);return
-    m=dict(m);t1=m["team1"];t2=m["team2"]
-    async with aiosqlite.connect(DB)as db:
-        db.row_factory=aiosqlite.Row
-        await db.execute("CREATE TABLE IF NOT EXISTS sched_events(id INTEGER PRIMARY KEY AUTOINCREMENT,guild_id TEXT,match_id TEXT,team TEXT,action TEXT,detail TEXT,ts TEXT)")
-        async with db.execute("SELECT team,action,detail,ts FROM sched_events WHERE match_id=? ORDER BY id",(m["id"],))as cur:
-            evs=await cur.fetchall()
-    if not evs:await i.followup.send("\u274c No scheduling activity recorded for this match yet.",ephemeral=True);return
-    stats={}
-    for ev in evs:
-        ev=dict(ev);tm=ev["team"]
-        s=stats.setdefault(tm,{"propose":0,"counter":0,"confirm":0,"decline":0,"last":ev["ts"],"details":[]})
-        if ev["action"]in s:s[ev["action"]]+=1
-        if ev["detail"]:s["details"].append(f"{ev['action']}: {ev['detail']}")
-        s["last"]=ev["ts"]
-    for tm in[t1,t2]:stats.setdefault(tm,{"propose":0,"counter":0,"confirm":0,"decline":0,"last":"-","details":[]})
-    def score(x):
-        return x["propose"]*3+x["counter"]*2+x["confirm"]*2-x["decline"]*2
-    s1=stats[t1];s2=stats[t2]
-    def line(tm,s):
-        acts=f"proposals {s['propose']} · counters {s['counter']} · confirms {s['confirm']} · declines {s['decline']}"
-        return f"**{tm}**: {acts}"
-    verdict=""
-    if score(s1)>score(s2):verdict=f"\n\n\u2705 **{t1}** tried harder to schedule."
-    elif score(s2)>score(s1):verdict=f"\n\n\u2705 **{t2}** tried harder to schedule."
-    else:verdict="\n\n\u26a0\ufe0f Both teams showed similar effort."
-    lines=[line(t1,s1),line(t2,s2)]
-    if s1["details"]:lines.append(f"\n**{t1}:** "+"; ".join(s1["details"][-5:]))
-    if s2["details"]:lines.append(f"**{t2}:** "+"; ".join(s2["details"][-5:]))
-    embed=discord.Embed(title="\U0001f4c5 Scheduling Review",description="\n".join(lines)+verdict,color=0x5865F2)
+    embed=discord.Embed(title=f"\U0001f4c5 Schedule Status \u00b7 Week {cur_week}",description="\n\n".join(lines),color=0x5865F2)
+    embed.set_footer(text=f"{len(rows)} open matches this week")
     await i.followup.send(embed=embed,ephemeral=True)
 
 @bot.tree.command(name="closematch",description="Force close a match (League Admin only, in match thread)")
@@ -1247,8 +1171,7 @@ async def schedule_cmd(i,datetime_str:str):
     if not ot:await i.response.send_message("\u274c Other team gone.",ephemeral=True);return
     oc=i.guild.get_member(int(ot["captain_id"]))
     if not oc:await i.response.send_message("\u274c Other captain not found.",ephemeral=True);return
-    await record_sched_event(gid,row["id"],d,"propose",sched)
-    v=ScheduleConfirmView(row["id"],ot["captain_id"],str(i.user.id),sched,unix,str(i.channel.id))
+    v=ScheduleConfirmView(ot["captain_id"],sched,unix,str(i.channel.id),row["id"])
     await i.response.send_message(f"\U0001f4c5 {i.user.mention} proposes: **{sched}**\n\U0001f550 Your time: <t:{unix}:f>\n\n{oc.mention} please confirm:",view=v)
 
 @bot.tree.command(name="reschedule",description="Reschedule (other captain approves)")
@@ -1272,8 +1195,7 @@ async def reschedule_cmd(i,datetime_str:str):
     if not ot:await i.response.send_message("\u274c Other team gone.",ephemeral=True);return
     oc=i.guild.get_member(int(ot["captain_id"]))
     if not oc:await i.response.send_message("\u274c Other captain gone.",ephemeral=True);return
-    await record_sched_event(gid,row["id"],d,"propose",nt)
-    v=ScheduleConfirmView(row["id"],ot["captain_id"],str(i.user.id),nt,unix,str(i.channel.id))
+    v=RescheduleView(ot["captain_id"],nt,row["id"],gid)
     await i.response.send_message(f"\U0001f4c5 {i.user.mention} wants **{nt}** (<t:{unix}:f>).\n{oc.mention} approve?",view=v)
 
 create_grp=app_commands.Group(name="create",description="Create scrims")
@@ -1599,6 +1521,33 @@ async def on_guild_join(guild):
                 r=await guild.create_role(name=role_name,color=color)
             except:pass
     log.info("\u2705 Joined %s, commands synced, roles created",guild.name)
+
+@bot.event
+async def on_member_remove(member):
+    gid=str(member.guild.id);uid=str(member.id)
+    t=await team_by_player(gid,uid)
+    if not t:return
+    was_cap=t["captain_id"]==uid
+    async with aiosqlite.connect(DB)as db:
+        await db.execute("DELETE FROM members WHERE guild_id=? AND team_name=? AND user_id=?",(gid,t["name"],uid))
+        await db.commit()
+    # If they were captain, promote the next member
+    if was_cap:
+        t2=await team_get(gid,t["name"])
+        if t2 and t2["members"]:
+            ncap=str(t2["members"][0])
+            async with aiosqlite.connect(DB)as db:
+                await db.execute("UPDATE teams SET captain_id=? WHERE guild_id=? AND name=?",(ncap,gid,t["name"]));await db.commit()
+            nm=member.guild.get_member(int(ncap))
+            cr=find_role(member.guild,"Captain")
+            if nm and cr:
+                try:await nm.add_roles(cr)
+                except:pass
+        else:
+            async with aiosqlite.connect(DB)as db:
+                await db.execute("DELETE FROM teams WHERE guild_id=? AND name=?",(gid,t["name"]));await db.commit()
+    await refresh_leaderboard(member.guild)
+    await refresh_rosters(member.guild)
 
 @bot.event
 async def on_ready():
