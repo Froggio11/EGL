@@ -202,20 +202,103 @@ async def need_captain(i):
     return t["display"]
 
 # ===== Views =====
+async def captain_team(gid,uid):
+    t=await team_by_player(gid,uid)
+    return t["display"]if t else None
+
+async def record_sched_event(gid,match_id,team,action,detail=""):
+    async with aiosqlite.connect(DB)as db:
+        await db.execute("CREATE TABLE IF NOT EXISTS sched_events(id INTEGER PRIMARY KEY AUTOINCREMENT,guild_id TEXT,match_id TEXT,team TEXT,action TEXT,detail TEXT,ts TEXT)")
+        await db.execute("INSERT INTO sched_events(guild_id,match_id,team,action,detail,ts) VALUES(?,?,?,?,?,?)",(gid,match_id,team,action,detail,datetime.now(timezone.utc).isoformat()))
+        await db.commit()
+
+class MapVoteView(discord.ui.View):
+    def __init__(self,mid,th):
+        super().__init__(timeout=604800);self.mid=mid;self.th=th;self.p={}
+    async def _v(self,i,mn):
+        uid=str(i.user.id)
+        async with aiosqlite.connect(DB)as db:
+            db.row_factory=aiosqlite.Row
+            async with db.execute("SELECT team1,team2 FROM matches WHERE id=?",(self.mid,))as cur:
+                row=await cur.fetchone()
+        if not row:await i.response.send_message("Match not found.",ephemeral=True);return
+        gid=str(i.guild_id)
+        t1=await team_get(gid,row["team1"]);t2=await team_get(gid,row["team2"])
+        caps=[t1["captain_id"]if t1 else"",t2["captain_id"]if t2 else""]
+        if uid not in caps:await i.response.send_message("Captains only.",ephemeral=True);return
+        if uid in self.p:await i.response.send_message("Already voted.",ephemeral=True);return
+        self.p[uid]=mn;await i.response.send_message(f"{mn}!",ephemeral=True)
+        if len(self.p)==2:
+            vs=list(self.p.values())
+            res=vs[0]if vs[0]==vs[1]else random.choice(vs)
+            coin=" (coin flip!)"if vs[0]!=vs[1]else""
+            for c in self.children:c.disabled=True
+            await i.edit_original_response(content=f"Map: **{res}**{coin}",view=None)
+            await self.th.send(f"\U0001f5fa\ufe0f Map: **{res}**{coin}")
+            async with aiosqlite.connect(DB)as db2:await db2.execute("UPDATE matches SET map=? WHERE id=?",(res,self.mid));await db2.commit()
+
+async def send_map_vote(channel,mid):
+    mv=MapVoteView(mid,channel)
+    for mn in MAPS:
+        btn=discord.ui.Button(label=mn,style=discord.ButtonStyle.primary)
+        async def cb(i,mn=mn):await mv._v(i,mn)
+        btn.callback=cb;mv.add_item(btn)
+    return await channel.send("**\U0001f5fa\ufe0f Map Vote:**",view=mv)
+
+class CounterModal(discord.ui.Modal,title="Counter-proposal"):
+    def __init__(self,view):
+        super().__init__();self.view=view
+        self.t=discord.ui.TextInput(label="New time (e.g. 12 Sep 20:00 or 8pm)",style=discord.TextStyle.short)
+        self.add_item(self.t)
+    async def on_submit(self,i):
+        try:
+            dt=parse_schedule(self.t.value)
+            ns=dt.strftime(SCHED_FMT+" GMT");unix=int(dt.timestamp())
+        except:
+            await i.response.send_message("Invalid time format.",ephemeral=True);return
+        gid=str(i.guild_id)
+        team=await captain_team(gid,self.view.actor_id)
+        await record_sched_event(gid,self.view.mid,team or "?","counter",ns)
+        self.view.done=True
+        other_member=i.guild.get_member(int(self.view.proposer_id))
+        nv=ScheduleConfirmView(self.view.mid,self.view.proposer_id,self.view.actor_id,ns,unix,self.view.thread_id)
+        await i.response.send_message(f"\U0001f504 {i.user.mention} counter-proposes **{ns}** (<t:{unix}:f>).\n{other_member.mention if other_member else ''} please reply:",view=nv)
+
 class ScheduleConfirmView(discord.ui.View):
-    def __init__(self,ocid,sched,unix,thread_id):
-        super().__init__(timeout=86400);self.ocid=ocid;self.sched=sched;self.unix=unix;self.thread_id=thread_id
+    def __init__(self,mid,actor_id,proposer_id,sched,unix,thread_id):
+        super().__init__(timeout=86400);self.mid=mid;self.actor_id=actor_id;self.proposer_id=proposer_id;self.sched=sched;self.unix=unix;self.thread_id=thread_id;self.done=False
+    async def _check(self,i):
+        if self.done:await i.response.send_message("Stale proposal.",ephemeral=True);return False
+        if str(i.user.id)!=self.actor_id:await i.response.send_message("Other captain only.",ephemeral=True);return False
+        return True
     @discord.ui.button(label="\u2705 Confirm",style=discord.ButtonStyle.green)
     async def confirm(self,i,btn):
-        if str(i.user.id)!=self.ocid:await i.response.send_message("Other captain only.",ephemeral=True);return
+        if not await self._check(i):return
+        gid=str(i.guild_id)
+        async with aiosqlite.connect(DB)as db:
+            db.row_factory=aiosqlite.Row
+            async with db.execute("SELECT team1,team2 FROM matches WHERE id=?",(self.mid,))as cur:row=await cur.fetchone()
+        if not row:await i.response.send_message("Match not found.",ephemeral=True);return
+        team=await captain_team(gid,self.actor_id)
+        await record_sched_event(gid,self.mid,team or "?","confirm",self.sched)
         async with aiosqlite.connect(DB)as db:await db.execute("UPDATE matches SET scheduled=? WHERE thread_id=?",(self.sched,self.thread_id));await db.commit()
+        self.done=True
         for c in self.children:c.disabled=True
-        await i.response.edit_message(content=f"\U0001f4c5 **Confirmed!** Match scheduled: **{self.sched}**\n\U0001f550 Your time: <t:{self.unix}:f>",view=self)
+        await i.response.edit_message(content=f"\U0001f4c5 **Confirmed!** Match scheduled: **{self.sched}**\n\U0001f550 Your time: <t:{self.unix}:f>",view=None)
+        await send_map_vote(i.channel,self.mid)
     @discord.ui.button(label="\u274c Decline",style=discord.ButtonStyle.red)
     async def decline(self,i,btn):
-        if str(i.user.id)!=self.ocid:await i.response.send_message("Other captain only.",ephemeral=True);return
+        if not await self._check(i):return
+        gid=str(i.guild_id)
+        team=await captain_team(gid,self.actor_id)
+        await record_sched_event(gid,self.mid,team or "?","decline")
+        self.done=True
         for c in self.children:c.disabled=True
         await i.response.edit_message(content="\u274c Schedule proposal declined.",view=self)
+    @discord.ui.button(label="\U0001f504 Counter",style=discord.ButtonStyle.blurple)
+    async def counter(self,i,btn):
+        if not await self._check(i):return
+        await i.response.send_modal(CounterModal(self))
 
 class ResultConfirmView(discord.ui.View):
     def __init__(self,ocid,d,opp_name,score,won,winner,delta,gid,cfg):
@@ -338,15 +421,28 @@ async def create_scrim_thread(gid,date):
 class RescheduleView(discord.ui.View):
     def __init__(self,ocid,nt,mid,gid):
         super().__init__(timeout=86400);self.ocid=ocid;self.nt=nt;self.mid=mid;self.gid=gid
+    async def _other_cap(self,gid,user_id):
+        async with aiosqlite.connect(DB)as db:
+            db.row_factory=aiosqlite.Row
+            async with db.execute("SELECT team1,team2 FROM matches WHERE id=?",(self.mid,))as cur:
+                row=await cur.fetchone()
+        if not row:return None
+        t1=await team_get(gid,row["team1"]);t2=await team_get(gid,row["team2"])
+        caps=[t1["captain_id"]if t1 else"",t2["captain_id"]if t2 else""]
+        other=[c for c in caps if c!=user_id]
+        return other[0]if other else None
     @discord.ui.button(label="Approve",style=discord.ButtonStyle.green)
     async def approve(self,i,btn):
-        if str(i.user.id)!=self.ocid:await i.response.send_message("Other captain only.",ephemeral=True);return
+        gid=str(i.guild_id)
+        other=await self._other_cap(gid,str(i.user.id))
+        if not other or str(i.user.id)!=other:await i.response.send_message("Other captain only.",ephemeral=True);return
         async with aiosqlite.connect(DB)as db:await db.execute("UPDATE matches SET scheduled=? WHERE id=?",(self.nt,self.mid));await db.commit()
         for c in self.children:c.disabled=True
         await i.response.edit_message(content=f"Rescheduled to **{self.nt}**",view=self)
     @discord.ui.button(label="Deny",style=discord.ButtonStyle.red)
     async def deny(self,i,btn):
-        if str(i.user.id)!=self.ocid:await i.response.send_message("Other captain only.",ephemeral=True);return
+        other=await self._other_cap(str(i.guild_id),str(i.user.id))
+        if not other or str(i.user.id)!=other:await i.response.send_message("Other captain only.",ephemeral=True);return
         for c in self.children:c.disabled=True;await i.response.edit_message(content="Denied.",view=self)
 
 # ===== Gen Matches =====
@@ -400,29 +496,7 @@ async def gen_matches(guild,c,force=False):
                     if is_admin(m)and str(m.id)not in added:
                         try:await th.add_user(m);added.add(str(m.id))
                         except:pass
-                await th.send(f"\u26a1 **{a} vs {b}** - Week {week}\n\nEveryone's here! Captains vote below then `/schedule {SCHED_HELP}` (GMT).")
-                cap1_id=t1["captain_id"]if t1 else"";cap2_id=t2["captain_id"]if t2 else""
-                class MV(discord.ui.View):
-                    def __init__(s):super().__init__(timeout=604800);s.c1=cap1_id;s.c2=cap2_id;s.p={};s.mid=mid;s.gid=gid;s.th=th
-                    async def _v(s,i,mn):
-                        uid=str(i.user.id)
-                        if uid not in(s.c1,s.c2):await i.response.send_message("Captains only.",ephemeral=True);return
-                        if uid in s.p:await i.response.send_message("Already voted.",ephemeral=True);return
-                        s.p[uid]=mn;await i.response.send_message(f"{mn}!",ephemeral=True)
-                        if len(s.p)==2:
-                            vs=list(s.p.values())
-                            res=vs[0]if vs[0]==vs[1]else random.choice(vs)
-                            coin=" (coin flip!)"if vs[0]!=vs[1]else""
-                            for c in s.children:c.disabled=True
-                            await i.edit_original_response(content=f"Map: **{res}**{coin}",view=None)
-                            await s.th.send(f"\U0001f5fa\ufe0f Map: **{res}**{coin}\nUse `/schedule {SCHED_HELP}` (GMT).")
-                            async with aiosqlite.connect(DB)as db3:await db3.execute("UPDATE matches SET map=? WHERE id=?",(res,s.mid));await db3.commit()
-                mv=MV()
-                for mn in MAPS:
-                    btn=discord.ui.Button(label=mn,style=discord.ButtonStyle.primary)
-                    async def cb(i,mn=mn):await MV._v(mv,i,mn)
-                    btn.callback=cb;mv.add_item(btn)
-                await th.send("**\U0001f5fa\ufe0f Map Vote:**",view=mv)
+                await th.send(f"\u26a1 **{a} vs {b}** - Week {week}\n\nEveryone's here! Captain, set a time with `/schedule {SCHED_HELP}` (GMT). Once both captains confirm, the map vote will open.")
             except Exception as e:log.warning("Thread: %s",e)
         lines=[f"\u26a1 **Week {week} Matches**",""]+[f"\u2022 **{a}** vs **{b}**"for _,a,b in match_ids]+["","Check threads!"]
         await ch.send("\n".join(lines))
@@ -466,8 +540,9 @@ async def matchrules_cmd(i):
     rules_embed=discord.Embed(title="\U0001f4dc Match Rules",color=0x9b59b6)
     rules_embed.add_field(name="\U0001f525 Element Rules",value="Play **anything you want**, as long as there are no copies.\n- Example: You can't play 2x fire, but you can play fire and explosion.\n- **No duplicate ultimates** on a team (e.g. 3 players = 3 different ults)",inline=False)
     rules_embed.add_field(name="\U0001f3ae Game Rules",value="- **Control point:** OFF\n- **Damage zone:** ON\n- **Game mode:** Rounds\n- **Rounds to win:** 3 (BO5)\n- **Stage hazards:** ON\n- **Off map damage:** ON\n- **Multipliers:** All x1",inline=False)
-    rules_embed.add_field(name="\U0001f5fa\ufe0f Map",value="Voted on when the match is being made.",inline=False)
+    rules_embed.add_field(name="\U0001f5fa\ufe0f Map",value="Voted on after the match time is set.",inline=False)
     rules_embed.add_field(name="\u26a1 Toggles",value="- Powerups: OFF\n- Ultimates: ON\n- Techniques: ON\n- Blocking: ON\n- Perfect blocking: ON\n- Dashing: ON",inline=False)
+    rules_embed.add_field(name="\u23f0 Forfeits & No-Shows",value="- If a teammate/enemy doesn't connect within **15 minutes** of the scheduled time, **that team loses 3-0**\n- If a team **can't play** that week, they forfeit the match **3-0**\n- If you **can't agree on a time**, ping the League Admins - they decide based on who tried to schedule\n- Captains are responsible for the rules - a match played with invalid rules **must be replayed**",inline=False)
     await i.response.send_message(embed=rules_embed)
 
 # ===== /scrimguide =====
@@ -885,6 +960,134 @@ async def resetteams(i):
         await db.commit()
     await i.followup.send("\u2705 All teams reset to 1000 MMR, 0W/0L.")
 
+@bot.tree.command(name="forcecaptainswap",description="Change a team's captain, even if the old one left (League Admin only)")
+@app_commands.describe(team="Team name",new_captain="New captain")
+async def forcecaptainswap(i,team:str,new_captain:discord.Member):
+    if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
+    gid=str(i.guild_id);t=await team_get(gid,team)
+    if not t:await i.response.send_message("\u274c Team not found.",ephemeral=True);return
+    if str(new_captain.id)not in t["members"]:await i.response.send_message("\u274c That player isn't on this team.",ephemeral=True);return
+    old_id=t["captain_id"]
+    if str(new_captain.id)==old_id:await i.response.send_message("\u274c Already the captain.",ephemeral=True);return
+    await i.response.defer()
+    async with aiosqlite.connect(DB)as db:
+        await db.execute("UPDATE teams SET captain_id=? WHERE guild_id=? AND name=?",(str(new_captain.id),gid,t["name"]));await db.commit()
+    cr=find_role(i.guild,"Captain")
+    old_member=i.guild.get_member(int(old_id))
+    if cr:
+        try:
+            if old_member:await old_member.remove_roles(cr)
+            await new_captain.add_roles(cr)
+        except:pass
+    await i.followup.send(f"\U0001f451 **{t['display']}** captain is now {new_captain.mention}.")
+
+@bot.tree.command(name="forcekick",description="Force remove a player from a team (League Admin only)")
+@app_commands.describe(team="Team name",player="Player to remove")
+async def forcekick(i,team:str,player:discord.Member):
+    if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
+    gid=str(i.guild_id);t=await team_get(gid,team)
+    if not t:await i.response.send_message("\u274c Team not found.",ephemeral=True);return
+    if str(player.id)not in t["members"]:await i.response.send_message("\u274c Not on that team.",ephemeral=True);return
+    await i.response.defer()
+    was_cap=str(player.id)==t["captain_id"]
+    async with aiosqlite.connect(DB)as db:
+        await db.execute("DELETE FROM members WHERE guild_id=? AND team_name=? AND user_id=?",(gid,t["name"],str(player.id)));await db.commit()
+    await rem_roles(i.guild,player,t["display"],was_cap)
+    if t.get("thread_id"):
+        th=i.guild.get_thread(int(t["thread_id"]))
+        if th:
+            try:await th.remove_user(player)
+            except:pass
+    # If the kicked player was captain, promote the next member
+    if was_cap:
+        t2=await team_get(gid,t["name"])
+        if t2 and t2["members"]:
+            ncap=str(t2["members"][0])
+            async with aiosqlite.connect(DB)as db:
+                await db.execute("UPDATE teams SET captain_id=? WHERE guild_id=? AND name=?",(ncap,gid,t["name"]));await db.commit()
+            nm=i.guild.get_member(int(ncap))
+            cr=find_role(i.guild,"Captain")
+            if nm and cr:
+                try:await nm.add_roles(cr)
+                except:pass
+            await i.followup.send(f"\U0001f9b5 Removed {player.mention}. New captain: <@{ncap}>.")
+        else:
+            async with aiosqlite.connect(DB)as db:
+                await db.execute("DELETE FROM teams WHERE guild_id=? AND name=?",(gid,t["name"]));await db.commit()
+            await i.followup.send(f"\U0001f9b5 Removed {player.mention}. Team **{t['display']}** is now empty and was disbanded.")
+    else:
+        await i.followup.send(f"\U0001f9b5 Removed {player.mention} from **{t['display']}**.")
+
+@bot.tree.command(name="schedulestatus",description="Check which matches are scheduled (League Admin only)")
+async def schedulestatus(i):
+    if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
+    gid=str(i.guild_id)
+    await i.response.defer(ephemeral=True)
+    async with aiosqlite.connect(DB)as db:
+        db.row_factory=aiosqlite.Row
+        async with db.execute("SELECT team1,team2,map,scheduled,week FROM matches WHERE guild_id=? AND winner IS NULL ORDER BY week",(gid,))as cur:
+            rows=await cur.fetchall()
+    if not rows:await i.followup.send("\u2705 No open matches.",ephemeral=True);return
+    lines=[]
+    now=datetime.now(timezone.utc)
+    for r in rows:
+        r=dict(r)
+        sched=r.get("scheduled")
+        time_part=("\u274c Not scheduled")
+        if sched:
+            try:
+                dt=datetime.strptime(sched.replace(" GMT",""),SCHED_FMT).replace(year=now.year,tzinfo=timezone.utc)
+                unix=int(dt.timestamp())
+                time_part=f"**{sched}** \u00b7 Your time: <t:{unix}:f>"
+            except:time_part=f"**{sched}**"
+        mp=r.get("map")or"\u274c No map"
+        lines.append(f"**W{r['week']}** {r['team1']} vs {r['team2']}\n\U0001f4c5 {time_part}\n\U0001f5fa\ufe0f {mp}")
+    embed=discord.Embed(title="\U0001f4c5 Schedule Status",description="\n\n".join(lines),color=0x5865F2)
+    embed.set_footer(text=f"{len(rows)} open matches")
+    await i.followup.send(embed=embed,ephemeral=True)
+
+@bot.tree.command(name="schedulereview",description="Analyze scheduling effort in this match thread (League Admin only)")
+async def schedulereview(i):
+    if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
+    if not isinstance(i.channel,discord.Thread):await i.response.send_message("\u274c Use inside the match thread.",ephemeral=True);return
+    gid=str(i.guild_id)
+    await i.response.defer(ephemeral=True)
+    async with aiosqlite.connect(DB)as db:
+        db.row_factory=aiosqlite.Row
+        async with db.execute("SELECT id,team1,team2 FROM matches WHERE thread_id=?",(str(i.channel.id),))as cur:
+            m=await cur.fetchone()
+    if not m:await i.followup.send("\u274c No match in this thread.",ephemeral=True);return
+    m=dict(m);t1=m["team1"];t2=m["team2"]
+    async with aiosqlite.connect(DB)as db:
+        db.row_factory=aiosqlite.Row
+        await db.execute("CREATE TABLE IF NOT EXISTS sched_events(id INTEGER PRIMARY KEY AUTOINCREMENT,guild_id TEXT,match_id TEXT,team TEXT,action TEXT,detail TEXT,ts TEXT)")
+        async with db.execute("SELECT team,action,detail,ts FROM sched_events WHERE match_id=? ORDER BY id",(m["id"],))as cur:
+            evs=await cur.fetchall()
+    if not evs:await i.followup.send("\u274c No scheduling activity recorded for this match yet.",ephemeral=True);return
+    stats={}
+    for ev in evs:
+        ev=dict(ev);tm=ev["team"]
+        s=stats.setdefault(tm,{"propose":0,"counter":0,"confirm":0,"decline":0,"last":ev["ts"],"details":[]})
+        if ev["action"]in s:s[ev["action"]]+=1
+        if ev["detail"]:s["details"].append(f"{ev['action']}: {ev['detail']}")
+        s["last"]=ev["ts"]
+    for tm in[t1,t2]:stats.setdefault(tm,{"propose":0,"counter":0,"confirm":0,"decline":0,"last":"-","details":[]})
+    def score(x):
+        return x["propose"]*3+x["counter"]*2+x["confirm"]*2-x["decline"]*2
+    s1=stats[t1];s2=stats[t2]
+    def line(tm,s):
+        acts=f"proposals {s['propose']} · counters {s['counter']} · confirms {s['confirm']} · declines {s['decline']}"
+        return f"**{tm}**: {acts}"
+    verdict=""
+    if score(s1)>score(s2):verdict=f"\n\n\u2705 **{t1}** tried harder to schedule."
+    elif score(s2)>score(s1):verdict=f"\n\n\u2705 **{t2}** tried harder to schedule."
+    else:verdict="\n\n\u26a0\ufe0f Both teams showed similar effort."
+    lines=[line(t1,s1),line(t2,s2)]
+    if s1["details"]:lines.append(f"\n**{t1}:** "+"; ".join(s1["details"][-5:]))
+    if s2["details"]:lines.append(f"**{t2}:** "+"; ".join(s2["details"][-5:]))
+    embed=discord.Embed(title="\U0001f4c5 Scheduling Review",description="\n".join(lines)+verdict,color=0x5865F2)
+    await i.followup.send(embed=embed,ephemeral=True)
+
 @bot.tree.command(name="closematch",description="Force close a match (League Admin only, in match thread)")
 @app_commands.choices(result=[
     app_commands.Choice(name="Team 1 wins",value="team1"),
@@ -1044,7 +1247,8 @@ async def schedule_cmd(i,datetime_str:str):
     if not ot:await i.response.send_message("\u274c Other team gone.",ephemeral=True);return
     oc=i.guild.get_member(int(ot["captain_id"]))
     if not oc:await i.response.send_message("\u274c Other captain not found.",ephemeral=True);return
-    v=ScheduleConfirmView(ot["captain_id"],sched,unix,str(i.channel.id))
+    await record_sched_event(gid,row["id"],d,"propose",sched)
+    v=ScheduleConfirmView(row["id"],ot["captain_id"],str(i.user.id),sched,unix,str(i.channel.id))
     await i.response.send_message(f"\U0001f4c5 {i.user.mention} proposes: **{sched}**\n\U0001f550 Your time: <t:{unix}:f>\n\n{oc.mention} please confirm:",view=v)
 
 @bot.tree.command(name="reschedule",description="Reschedule (other captain approves)")
@@ -1068,7 +1272,8 @@ async def reschedule_cmd(i,datetime_str:str):
     if not ot:await i.response.send_message("\u274c Other team gone.",ephemeral=True);return
     oc=i.guild.get_member(int(ot["captain_id"]))
     if not oc:await i.response.send_message("\u274c Other captain gone.",ephemeral=True);return
-    v=RescheduleView(ot["captain_id"],nt,row["id"],gid)
+    await record_sched_event(gid,row["id"],d,"propose",nt)
+    v=ScheduleConfirmView(row["id"],ot["captain_id"],str(i.user.id),nt,unix,str(i.channel.id))
     await i.response.send_message(f"\U0001f4c5 {i.user.mention} wants **{nt}** (<t:{unix}:f>).\n{oc.mention} approve?",view=v)
 
 create_grp=app_commands.Group(name="create",description="Create scrims")
