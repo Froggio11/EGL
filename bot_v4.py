@@ -1181,7 +1181,7 @@ mat=app_commands.Group(name="match",description="Match")
 async def match_report(i,opponent:str,score:str):
     d=await need_captain(i)
     if not d:return
-    await i.response.defer(ephemeral=True)
+    await i.response.defer()
     gid=str(i.guild_id);opp=await team_get(gid,opponent)
     if not opp:await i.followup.send("\u274c Not found.",ephemeral=True);return
     if opp["name"]==d.lower():await i.followup.send("\u274c Self.",ephemeral=True);return
