@@ -185,6 +185,10 @@ def make_pairs(teams,week):
     full=[fixed]+rotating
     return[(full[i],full[n-1-i])for i in range(n//2)if full[i]and full[n-1-i]]
 
+def _pairkey(a,b):
+    a=str(a).strip().lower();b=str(b).strip().lower()
+    return(a,b)if a<=b else(b,a)
+
 async def need_league(i):
     if not await cfg_get(str(i.guild_id)):
         await i.response.send_message("\u274c No league.",ephemeral=True);return False
@@ -460,14 +464,27 @@ async def gen_matches(guild,c,force=False):
     names=[t["display"]for t in eligible]
     n=len(names)
     if n<2:return
-    # Adaptive: 1 match/week normally, 2/week for big leagues. Always runs 8 weeks;
-    # make_pairs wraps around so remaining weeks become rematches.
+    # Matches per week by team count
     rounds_needed=n if n%2 else n-1
     mpw=1 if rounds_needed<=SEASON_WEEKS else 2
-    start_round=(week-1)*mpw+1
-    all_pairs=[]
-    for r in range(mpw):
-        all_pairs+=make_pairs(names,start_round+r)
+    # Load already-scheduled pairings so nobody meets twice before all have met
+    played=set()
+    async with aiosqlite.connect(DB)as db:
+        async with db.execute("SELECT team1,team2 FROM matches WHERE guild_id=?",(gid,))as cur:
+            for r in await cur.fetchall():
+                played.add(_pairkey(r[0],r[1]))
+    names_sorted=sorted(names,key=str.lower)
+    rounds=[make_pairs(names_sorted,rnd) for rnd in range(1,rounds_needed+1)]
+    # Prefer rounds with the most not-yet-played pairings (clean rounds first)
+    rounds.sort(key=lambda r:-sum(1 for a,b in r if _pairkey(a,b)not in played))
+    target=mpw*(n//2)
+    all_pairs=[];used=set()
+    for rnd in rounds:
+        if len(all_pairs)>=target:break
+        for a,b in rnd:
+            k=_pairkey(a,b)
+            if k in used:continue
+            used.add(k);played.add(k);all_pairs.append((a,b))
     if not all_pairs:return
     match_ids=[]
     async with aiosqlite.connect(DB)as db:
@@ -542,7 +559,8 @@ async def matchrules_cmd(i):
     rules_embed.add_field(name="\U0001f3ae Game Rules",value="- **Control point:** OFF\n- **Damage zone:** ON\n- **Game mode:** Rounds\n- **Rounds to win:** 3 (BO5)\n- **Stage hazards:** ON\n- **Off map damage:** ON\n- **Multipliers:** All x1",inline=False)
     rules_embed.add_field(name="\U0001f5fa\ufe0f Map",value="Voted on after the match time is set.",inline=False)
     rules_embed.add_field(name="\u26a1 Toggles",value="- Powerups: OFF\n- Ultimates: ON\n- Techniques: ON\n- Blocking: ON\n- Perfect blocking: ON\n- Dashing: ON",inline=False)
-    rules_embed.add_field(name="\u23f0 Forfeits & No-Shows",value="- If a teammate/enemy doesn't connect within **15 minutes** of the scheduled time, **that team loses 3-0**\n- If a team **can't play** that week, they forfeit the match **3-0**\n- If you **can't agree on a time**, ping the League Admins - they decide based on who tried to schedule\n- Captains are responsible for the rules - a match played with invalid rules **must be replayed**",inline=False)
+    rules_embed.add_field(name="\u23f0 No-Shows & Forfeits",value="- If some of your team **doesn't show up within 15 minutes**, you either **play down a player** (e.g. 2v3 or 1v3) or **forfeit** (3-0 loss)\n- If a team **can't play** that week, they forfeit the match **3-0**\n- If you **can't agree on a time**, ping the League Admins - they decide based on who tried to schedule\n- Captains are responsible for the rules - a match played with invalid rules **must be replayed**",inline=False)
+    rules_embed.add_field(name="\ud83d\udeab Substitutes",value="- **No subs** - nobody outside your team can join the match\n- You play with your own roster only",inline=False)
     await i.response.send_message(embed=rules_embed)
 
 # ===== /scrimguide =====
