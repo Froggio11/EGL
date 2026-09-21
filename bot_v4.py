@@ -10,7 +10,7 @@ logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(messa
 log=logging.getLogger(__name__)
 TOKEN=os.environ.get("DISCORD_BOT_TOKEN","")
 DB="league.db";DEFAULT_MMR=1000;MAX_TEAM=5;SEASON_WEEKS=8
-ADMIN_ROLE="League Admin";TESTER_ROLE="EGL Tester"
+ADMIN_ROLE="League Admin";TESTER_ROLE="EGL Tester";SPOON_ROLE="Spoon"
 MAPS=["Chessboard","Portal Mayhem","Construction Site","Parking Lot"]
 SCHED_FMT="%d %b %H:%M";SCHED_HELP="DD Mon HH:MM or 8pm (e.g. 05 Aug 20:00 or 05 Aug 8pm)"
 
@@ -497,12 +497,17 @@ async def update_scrim_thread(gid,date):
     embed.set_footer(text=f"{len(members)}/{max_p} in \u00b7 Sign Off or Ask for Queue below")
     view=ScrimThreadView(gid,date)
     target=None;dups=[]
+    scanned=False
     try:
         async for m in th.history(limit=100,oldest_first=True):
+            scanned=True
             if m.author.id==bot.user.id and m.embeds and "In the scrim:"in(m.embeds[0].description or""):
                 if target is None:target=m
                 else:dups.append(m)
     except Exception as e:log.warning("scrim history: %s",e)
+    if not scanned and session.get("thread_msg_id"):
+        try:target=await th.fetch_message(int(session["thread_msg_id"]))
+        except:target=None
     if target is not None:
         try:
             await target.edit(embed=embed,view=view)
@@ -702,7 +707,7 @@ async def matchrules_cmd(i):
 async def scrimguide_cmd(i):
     if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
     embed=discord.Embed(title="\U0001f3ae Scrims Guide",description="Casual practice matches - no league points, just fun.",color=0xe67e22)
-    embed.add_field(name="\U0001f4dd How it works",value="`/create mixedscrim time:20:00 format:3v3` (League Admin)\n- **3v3 = 6 spots**\n- Click **Sign Up** in #mixed-scrims to join\n- Once 6 players are in, anyone else goes on the **Up Next** queue\n- If someone drops out, the **first person in the queue is pulled in** automatically",inline=False)
+    embed.add_field(name="\U0001f4dd How it works",value="`/create mixedscrim time:20:00` (League Admin)\n- **3v3 = 6 spots**\n- Click **Sign Up** in #mixed-scrims to join\n- Once 6 players are in, anyone else goes on the **Up Next** queue\n- If someone drops out, the **first person in the queue is pulled in** automatically",inline=False)
     embed.add_field(name="\U0001f9f5 The scrim thread",value="Every scrim gets its own thread - everyone signed up (and everyone in the queue) is added automatically.\n\nIn the thread you'll see the live list, plus:\n- **Sign Off** - drop out, and the next player in line takes your spot\n- **Ask for Queue** - ping the next player in line to fill a spot",inline=False)
     embed.add_field(name="\u23f0 Reminder",value="**5 minutes before start**, everyone in the scrim gets pinged in the thread.\nGet a lobby ready and drop the code in the chat!",inline=False)
     await i.response.send_message(embed=embed)
@@ -1115,6 +1120,31 @@ async def resetteams(i):
         await db.commit()
     await i.followup.send("\u2705 All teams reset to 1000 MMR, 0W/0L.")
 
+@bot.tree.command(name="spoon",description="Get the Spoon role - anyone can ping you")
+async def spoon_cmd(i):
+    await i.response.defer()
+    role=find_role(i.guild,SPOON_ROLE)
+    if not role:
+        try:role=await i.guild.create_role(name=SPOON_ROLE,color=discord.Color.from_rgb(200,200,200),mentionable=True)
+        except Exception as e:
+            await i.followup.send(f"\u274c Couldn't create the Spoon role: {e}",ephemeral=True);return
+    if not role.mentionable:
+        try:await role.edit(mentionable=True)
+        except:pass
+    already=role in i.user.roles
+    if already:
+        await i.followup.send(f"\U0001f944 You already have the **Spoon** role!")
+    else:
+        try:
+            await i.user.add_roles(role)
+            await i.followup.send(f"\U0001f944 {i.user.mention} is now a **Spoon** - anyone can ping them with {role.mention}!")
+        except Exception as e:
+            await i.followup.send(f"\u274c Couldn't give you the role: {e}",ephemeral=True);return
+    try:
+        msg=await i.original_response()
+        await msg.add_reaction("\U0001f944")
+    except:pass
+
 @bot.tree.command(name="forcecaptainswap",description="Change a team's captain, even if the old one left (League Admin only)")
 @app_commands.describe(team="Team name",new_captain="New captain")
 async def forcecaptainswap(i,team:str,new_captain:discord.Member):
@@ -1483,9 +1513,15 @@ async def reschedule_cmd(i,datetime_str:str):
 
 create_grp=app_commands.Group(name="create",description="Create scrims")
 @create_grp.command(name="mixedscrim",description="Create a mixed scrim")
-@app_commands.describe(time="Start time HH:MM GMT (e.g. 20:00)",format="Match format")
-@app_commands.choices(format=[app_commands.Choice(name="3v3 (6 players)",value="3v3")])
-async def create_mixedscrim(i,time:str,format:str):
+@app_commands.describe(time="Start time HH:MM GMT (e.g. 20:00)")
+async def create_mixedscrim(i,time:str):
+    msc_ch=None
+    for cat in i.guild.categories:
+        if cat.name=="Scrims":
+            for ch in cat.text_channels:
+                if ch.name=="mixed-scrims":msc_ch=ch;break
+    if not msc_ch:await i.response.send_message("\u274c No #mixed-scrims channel. Run `/scrimbot setup`.",ephemeral=True);return
+    if i.channel.id!=msc_ch.id:await i.response.send_message(f"\u274c Please use this in {msc_ch.mention}.",ephemeral=True);return
     # Accept: 20:00, 20.00, 8pm, 8:30pm, 8.30pm, 20, 8pm
     import re
     t=time.strip().lower()
@@ -1500,8 +1536,8 @@ async def create_mixedscrim(i,time:str,format:str):
     except:await i.response.send_message("\u274c Try: 20:00, 20.00, 8pm, 8:30pm",ephemeral=True);return
     await i.response.defer(ephemeral=True)
     if not has_scrims(i.guild):await i.response.send_message("\u274c Run `/scrimbot setup` first.",ephemeral=True);return
-    gid=str(i.guild_id);max_p=6 if format=="3v3" else 4;today=datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    title=f"Mixed Scrim  -  {format.upper()}"
+    gid=str(i.guild_id);max_p=6;today=datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    title="Mixed Scrim - 3V3"
     msc=None
     for cat in i.guild.categories:
         if cat.name=="Scrims":
@@ -1518,12 +1554,12 @@ async def create_mixedscrim(i,time:str,format:str):
     async with aiosqlite.connect(DB)as db:await db.execute("INSERT OR REPLACE INTO scrim_sessions(guild_id,date,thread_id,msg_id,max_players,scrim_title,unix_time) VALUES(?,?,NULL,?,?,?,?)",(gid,today,str(msg.id),max_p,title,unix));await db.commit()
     # Create the scrim thread
     try:
-        th=await msc.create_thread(name=f"Scrim {scrim_time} GMT - {format.upper()}",type=discord.ChannelType.public_thread,auto_archive_duration=1440)
+        th=await msc.create_thread(name=f"Scrim {scrim_time} GMT - 3V3",type=discord.ChannelType.public_thread,auto_archive_duration=1440)
         async with aiosqlite.connect(DB)as db:
             await db.execute("UPDATE scrim_sessions SET thread_id=? WHERE guild_id=? AND date=?",(str(th.id),gid,today));await db.commit()
         await update_scrim_thread(gid,today)
     except Exception as e:log.warning("scrim thread create: %s",e)
-    await i.followup.send(f"\u2705 Mixed {format} scrim created! ({scrim_time} GMT)",ephemeral=True)
+    await i.followup.send(f"\u2705 Scrim created for **{scrim_time} GMT**!",ephemeral=True)
 
 
 bot.tree.add_command(create_grp)
@@ -1805,6 +1841,15 @@ async def on_guild_join(guild):
             try:
                 r=await guild.create_role(name=role_name,color=color)
             except:pass
+    # Spoon role: pingable by everyone
+    if not find_role(guild,SPOON_ROLE):
+        try:await guild.create_role(name=SPOON_ROLE,color=discord.Color.from_rgb(200,200,200),mentionable=True)
+        except:pass
+    else:
+        try:
+            sr=find_role(guild,SPOON_ROLE)
+            if not sr.mentionable:await sr.edit(mentionable=True)
+        except:pass
     log.info("\u2705 Joined %s, commands synced, roles created",guild.name)
 
 @bot.event
