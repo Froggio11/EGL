@@ -379,10 +379,6 @@ class ScrimSignupView(discord.ui.View):
         if th:
             try:await th.add_user(i.user)
             except:pass
-            try:
-                if active:await th.send(f"\U0001f44b {i.user.mention} joined the scrim!")
-                else:await th.send(f"\u23f3 {i.user.mention} joined the **up next** list - you'll be pinged if a spot opens.")
-            except:pass
         await update_scrim_embed(gid,date)
         await update_scrim_thread(gid,date)
     @discord.ui.button(label="Sign Off",style=discord.ButtonStyle.red,emoji="\u274c")
@@ -394,7 +390,11 @@ async def _scrim_thread(gid,date):
     if not g:return None
     session=await get_scrim_session(gid,date)
     if not session or not session.get("thread_id"):return None
-    return g.get_thread(int(session["thread_id"]))
+    tid=int(session["thread_id"])
+    th=g.get_thread(tid)
+    if th:return th
+    try:return await g.fetch_thread(tid)
+    except:return None
 
 async def scrim_leave(i,gid,date):
     uid=str(i.user.id)
@@ -469,15 +469,30 @@ async def update_scrim_thread(gid,date):
         embed.add_field(name="Your Time",value=f"<t:{unix}:f>",inline=True)
     embed.set_footer(text=f"{len(members)}/{max_p} in \u00b7 Sign Off or Ask for Queue below")
     view=ScrimThreadView(gid,date)
+    target=None
     if session.get("thread_msg_id"):
+        try:target=await th.fetch_message(int(session["thread_msg_id"]))
+        except:target=None
+    if target is None:
         try:
-            m=await th.fetch_message(int(session["thread_msg_id"]))
-            await m.edit(embed=embed,view=view);return
-        except:pass
+            async for m in th.history(limit=50):
+                if m.author.id==bot.user.id and m.embeds and (m.embeds[0].title or "").startswith("\U0001f3ae"):
+                    target=m;break
+        except:target=None
+    if target is not None:
+        try:
+            await target.edit(embed=embed,view=view)
+            if str(target.id)!=str(session.get("thread_msg_id")):
+                async with aiosqlite.connect(DB)as db:
+                    await db.execute("UPDATE scrim_sessions SET thread_msg_id=? WHERE guild_id=? AND date=?",(str(target.id),gid,date));await db.commit()
+            return
+        except Exception as e:log.warning("scrim thread edit: %s",e)
     try:
         m=await th.send(embed=embed,view=view)
         async with aiosqlite.connect(DB)as db:
             await db.execute("UPDATE scrim_sessions SET thread_msg_id=? WHERE guild_id=? AND date=?",(str(m.id),gid,date));await db.commit()
+        try:await m.pin()
+        except:pass
     except Exception as e:log.warning("scrim thread msg: %s",e)
 
 async def update_scrim_embed(gid,date):
@@ -1256,17 +1271,28 @@ async def closematch(i,result:str):
             row=await cur.fetchone()
     if not row:await i.followup.send("\u274c No open match in this thread (or already resolved).",ephemeral=True);return
     row=dict(row);t1=row["team1"];t2=row["team2"]
+    c=await cfg_get(gid)
+    rc=None
+    if c and c.get("results_ch"):
+        try:rc=i.guild.get_channel(int(c["results_ch"]))
+        except:rc=None
     if result=="cancel":
         async with aiosqlite.connect(DB)as db:
             await db.execute("UPDATE matches SET score='canceled',winner='canceled',reporter=? WHERE id=?",(str(i.user.id),row["id"]))
             await db.commit()
         await i.followup.send(f"\u274c Match **{t1} vs {t2}** canceled. No MMR or W/L changes.",ephemeral=True)
+        if rc:
+            try:await rc.send(f"\U0001f6ab **{t1} vs {t2}**\nCanceled by an admin - no MMR or W/L changes.")
+            except:pass
     elif result=="bothforfeit":
         async with aiosqlite.connect(DB)as db:
             await db.execute("UPDATE teams SET mmr=mmr-10 WHERE guild_id=? AND name IN (?,?)",(gid,t1.lower(),t2.lower()))
             await db.execute("UPDATE matches SET score='forfeit',winner='both-forfeit',reporter=? WHERE id=?",(str(i.user.id),row["id"]))
             await db.commit()
         await i.followup.send(f"\u26a0\ufe0f **{t1} vs {t2}** closed: both forfeit (-10 MMR each, no W/L).",ephemeral=True)
+        if rc:
+            try:await rc.send(f"\u26a0\ufe0f **{t1} vs {t2}**\nBoth teams forfeit - no W/L change, -10 MMR each.")
+            except:pass
     else:
         # team1 or team2 wins
         winner=t1 if result=="team1" else t2
@@ -1281,6 +1307,9 @@ async def closematch(i,result:str):
             await db.execute("UPDATE matches SET score='forfeit',winner=?,reporter=? WHERE id=?",(winner,str(i.user.id),row["id"]))
             await db.commit()
         await i.followup.send(f"\U0001f3c6 **{winner}** wins by forfeit over **{loser}** ({delta} MMR).",ephemeral=True)
+        if rc:
+            try:await rc.send(f"\u26a1 **{winner} 3-0 {loser}**\nWinner: **{winner}**\nClosed by an admin (forfeit).")
+            except:pass
     # Archive the thread
     try:
         await i.channel.send(f"\U0001f512 Match closed by {i.user.mention}.")
