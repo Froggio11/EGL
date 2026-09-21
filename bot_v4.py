@@ -396,6 +396,33 @@ async def _scrim_thread(gid,date):
     try:return await g.fetch_thread(tid)
     except:return None
 
+async def close_scrim(gid,date,sess=None):
+    g=bot.get_guild(int(gid))
+    if not g:return
+    members=await scrim_signups_active(gid,date)
+    queue=await scrim_queue_list(gid,date)
+    th=None
+    if sess and sess.get("thread_id"):
+        tid=int(sess["thread_id"])
+        th=g.get_thread(tid)
+        if th is None:
+            try:th=await g.fetch_thread(tid)
+            except:th=None
+    if th:
+        try:await th.send("\U0001f512 **Scrim finished** - closing the thread. GG!")
+        except:pass
+        for uid in set(list(members)+list(queue)):
+            try:
+                m=g.get_member(int(uid))
+                if m:await th.remove_user(m)
+            except:pass
+        try:await th.edit(archived=True,locked=True)
+        except:pass
+    async with aiosqlite.connect(DB)as db:
+        await db.execute("DELETE FROM scrim_signups WHERE guild_id=? AND date=?",(gid,date))
+        await db.execute("DELETE FROM scrim_sessions WHERE guild_id=? AND date=?",(gid,date))
+        await db.commit()
+
 async def scrim_leave(i,gid,date):
     uid=str(i.user.id)
     async with aiosqlite.connect(DB)as db:
@@ -469,22 +496,22 @@ async def update_scrim_thread(gid,date):
         embed.add_field(name="Your Time",value=f"<t:{unix}:f>",inline=True)
     embed.set_footer(text=f"{len(members)}/{max_p} in \u00b7 Sign Off or Ask for Queue below")
     view=ScrimThreadView(gid,date)
-    target=None
-    if session.get("thread_msg_id"):
-        try:target=await th.fetch_message(int(session["thread_msg_id"]))
-        except:target=None
-    if target is None:
-        try:
-            async for m in th.history(limit=50):
-                if m.author.id==bot.user.id and m.embeds and (m.embeds[0].title or "").startswith("\U0001f3ae"):
-                    target=m;break
-        except:target=None
+    target=None;dups=[]
+    try:
+        async for m in th.history(limit=100,oldest_first=True):
+            if m.author.id==bot.user.id and m.embeds and "In the scrim:"in(m.embeds[0].description or""):
+                if target is None:target=m
+                else:dups.append(m)
+    except Exception as e:log.warning("scrim history: %s",e)
     if target is not None:
         try:
             await target.edit(embed=embed,view=view)
             if str(target.id)!=str(session.get("thread_msg_id")):
                 async with aiosqlite.connect(DB)as db:
                     await db.execute("UPDATE scrim_sessions SET thread_msg_id=? WHERE guild_id=? AND date=?",(str(target.id),gid,date));await db.commit()
+            for d in dups:
+                try:await d.delete()
+                except:pass
             return
         except Exception as e:log.warning("scrim thread edit: %s",e)
     try:
@@ -1724,6 +1751,9 @@ async def scrim_check():
                         except:pass
                     else:
                         await msc.send(txt)
+            if diff<=-5400:
+                await close_scrim(gid,today,sess)
+                continue
         # Midnight cleanup
         if hour==0 and minute==0:
             async with aiosqlite.connect(DB)as db:
