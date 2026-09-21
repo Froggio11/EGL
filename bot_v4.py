@@ -50,7 +50,7 @@ async def init_db():
         try:await db.execute("ALTER TABLE teams ADD COLUMN clantag TEXT")
         except:pass
         # Migrate: add new columns to scrim_sessions if missing
-        for col,typ in [("max_players","INT DEFAULT 6"),("scrim_title","TEXT"),("unix_time","INT"),("thread_id","TEXT"),("thread_msg_id","TEXT")]:
+        for col,typ in [("max_players","INT DEFAULT 6"),("scrim_title","TEXT"),("unix_time","INT"),("thread_id","TEXT"),("thread_msg_id","TEXT"),("pinged","INT DEFAULT 0")]:
             try:await db.execute(f"ALTER TABLE scrim_sessions ADD COLUMN {col} {typ}")
             except:pass
         await db.commit()
@@ -511,14 +511,17 @@ async def update_scrim_thread(gid,date):
     if target is not None:
         try:
             await target.edit(embed=embed,view=view)
-            if str(target.id)!=str(session.get("thread_msg_id")):
-                async with aiosqlite.connect(DB)as db:
-                    await db.execute("UPDATE scrim_sessions SET thread_msg_id=? WHERE guild_id=? AND date=?",(str(target.id),gid,date));await db.commit()
-            for d in dups:
-                try:await d.delete()
-                except:pass
-            return
-        except Exception as e:log.warning("scrim thread edit: %s",e)
+        except Exception as e:
+            log.warning("scrim thread edit: %s",e)
+            try:await target.edit(embed=embed)
+            except Exception as e2:log.warning("scrim thread edit2: %s",e2)
+        if str(target.id)!=str(session.get("thread_msg_id")):
+            async with aiosqlite.connect(DB)as db:
+                await db.execute("UPDATE scrim_sessions SET thread_msg_id=? WHERE guild_id=? AND date=?",(str(target.id),gid,date));await db.commit()
+        for d in dups:
+            try:await d.delete()
+            except:pass
+        return
     try:
         m=await th.send(embed=embed,view=view)
         async with aiosqlite.connect(DB)as db:
@@ -1535,7 +1538,7 @@ async def create_mixedscrim(i,time:str):
         dt=datetime.now(timezone.utc).replace(hour=utc_h,minute=mi,second=0,tzinfo=timezone.utc);unix=int(dt.timestamp())
     except:await i.response.send_message("\u274c Try: 20:00, 20.00, 8pm, 8:30pm",ephemeral=True);return
     await i.response.defer(ephemeral=True)
-    if not has_scrims(i.guild):await i.response.send_message("\u274c Run `/scrimbot setup` first.",ephemeral=True);return
+    if not has_scrims(i.guild):await i.followup.send("\u274c Run `/scrimbot setup` first.",ephemeral=True);return
     gid=str(i.guild_id);max_p=6;today=datetime.now(timezone.utc).strftime("%Y-%m-%d")
     title="Mixed Scrim - 3V3"
     msc=None
@@ -1776,7 +1779,7 @@ async def scrim_check():
             if not sess.get("unix_time"):continue
             dt=datetime.fromtimestamp(sess["unix_time"],tz=timezone.utc)
             diff=(dt-now).total_seconds()
-            if 280<=diff<=310:
+            if 0<diff<=300 and not sess.get("pinged"):
                 members=await scrim_signups_active(gid,today)
                 if members:
                     pings=" ".join(f"<@{uid}>"for uid in members)
@@ -1787,6 +1790,8 @@ async def scrim_check():
                         except:pass
                     else:
                         await msc.send(txt)
+                async with aiosqlite.connect(DB)as db:
+                    await db.execute("UPDATE scrim_sessions SET pinged=1 WHERE guild_id=? AND date=?",(gid,today));await db.commit()
             if diff<=-5400:
                 await close_scrim(gid,today,sess)
                 continue
