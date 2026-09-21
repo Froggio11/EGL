@@ -1136,11 +1136,15 @@ async def spoon_cmd(i):
         except:pass
     already=role in i.user.roles
     if already:
-        await i.followup.send(f"\U0001f944 You already have the **Spoon** role!")
+        try:
+            await i.user.remove_roles(role)
+            await i.followup.send(f"\U0001f944 {i.user.mention} is no longer a **Spoon**.")
+        except Exception as e:
+            await i.followup.send(f"\u274c Couldn't remove the role: {e}",ephemeral=True);return
     else:
         try:
             await i.user.add_roles(role)
-            await i.followup.send(f"\U0001f944 {i.user.mention} is now a **Spoon** - anyone can ping them with {role.mention}!")
+            await i.followup.send(f"\U0001f944 {i.user.mention} is now a **Spoon**.")
         except Exception as e:
             await i.followup.send(f"\u274c Couldn't give you the role: {e}",ephemeral=True);return
     try:
