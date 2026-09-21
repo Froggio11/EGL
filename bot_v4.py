@@ -710,8 +710,10 @@ async def matchrules_cmd(i):
 async def scrimguide_cmd(i):
     if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
     embed=discord.Embed(title="\U0001f3ae Scrims Guide",description="Casual practice matches - no league points, just fun.",color=0xe67e22)
-    embed.add_field(name="\U0001f4dd How it works",value="`/create mixedscrim time:20:00` (League Admin)\n- **3v3 = 6 spots**\n- Click **Sign Up** in #mixed-scrims to join\n- Once 6 players are in, anyone else goes on the **Up Next** queue\n- If someone drops out, the **first person in the queue is pulled in** automatically",inline=False)
-    embed.add_field(name="\U0001f9f5 The scrim thread",value="Every scrim gets its own thread - everyone signed up (and everyone in the queue) is added automatically.\n\nIn the thread you'll see the live list, plus:\n- **Sign Off** - drop out, and the next player in line takes your spot\n- **Ask for Queue** - ping the next player in line to fill a spot",inline=False)
+    embed.add_field(name="\U0001f4dd How it works",value="`/create mixedscrim time:20:00` - **anyone can create one**\n- **3v3 = 6 spots**\n- Click **Sign Up** in #mixed-scrims to join\n- Once 6 players are in, anyone else goes on the **Up Next** queue\n- If someone drops out, the **first person in the queue is pulled in** automatically",inline=False)
+    embed.add_field(name="\u23f1\ufe0f Before you sign up",value="Scrims usually last **around an hour**.\nMake sure you have the **time and the charge** before you sign up - don't leave your team short.",inline=False)
+    embed.add_field(name="\U0001f6aa If you drop out",value="You **have to get a new player in** to replace you.\nDon't just sign off and leave - the next person in the **Up Next** queue gets pulled in automatically, but it's on you to make sure the spot is filled.",inline=False)
+    embed.add_field(name="\U0001f9f5 The scrim thread",value="Every scrim gets its own thread - everyone signed up (and everyone in the queue) is added automatically.\n\nIn the thread you'll see the live list, plus:\n- **Sign Off** - drop out\n- **Ask for Queue** - ping the next player in line to fill a spot",inline=False)
     embed.add_field(name="\u23f0 Reminder",value="**5 minutes before start**, everyone in the scrim gets pinged in the thread.\nGet a lobby ready and drop the code in the chat!",inline=False)
     await i.response.send_message(embed=embed)
 
