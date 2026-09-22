@@ -331,9 +331,11 @@ class ResultConfirmView(discord.ui.View):
             await db.execute("INSERT INTO matches VALUES(?,?,0,?,?,?,?,?,?,NULL,0,NULL,NULL,NULL,NULL)",(str(uuid.uuid4())[:8],gid,d,opp_name,score,winner,str(i.user.id),datetime.now(timezone.utc).isoformat()))
             await db.commit()
         c=self.cfg
+        _o=await team_get(gid,opp_name);_m=await team_get(gid,d)
+        loser_disp=(_o["display"]if won else _m["display"])if(_o and _m)else opp_name
         if c and c.get("results_ch"):
             rc=i.guild.get_channel(int(c["results_ch"]))
-            if rc:await rc.send(f"\u26a1 **{d} {score} {opp_name}**\nWinner:**{winner}**\nConfirmed by both captains.")
+            if rc:await rc.send(f"\u26a1 **{winner} {score} {loser_disp}**\nWinner: **{winner}**\nConfirmed by both captains.")
         if c and c.get("matches_ch"):
             mc=i.guild.get_channel(int(c["matches_ch"]))
             if mc:
@@ -346,13 +348,13 @@ class ResultConfirmView(discord.ui.View):
                 if found_t:
                     try:
                         if found_t.archived:await found_t.edit(archived=False,locked=False)
-                        await found_t.send(f"\u2705 **{d} {score} {opp_name}** - {winner} wins!")
+                        await found_t.send(f"\u2705 **{winner} {score} {loser_disp}** - {winner} wins!")
                         await found_t.edit(archived=True,locked=True)
                     except:pass
         my_t=await team_get(gid,d);opp_t=await team_get(gid,opp_name)
-        su="+"if won else"-";st="-"if won else"+"
+        w_t=my_t if won else opp_t;l_t=opp_t if won else my_t
         for c2 in self.children:c2.disabled=True
-        await i.response.edit_message(content=f"\u26a1 **Result confirmed!**\n**{d} {score} {opp_name}** - Winner: **{winner}**\n{d}({get_rank(my_t['mmr'])}) {su}{delta} | {opp_name}({get_rank(opp_t['mmr'])}) {st}{delta}",view=self)
+        await i.response.edit_message(content=f"\u26a1 **Result confirmed!**\n**{winner} {score} {l_t['display']}**\n{winner} ({get_rank(w_t['mmr'])}) +{delta} | {l_t['display']} ({get_rank(l_t['mmr'])}) -{delta}",view=self)
     @discord.ui.button(label="\u26a0\ufe0f Dispute",style=discord.ButtonStyle.red)
     async def dispute(self,i,btn):
         if str(i.user.id)!=self.ocid:await i.response.send_message("Other captain only.",ephemeral=True);return
@@ -1418,34 +1420,76 @@ async def captain_swap(i,player:discord.Member):
 bot.tree.add_command(cap)
 
 mat=app_commands.Group(name="match",description="Match")
-@mat.command(name="result",description="Report result (captain)")
-@app_commands.describe(opponent="Opponent",score="e.g. 3-0")
-async def match_report(i,opponent:str,score:str):
-    d=await need_captain(i)
-    if not d:return
-    await i.response.defer()
-    gid=str(i.guild_id);opp=await team_get(gid,opponent)
-    if not opp:await i.followup.send("\u274c Not found.",ephemeral=True);return
-    if opp["name"]==d.lower():await i.followup.send("\u274c Self.",ephemeral=True);return
-    try:our,their=map(int,score.strip().split("-"))
-    except:await i.followup.send("\u274c 3-0 / 3-1 / 3-2",ephemeral=True);return
-    won=our>their;winner=d if won else opp["display"]
-    my_t=await team_get(gid,d);opp_t=await team_get(gid,opp["name"])
+class ResultScoreView(discord.ui.View):
+    def __init__(self,gid,reporter,opp_key,winner,loser):
+        super().__init__(timeout=600)
+        self.gid=gid;self.reporter=reporter;self.opp_key=opp_key;self.winner=winner;self.loser=loser
+        sel=discord.ui.Select(placeholder="Pick the final score",options=[
+            discord.SelectOption(label=f"{winner} 3-0 {loser}",value="3-0"),
+            discord.SelectOption(label=f"{winner} 3-1 {loser}",value="3-1"),
+            discord.SelectOption(label=f"{winner} 3-2 {loser}",value="3-2"),
+        ])
+        sel.callback=self._submit
+        self.add_item(sel)
+    async def _submit(self,i):
+        score=self.children[0].values[0]
+        await i.response.edit_message(content=f"\u2705 Reporting **{self.winner} {score} {self.loser}**...",view=None)
+        await finalize_report(i,self.gid,self.reporter,self.opp_key,self.winner,self.loser,score)
+
+class ResultWinnerView(discord.ui.View):
+    def __init__(self,gid,t1,t2,reporter,opp_key):
+        super().__init__(timeout=600)
+        self.gid=gid;self.t1=t1;self.t2=t2;self.reporter=reporter;self.opp_key=opp_key
+        for nm in(t1,t2):
+            b=discord.ui.Button(label=nm,style=discord.ButtonStyle.primary)
+            b.callback=self._mk(nm)
+            self.add_item(b)
+    def _mk(self,name):
+        async def cb(i):
+            loser=self.t2 if name==self.t1 else self.t1
+            v=ResultScoreView(self.gid,self.reporter,self.opp_key,name,loser)
+            await i.response.edit_message(content=f"**Step 2:** pick the final score - {name} vs {loser}",view=v)
+        return cb
+
+async def finalize_report(i,gid,reporter,opp_key,winner,loser,score):
+    my_t=await team_get(gid,reporter);opp_t=await team_get(gid,opp_key)
+    if not my_t or not opp_t:return False
     my_mmr=int(my_t["mmr"]);opp_mmr=int(opp_t["mmr"])
+    won=(winner==reporter)
     if my_mmr==opp_mmr:expected=0.5
     else:expected=1/(1+10**((opp_mmr-my_mmr)/400))
-    # Base MMR swing: beating stronger = more, beating weaker = less
     base=50*(1-expected)if won else 50*expected
-    # BO5 margin bonus: sweep (3-0) = more, close (3-2) = less
-    margin=abs(our-their)
-    mult={3:1.25,2:1.0,1:0.75}.get(margin,1.0)
+    try:our,their=map(int,score.split("-"))
+    except:our,their=3,0
+    mult={3:1.25,2:1.0,1:0.75}.get(abs(our-their),1.0)
     delta=round(base*mult)
     c=await cfg_get(gid)
     oc=i.guild.get_member(int(opp_t["captain_id"]))
-    if not oc:await i.followup.send("\u274c Other captain not found.",ephemeral=True);return
+    if not oc:return False
     su="+"if won else"-";st="-"if won else"+"
-    v=ResultConfirmView(opp_t["captain_id"],d,opp["name"],score,won,winner,delta,gid,c)
-    await i.followup.send(f"\u26a1 {i.user.mention} reports: **{d} {score} {opp['display']}** - Winner: **{winner}**\n{d}({get_rank(my_mmr)}) {su}{delta} | {opp['display']}({get_rank(opp_mmr)}) {st}{delta}\n\n{oc.mention} please confirm:",view=v)
+    v=ResultConfirmView(opp_t["captain_id"],reporter,opp_key,score,won,winner,delta,gid,c)
+    await i.channel.send(f"\u26a1 {i.user.mention} reports: **{winner} {score} {loser}**\n{reporter}({get_rank(my_mmr)}) {su}{delta} | {opp_t['display']}({get_rank(opp_mmr)}) {st}{delta}\n\n{oc.mention} please confirm:",view=v)
+    return True
+
+@mat.command(name="result",description="Report the result of this match (captain)")
+async def match_report(i):
+    d=await need_captain(i)
+    if not d:return
+    if not isinstance(i.channel,discord.Thread):
+        await i.response.send_message("\u274c Use this inside the match thread.",ephemeral=True);return
+    gid=str(i.guild_id)
+    async with aiosqlite.connect(DB)as db:
+        db.row_factory=aiosqlite.Row
+        async with db.execute("SELECT * FROM matches WHERE thread_id=? AND guild_id=? AND winner IS NULL",(str(i.channel.id),gid))as cur:
+            row=await cur.fetchone()
+    if not row:
+        await i.response.send_message("\u274c No open match in this thread.",ephemeral=True);return
+    row=dict(row);t1=row["team1"];t2=row["team2"]
+    if d not in(t1,t2):
+        await i.response.send_message("\u274c You're not in this match.",ephemeral=True);return
+    opp=t2 if d==t1 else t1
+    v=ResultWinnerView(gid,t1,t2,d,opp)
+    await i.response.send_message(f"\u26a1 **Report result** - {t1} vs {t2}\n\n**Step 1:** which team won?",view=v,ephemeral=True)
 bot.tree.add_command(mat)
 
 mmr=app_commands.Group(name="mmr",description="MMR (Admin)")
