@@ -45,6 +45,8 @@ async def init_db():
         CREATE TABLE IF NOT EXISTS setup_data(guild_id TEXT PRIMARY KEY,league_name TEXT,league_category_id TEXT,matches_category_id TEXT,announcements_ch TEXT,general_ch TEXT,teams_ch TEXT,fa_ch TEXT,matches_ch TEXT,results_ch TEXT);
         CREATE TABLE IF NOT EXISTS scrim_sessions(guild_id TEXT,date TEXT,thread_id TEXT,msg_id TEXT,max_players INT DEFAULT 6,PRIMARY KEY(guild_id,date));
         CREATE TABLE IF NOT EXISTS scrim_signups(guild_id TEXT,date TEXT,user_id TEXT,position INT,PRIMARY KEY(guild_id,date,user_id));
+        CREATE TABLE IF NOT EXISTS scrim_v2(sid TEXT PRIMARY KEY,guild_id TEXT,date TEXT,thread_id TEXT,msg_id TEXT,thread_msg_id TEXT,max_players INT DEFAULT 6,scrim_title TEXT,unix_time INT,pinged INT DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS scrim_signups_v2(sid TEXT,guild_id TEXT,user_id TEXT,position INT,PRIMARY KEY(sid,user_id));
         """)
         # Migrate: add clantag column if missing
         try:await db.execute("ALTER TABLE teams ADD COLUMN clantag TEXT")
@@ -53,6 +55,27 @@ async def init_db():
         for col,typ in [("max_players","INT DEFAULT 6"),("scrim_title","TEXT"),("unix_time","INT"),("thread_id","TEXT"),("thread_msg_id","TEXT"),("pinged","INT DEFAULT 0")]:
             try:await db.execute(f"ALTER TABLE scrim_sessions ADD COLUMN {col} {typ}")
             except:pass
+        # Migrate legacy scrims into scrim_v2 so their threads still close
+        try:
+            db.row_factory=aiosqlite.Row
+            async with db.execute("SELECT * FROM scrim_sessions")as c:
+                legacy=[dict(r)for r in await c.fetchall()]
+            for r in legacy:
+                dd=r.get("date")or""
+                if not dd:continue
+                await db.execute("INSERT OR IGNORE INTO scrim_v2(sid,guild_id,date,thread_id,msg_id,thread_msg_id,max_players,scrim_title,unix_time,pinged) VALUES(?,?,?,?,?,NULL,?,?,?,0)",
+                    ("L"+dd,r.get("guild_id"),dd,r.get("thread_id"),r.get("msg_id"),r.get("max_players")or 6,r.get("scrim_title")or"Mixed Scrim",r.get("unix_time")))
+            async with db.execute("SELECT * FROM scrim_signups")as c:
+                lsign=[dict(r)for r in await c.fetchall()]
+            for r in lsign:
+                dd=r.get("date")or""
+                if not dd:continue
+                await db.execute("INSERT OR IGNORE INTO scrim_signups_v2(sid,guild_id,user_id,position) VALUES(?,?,?,?)",("L"+dd,r.get("guild_id"),r.get("user_id"),r.get("position")or 0))
+            if legacy or lsign:
+                await db.execute("DELETE FROM scrim_sessions")
+                await db.execute("DELETE FROM scrim_signups")
+                log.info("migrated %d legacy scrims",len(legacy))
+        except Exception as e:log.warning("scrim migrate: %s",e)
         await db.commit()
 
 async def cfg_get(gid):
@@ -85,38 +108,44 @@ async def teams_all(gid):
             names=[x[0]for x in await c.fetchall()]
     return[t for n in names if(t:=await team_get(gid,n))]
 
-async def get_scrim_session(gid,date):
+async def get_scrim_session(sid):
     async with aiosqlite.connect(DB)as db:
         db.row_factory=aiosqlite.Row
-        async with db.execute("SELECT * FROM scrim_sessions WHERE guild_id=? AND date=?",(gid,date))as c:
+        async with db.execute("SELECT * FROM scrim_v2 WHERE sid=?",(sid,))as c:
             r=await c.fetchone();return dict(r)if r else None
 
-async def scrim_signup_count(gid,date):
+async def todays_scrims(gid,date):
     async with aiosqlite.connect(DB)as db:
-        async with db.execute("SELECT COUNT(*) FROM scrim_signups WHERE guild_id=? AND date=?",(gid,date))as c:
+        db.row_factory=aiosqlite.Row
+        async with db.execute("SELECT * FROM scrim_v2 WHERE guild_id=? AND date=? ORDER BY unix_time",(gid,date))as c:
+            return[dict(r)for r in await c.fetchall()]
+
+async def scrim_signup_count(sid):
+    async with aiosqlite.connect(DB)as db:
+        async with db.execute("SELECT COUNT(*) FROM scrim_signups_v2 WHERE sid=?",(sid,))as c:
             r=await c.fetchone();return r[0]if r else 0
 
-async def scrim_max_players(gid,date):
+async def scrim_max_players(sid):
     async with aiosqlite.connect(DB)as db:
-        async with db.execute("SELECT max_players FROM scrim_sessions WHERE guild_id=? AND date=?",(gid,date))as c:
-            r=await c.fetchone();return r[0]if r else 6
+        async with db.execute("SELECT max_players FROM scrim_v2 WHERE sid=?",(sid,))as c:
+            r=await c.fetchone();return r[0]if r and r[0] else 6
 
-async def scrim_signups_active(gid,date):
-    max_p=await scrim_max_players(gid,date)
+async def scrim_signups_active(sid):
+    max_p=await scrim_max_players(sid)
     async with aiosqlite.connect(DB)as db:
-        async with db.execute("SELECT user_id FROM scrim_signups WHERE guild_id=? AND date=? ORDER BY position ASC LIMIT ?",(gid,date,max_p))as c:
+        async with db.execute("SELECT user_id FROM scrim_signups_v2 WHERE sid=? ORDER BY position ASC LIMIT ?",(sid,max_p))as c:
             return[r[0]for r in await c.fetchall()]
 
-async def scrim_queue_list(gid,date):
-    max_p=await scrim_max_players(gid,date)
+async def scrim_queue_list(sid):
+    max_p=await scrim_max_players(sid)
     async with aiosqlite.connect(DB)as db:
-        async with db.execute("SELECT user_id FROM scrim_signups WHERE guild_id=? AND date=? AND position>=? ORDER BY position ASC",(gid,date,max_p))as c:
+        async with db.execute("SELECT user_id FROM scrim_signups_v2 WHERE sid=? AND position>=? ORDER BY position ASC",(sid,max_p))as c:
             return[r[0]for r in await c.fetchall()]
 
-async def scrim_next_queue(gid,date):
-    max_p=await scrim_max_players(gid,date)
+async def scrim_next_queue(sid):
+    max_p=await scrim_max_players(sid)
     async with aiosqlite.connect(DB)as db:
-        async with db.execute("SELECT user_id FROM scrim_signups WHERE guild_id=? AND date=? AND position>=? ORDER BY position ASC LIMIT 1",(gid,date,max_p))as c:
+        async with db.execute("SELECT user_id FROM scrim_signups_v2 WHERE sid=? AND position>=? ORDER BY position ASC LIMIT 1",(sid,max_p))as c:
             r=await c.fetchone();return r[0]if r else None
 
 async def get_player_mmr(gid,uid):
@@ -368,54 +397,50 @@ class ResultConfirmView(discord.ui.View):
         await i.response.edit_message(content="\u26a0\ufe0f **Result disputed!** Contact a League Admin to resolve.",view=self)
 
 class ScrimSignupView(discord.ui.View):
-    def __init__(self,gid,date):
-        super().__init__(timeout=None);self.gid=gid;self.date=date
+    def __init__(self,gid,sid):
+        super().__init__(timeout=None);self.gid=gid;self.sid=sid
     @discord.ui.button(label="Sign Up",style=discord.ButtonStyle.green,emoji="\u2795")
     async def signup(self,i,btn):
-        gid=self.gid;date=self.date;uid=str(i.user.id)
+        gid=self.gid;sid=self.sid;uid=str(i.user.id)
         async with aiosqlite.connect(DB)as db:
-            async with db.execute("SELECT 1 FROM scrim_signups WHERE guild_id=? AND date=? AND user_id=?",(gid,date,uid))as c:
+            async with db.execute("SELECT 1 FROM scrim_signups_v2 WHERE sid=? AND user_id=?",(sid,uid))as c:
                 if await c.fetchone():await i.response.send_message("\u274c You're already signed up! Sign off first if you want to leave.",ephemeral=True);return
-        count=await scrim_signup_count(gid,date)
-        max_p=await scrim_max_players(gid,date)
+        count=await scrim_signup_count(sid)
+        max_p=await scrim_max_players(sid)
         async with aiosqlite.connect(DB)as db:
-            await db.execute("INSERT OR IGNORE INTO scrim_signups VALUES(?,?,?,?)",(gid,date,uid,count));await db.commit()
+            await db.execute("INSERT OR IGNORE INTO scrim_signups_v2 VALUES(?,?,?,?)",(sid,gid,uid,count));await db.commit()
         active=count<max_p
         status="You're in the scrim!"if active else f"You're up next (#{count-max_p+1} in queue)."
         await i.response.send_message(f"\u2705 Signed up! {status}",ephemeral=True)
-        th=await _scrim_thread(gid,date)
+        th=await _scrim_thread(sid)
         if th:
             try:await th.add_user(i.user)
             except:pass
-        await update_scrim_embed(gid,date)
-        await update_scrim_thread(gid,date)
+        await update_scrim_embed(sid)
+        await update_scrim_thread(sid)
     @discord.ui.button(label="Sign Off",style=discord.ButtonStyle.red,emoji="\u274c")
     async def leave(self,i,btn):
-        await scrim_leave(i,self.gid,self.date)
+        await scrim_leave(i,self.gid,self.sid)
 
-async def _scrim_thread(gid,date):
-    g=bot.get_guild(int(gid))
-    if not g:return None
-    session=await get_scrim_session(gid,date)
+async def _scrim_thread(sid):
+    session=await get_scrim_session(sid)
     if not session or not session.get("thread_id"):return None
+    g=bot.get_guild(int(session["guild_id"]))
+    if not g:return None
     tid=int(session["thread_id"])
     th=g.get_thread(tid)
     if th:return th
     try:return await g.fetch_thread(tid)
     except:return None
 
-async def close_scrim(gid,date,sess=None):
-    g=bot.get_guild(int(gid))
+async def close_scrim(sid,sess=None):
+    if sess is None:sess=await get_scrim_session(sid)
+    if not sess:return
+    g=bot.get_guild(int(sess["guild_id"]))
     if not g:return
-    members=await scrim_signups_active(gid,date)
-    queue=await scrim_queue_list(gid,date)
-    th=None
-    if sess and sess.get("thread_id"):
-        tid=int(sess["thread_id"])
-        th=g.get_thread(tid)
-        if th is None:
-            try:th=await g.fetch_thread(tid)
-            except:th=None
+    members=await scrim_signups_active(sid)
+    queue=await scrim_queue_list(sid)
+    th=await _scrim_thread(sid)
     if th:
         try:await th.send("\U0001f512 **Scrim finished** - closing the thread. GG!")
         except:pass
@@ -427,53 +452,52 @@ async def close_scrim(gid,date,sess=None):
         try:await th.edit(archived=True,locked=True)
         except:pass
     async with aiosqlite.connect(DB)as db:
-        await db.execute("DELETE FROM scrim_signups WHERE guild_id=? AND date=?",(gid,date))
-        await db.execute("DELETE FROM scrim_sessions WHERE guild_id=? AND date=?",(gid,date))
+        await db.execute("DELETE FROM scrim_signups_v2 WHERE sid=?",(sid,))
+        await db.execute("DELETE FROM scrim_v2 WHERE sid=?",(sid,))
         await db.commit()
 
-async def scrim_leave(i,gid,date):
+async def scrim_leave(i,gid,sid):
     uid=str(i.user.id)
     async with aiosqlite.connect(DB)as db:
-        async with db.execute("SELECT position FROM scrim_signups WHERE guild_id=? AND date=? AND user_id=?",(gid,date,uid))as c:
+        async with db.execute("SELECT position FROM scrim_signups_v2 WHERE sid=? AND user_id=?",(sid,uid))as c:
             r=await c.fetchone()
-    if not r:await i.response.send_message("\u274c You're not signed up.",ephemeral=True);return
+    if not r:await i.response.send_message("\u274c You're not signed up to this scrim.",ephemeral=True);return
     pos=r[0]
     async with aiosqlite.connect(DB)as db:
-        await db.execute("DELETE FROM scrim_signups WHERE guild_id=? AND date=? AND user_id=?",(gid,date,uid));await db.commit()
-    max_p=await scrim_max_players(gid,date)
+        await db.execute("DELETE FROM scrim_signups_v2 WHERE sid=? AND user_id=?",(sid,uid));await db.commit()
+    max_p=await scrim_max_players(sid)
     was_active=pos<max_p
     await i.response.send_message("\U0001f44b You've signed off.",ephemeral=True)
-    th=await _scrim_thread(gid,date)
+    th=await _scrim_thread(sid)
     g=bot.get_guild(int(gid))
     if th and g:
         try:
             m=g.get_member(int(uid))
             if m:await th.remove_user(m)
         except:pass
-    # If an active player left, pull the first person up from the queue
     if was_active:
-        nxt=await scrim_next_queue(gid,date)
+        nxt=await scrim_next_queue(sid)
         if nxt:
             async with aiosqlite.connect(DB)as db:
-                await db.execute("UPDATE scrim_signups SET position=? WHERE guild_id=? AND date=? AND user_id=?",(pos,gid,date,nxt));await db.commit()
+                await db.execute("UPDATE scrim_signups_v2 SET position=? WHERE sid=? AND user_id=?",(pos,sid,nxt));await db.commit()
             if th:
                 try:await th.send(f"\U0001f4e2 <@{nxt}> a spot opened up - you're in the scrim!")
                 except:pass
-    await update_scrim_embed(gid,date)
-    await update_scrim_thread(gid,date)
+    await update_scrim_embed(sid)
+    await update_scrim_thread(sid)
 
 class ScrimThreadView(discord.ui.View):
-    def __init__(self,gid,date):
-        super().__init__(timeout=None);self.gid=gid;self.date=date
+    def __init__(self,gid,sid):
+        super().__init__(timeout=None);self.gid=gid;self.sid=sid
     @discord.ui.button(label="Sign Off",style=discord.ButtonStyle.red,emoji="\u274c")
     async def signoff(self,i,btn):
-        await scrim_leave(i,self.gid,self.date)
+        await scrim_leave(i,self.gid,self.sid)
     @discord.ui.button(label="Ask for Queue",style=discord.ButtonStyle.blurple,emoji="\U0001f4e3")
     async def askqueue(self,i,btn):
-        gid=self.gid;date=self.date
-        members=await scrim_signups_active(gid,date)
-        max_p=await scrim_max_players(gid,date)
-        queue=await scrim_queue_list(gid,date)
+        sid=self.sid
+        members=await scrim_signups_active(sid)
+        max_p=await scrim_max_players(sid)
+        queue=await scrim_queue_list(sid)
         if len(members)<max_p:
             await i.response.send_message(f"\u2705 There's still a free spot - sign up in the scrim channel!",ephemeral=True);return
         if not queue:
@@ -483,14 +507,14 @@ class ScrimThreadView(discord.ui.View):
         try:await i.channel.send(f"\U0001f4e3 <@{nxt}> a spot is open - can you play?")
         except:pass
 
-async def update_scrim_thread(gid,date):
-    session=await get_scrim_session(gid,date)
+async def update_scrim_thread(sid):
+    session=await get_scrim_session(sid)
     if not session or not session.get("thread_id"):return
-    th=await _scrim_thread(gid,date)
+    th=await _scrim_thread(sid)
     if not th:return
-    members=await scrim_signups_active(gid,date)
-    queue=await scrim_queue_list(gid,date)
-    max_p=await scrim_max_players(gid,date)
+    members=await scrim_signups_active(sid)
+    queue=await scrim_queue_list(sid)
+    max_p=await scrim_max_players(sid)
     unix=session.get("unix_time")
     title=session.get("scrim_title")or"Mixed Scrim"
     lines=["**In the scrim:**"]
@@ -503,7 +527,7 @@ async def update_scrim_thread(gid,date):
         embed.add_field(name="\u23f0 Time (GMT)",value=datetime.fromtimestamp(int(unix),timezone.utc).strftime("%H:%M"),inline=True)
         embed.add_field(name="Your Time",value=f"<t:{unix}:f>",inline=True)
     embed.set_footer(text=f"{len(members)}/{max_p} in \u00b7 Sign Off or Ask for Queue below")
-    view=ScrimThreadView(gid,date)
+    view=ScrimThreadView(session["guild_id"],sid)
     target=None;dups=[]
     scanned=False
     try:
@@ -525,7 +549,7 @@ async def update_scrim_thread(gid,date):
             except Exception as e2:log.warning("scrim thread edit2: %s",e2)
         if str(target.id)!=str(session.get("thread_msg_id")):
             async with aiosqlite.connect(DB)as db:
-                await db.execute("UPDATE scrim_sessions SET thread_msg_id=? WHERE guild_id=? AND date=?",(str(target.id),gid,date));await db.commit()
+                await db.execute("UPDATE scrim_v2 SET thread_msg_id=? WHERE sid=?",(str(target.id),sid));await db.commit()
         for d in dups:
             try:await d.delete()
             except:pass
@@ -533,19 +557,19 @@ async def update_scrim_thread(gid,date):
     try:
         m=await th.send(embed=embed,view=view)
         async with aiosqlite.connect(DB)as db:
-            await db.execute("UPDATE scrim_sessions SET thread_msg_id=? WHERE guild_id=? AND date=?",(str(m.id),gid,date));await db.commit()
+            await db.execute("UPDATE scrim_v2 SET thread_msg_id=? WHERE sid=?",(str(m.id),sid));await db.commit()
         try:await m.pin()
         except:pass
     except Exception as e:log.warning("scrim thread msg: %s",e)
 
-async def update_scrim_embed(gid,date):
-    g=bot.get_guild(int(gid))
-    if not g:return
-    session=await get_scrim_session(gid,date)
+async def update_scrim_embed(sid):
+    session=await get_scrim_session(sid)
     if not session or not session.get("msg_id"):return
-    members=await scrim_signups_active(gid,date)
-    total=await scrim_signup_count(gid,date)
-    max_p=await scrim_max_players(gid,date)
+    g=bot.get_guild(int(session["guild_id"]))
+    if not g:return
+    members=await scrim_signups_active(sid)
+    total=await scrim_signup_count(sid)
+    max_p=await scrim_max_players(sid)
     desc="\n".join(f"{n+1}. <@{uid}>"for n,uid in enumerate(members))if members else"*No signups yet. Be the first!*"
     q_count=max(0,total-max_p)
     title=session.get("scrim_title","Mixed Scrim")or"Mixed Scrim"
@@ -1685,20 +1709,20 @@ async def create_mixedscrim(i,time:str):
             for ch in cat.text_channels:
                 if ch.name=="mixed-scrims":msc=ch;break
     if not msc:await i.response.send_message("\u274c No #mixed-scrims channel.",ephemeral=True);return
-    async with aiosqlite.connect(DB)as db:await db.execute("DELETE FROM scrim_signups WHERE guild_id=? AND date=?",(gid,today));await db.commit()
     embed=discord.Embed(title=title,description=f"*{max_p} spots | Click Sign Up!*",color=0x5865F2)
     embed.add_field(name="Signed Up",value=f"0/{max_p}",inline=True)
     embed.add_field(name="\u23f0 Time (GMT)",value=scrim_time,inline=True)
     embed.add_field(name="Your Time",value=f"<t:{unix}:f>",inline=True)
     embed.set_footer(text="Click Sign Up to join")
-    view=ScrimSignupView(gid,today);msg=await msc.send(embed=embed,view=view)
-    async with aiosqlite.connect(DB)as db:await db.execute("INSERT OR REPLACE INTO scrim_sessions(guild_id,date,thread_id,msg_id,max_players,scrim_title,unix_time) VALUES(?,?,NULL,?,?,?,?)",(gid,today,str(msg.id),max_p,title,unix));await db.commit()
+    sid=str(uuid.uuid4())[:8]
+    view=ScrimSignupView(gid,sid);msg=await msc.send(embed=embed,view=view)
+    async with aiosqlite.connect(DB)as db:await db.execute("INSERT OR REPLACE INTO scrim_v2(sid,guild_id,date,thread_id,msg_id,max_players,scrim_title,unix_time) VALUES(?,?,?,NULL,?,?,?,?)",(sid,gid,today,str(msg.id),max_p,title,unix));await db.commit()
     # Create the scrim thread
     try:
         th=await msc.create_thread(name=f"Scrim {scrim_time} GMT - 3V3",type=discord.ChannelType.public_thread,auto_archive_duration=1440)
         async with aiosqlite.connect(DB)as db:
-            await db.execute("UPDATE scrim_sessions SET thread_id=? WHERE guild_id=? AND date=?",(str(th.id),gid,today));await db.commit()
-        await update_scrim_thread(gid,today)
+            await db.execute("UPDATE scrim_v2 SET thread_id=? WHERE sid=?",(str(th.id),sid));await db.commit()
+        await update_scrim_thread(sid)
     except Exception as e:log.warning("scrim thread create: %s",e)
     await i.followup.send(f"\u2705 Scrim created for **{scrim_time} GMT**!",ephemeral=True)
 
@@ -1894,9 +1918,6 @@ async def scrim_check():
     hour=now.hour;minute=now.minute;today=now.strftime("%Y-%m-%d")
     for g in bot.guilds:
         gid=str(g.id)
-        async with aiosqlite.connect(DB)as db:
-            async with db.execute("SELECT guild_id FROM setup_data WHERE guild_id=?",(gid,))as c:
-                if not await c.fetchone():continue
         msc=None
         for cat in g.categories:
             if cat.name=="Scrims":
@@ -1904,21 +1925,19 @@ async def scrim_check():
                     if ch.name=="mixed-scrims":msc=ch;break
         if not msc:continue
         if not has_scrims(g):continue
-        # Every 5 min - refresh embed
+        # Every 5 min - refresh embeds (each scrim has its own)
         if minute%5==0:
-            await update_scrim_embed(gid,today)
-        # Check for 5-min ping
-        async with aiosqlite.connect(DB)as db:
-            db.row_factory=aiosqlite.Row
-            async with db.execute("SELECT * FROM scrim_sessions WHERE guild_id=? AND date=? AND unix_time IS NOT NULL",(gid,today))as c:
-                sessions=await c.fetchall()
+            for s in await todays_scrims(gid,today):
+                await update_scrim_embed(s["sid"])
+        # 5-min ping and auto-close, per scrim
+        sessions=await todays_scrims(gid,today)
         for sess in sessions:
-            sess=dict(sess)
+            sid=sess["sid"]
             if not sess.get("unix_time"):continue
             dt=datetime.fromtimestamp(sess["unix_time"],tz=timezone.utc)
             diff=(dt-now).total_seconds()
             if 0<diff<=300 and not sess.get("pinged"):
-                members=await scrim_signups_active(gid,today)
+                members=await scrim_signups_active(sid)
                 if members:
                     pings=" ".join(f"<@{uid}>"for uid in members)
                     txt=f"\U0001f514 **Scrim starting in 5 minutes!**\n\nGet a lobby ready and drop the code in this chat.\n{pings}"
@@ -1929,15 +1948,15 @@ async def scrim_check():
                     else:
                         await msc.send(txt)
                 async with aiosqlite.connect(DB)as db:
-                    await db.execute("UPDATE scrim_sessions SET pinged=1 WHERE guild_id=? AND date=?",(gid,today));await db.commit()
+                    await db.execute("UPDATE scrim_v2 SET pinged=1 WHERE sid=?",(sid,));await db.commit()
             if diff<=-5400:
-                await close_scrim(gid,today,sess)
+                await close_scrim(sid,sess)
                 continue
         # Midnight cleanup
         if hour==0 and minute==0:
             async with aiosqlite.connect(DB)as db:
-                await db.execute("DELETE FROM scrim_signups WHERE guild_id=? AND date<?",(gid,today))
-                await db.execute("DELETE FROM scrim_sessions WHERE guild_id=? AND date<?",(gid,today));await db.commit()
+                await db.execute("DELETE FROM scrim_signups_v2 WHERE guild_id=? AND sid IN (SELECT sid FROM scrim_v2 WHERE guild_id=? AND date<?)",(gid,gid,today))
+                await db.execute("DELETE FROM scrim_v2 WHERE guild_id=? AND date<?",(gid,today));await db.commit()
 
 @scrim_check.before_loop
 async def scrim_bef():await bot.wait_until_ready()
