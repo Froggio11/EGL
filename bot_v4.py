@@ -905,7 +905,7 @@ async def league_delete(i):
     if not await need_admin(i):return
     gid=str(i.guild_id);c=await cfg_get(gid)
     async with aiosqlite.connect(DB)as db:
-        for tbl in("config","teams","members","fa","matches","season"):await db.execute(f"DELETE FROM {tbl} WHERE guild_id=?",(gid,))
+        for tbl in("config","fa","matches","season"):await db.execute(f"DELETE FROM {tbl} WHERE guild_id=?",(gid,))
         await db.commit()
     await i.response.send_message(f"\U0001f5d1\ufe0f **{c['name']}** deleted.")
 @league.command(name="info",description="League info")
@@ -1147,13 +1147,14 @@ async def deleteteam(i,name:str):
     await refresh_leaderboard(i.guild)
     await refresh_rosters(i.guild)
 
-@bot.tree.command(name="resetteams",description="Reset all teams' MMR + record (League Admin only)")
+@bot.tree.command(name="resetteams",description="Reset all teams' MMR + record + match history (League Admin only)")
 async def resetteams(i):
     if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
     gid=str(i.guild_id)
     await i.response.defer()
     async with aiosqlite.connect(DB)as db:
         await db.execute("UPDATE teams SET mmr=1000,wins=0,losses=0 WHERE guild_id=?",(gid,))
+        await db.execute("DELETE FROM matches WHERE guild_id=?",(gid,))
         await db.commit()
     await i.followup.send("\u2705 All teams reset to 1000 MMR, 0W/0L.")
 
