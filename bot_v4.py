@@ -1900,6 +1900,7 @@ async def restore_cmd(i,file:discord.Attachment):
     if not file.filename.endswith(".db"):await i.response.send_message("\u274c Must be a .db file.",ephemeral=True);return
     await i.response.defer(ephemeral=True)
     await file.save(DB)
+    await init_db()
     await i.followup.send("\u2705 Database restored!",ephemeral=True)
 
 # ===== Scheduler =====
