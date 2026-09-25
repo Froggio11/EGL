@@ -360,7 +360,7 @@ class ResultConfirmView(discord.ui.View):
         async with aiosqlite.connect(DB)as db:
             await db.execute("UPDATE teams SET wins=wins+1,mmr=mmr+? WHERE guild_id=? AND name=?",(delta,gid,w_key))
             await db.execute("UPDATE teams SET losses=losses+1,mmr=mmr-? WHERE guild_id=? AND name=?",(delta,gid,l_key))
-            await db.execute("INSERT INTO matches VALUES(?,?,0,?,?,?,?,?,?,NULL,0,NULL,NULL,NULL,NULL)",(str(uuid.uuid4())[:8],gid,rep_disp,opp_disp,score,winner,str(i.user.id),datetime.now(timezone.utc).isoformat()))
+            await db.execute("UPDATE matches SET score=?,winner=? WHERE guild_id=? AND thread_id=? AND winner IS NULL",(score,winner,gid,self.thread_id))
             await db.commit()
         c=self.cfg
         if c and c.get("results_ch"):
@@ -1239,6 +1239,16 @@ async def forcekick(i,team:str,player:discord.Member):
                 except:pass
             await i.followup.send(f"\U0001f9b5 Removed {player.mention}. New captain: <@{ncap}>.")
         else:
+            if t.get("thread_id"):
+                th=i.guild.get_thread(int(t["thread_id"]))
+                if th:
+                    try:await th.edit(archived=True,locked=True)
+                    except:pass
+            if t.get("role_id"):
+                role=i.guild.get_role(int(t["role_id"]))
+                if role:
+                    try:await role.delete()
+                    except:pass
             async with aiosqlite.connect(DB)as db:
                 await db.execute("DELETE FROM teams WHERE guild_id=? AND name=?",(gid,t["name"]));await db.commit()
             await i.followup.send(f"\U0001f9b5 Removed {player.mention}. Team **{t['display']}** is now empty and was disbanded.")
