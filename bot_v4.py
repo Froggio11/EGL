@@ -38,7 +38,7 @@ async def init_db():
         CREATE TABLE IF NOT EXISTS members(guild_id TEXT,team_name TEXT,user_id TEXT,PRIMARY KEY(guild_id,team_name,user_id));
         CREATE TABLE IF NOT EXISTS fa(guild_id TEXT,user_id TEXT,username TEXT,joined_at TEXT,PRIMARY KEY(guild_id,user_id));
         CREATE TABLE IF NOT EXISTS matches(id TEXT PRIMARY KEY,guild_id TEXT,week INT,team1 TEXT,team2 TEXT,score TEXT,winner TEXT,reporter TEXT,created_at TEXT,thread_id TEXT,is_finals INT DEFAULT 0,map TEXT,scheduled TEXT,reschedule_by TEXT,reschedule_to TEXT);
-        CREATE TABLE IF NOT EXISTS season(guild_id TEXT PRIMARY KEY,weeks_done INT DEFAULT 0,finals_generated INT DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS season(guild_id TEXT PRIMARY KEY,weeks_done INT DEFAULT 0,finals_generated INT DEFAULT 0);\n        CREATE TABLE IF NOT EXISTS finals_state(guild_id TEXT PRIMARY KEY,bracket_thread_id TEXT,bracket_msg_id TEXT,host_thread_id TEXT,stage_channel_id TEXT,created_at TEXT);
         CREATE TABLE IF NOT EXISTS player_history(guild_id TEXT,user_id TEXT,last_mmr INT DEFAULT 1000,cooldown_until TEXT,PRIMARY KEY(guild_id,user_id));
         CREATE TABLE IF NOT EXISTS guild_settings(guild_id TEXT PRIMARY KEY,teams_ch TEXT);
         CREATE TABLE IF NOT EXISTS leaderboard_state(guild_id TEXT PRIMARY KEY,ch TEXT,msg TEXT);
@@ -346,26 +346,93 @@ class ResultConfirmView(discord.ui.View):
         super().__init__(timeout=86400)
         self.ocid=ocid;self.rep_key=rep_key;self.rep_disp=rep_disp
         self.opp_key=opp_key;self.opp_disp=opp_disp
-        self.score=score;self.won=won;self.winner=winner;self.delta=delta
+        self.score=self._norm_score(score);self.won=won;self.winner=winner;self.delta=delta
         self.gid=gid;self.cfg=cfg;self.thread_id=thread_id
+    @staticmethod
+    def _norm_score(score):
+        try:
+            a,b=[int(x) for x in str(score).split("-")]
+            return f"{a}-{b}"
+        except Exception:
+            return str(score)
     @discord.ui.button(label="\u2705 Confirm Result",style=discord.ButtonStyle.green)
     async def confirm(self,i,btn):
-        if str(i.user.id)!=self.ocid:await i.response.send_message("Other captain only.",ephemeral=True);return
+        if str(i.user.id)!=self.ocid:
+            await i.response.send_message("Other captain only.",ephemeral=True);return
         score=self.score;winner=self.winner;delta=self.delta;gid=self.gid
         rep=self.rep_key;opp=self.opp_key
         rep_disp=self.rep_disp;opp_disp=self.opp_disp
         w_key=rep if self.won else opp
         l_key=opp if self.won else rep
         l_disp=opp_disp if self.won else rep_disp
-        async with aiosqlite.connect(DB)as db:
-            await db.execute("UPDATE teams SET wins=wins+1,mmr=mmr+? WHERE guild_id=? AND name=?",(delta,gid,w_key))
-            await db.execute("UPDATE teams SET losses=losses+1,mmr=mmr-? WHERE guild_id=? AND name=?",(delta,gid,l_key))
-            await db.execute("UPDATE matches SET score=?,winner=? WHERE guild_id=? AND thread_id=? AND winner IS NULL",(score,winner,gid,self.thread_id))
+
+        # Read and claim the match first.  This prevents a double-click or stale
+        # confirmation from awarding a result twice.
+        async with aiosqlite.connect(DB) as db:
+            db.row_factory=aiosqlite.Row
+            async with db.execute("SELECT * FROM matches WHERE guild_id=? AND thread_id=?",(gid,self.thread_id)) as cur:
+                match=await cur.fetchone()
+            if not match:
+                await i.response.send_message("Match not found.",ephemeral=True);return
+            if match["winner"] is not None:
+                await i.response.send_message("This match has already been recorded.",ephemeral=True);return
+
+            finals_type=int(match["is_finals"] or 0)
+            if finals_type in (1,3):
+                try:
+                    sa,sb=[int(x) for x in score.split("-")]
+                except Exception:
+                    await i.response.send_message("\u274c Finals results must be a BO5 score such as **3-0**, **3-1**, or **3-2**.",ephemeral=True);return
+                if sorted((sa,sb)) not in ([0,3],[1,3],[2,3]):
+                    await i.response.send_message("\u274c Finals results must be **3-0**, **3-1**, or **3-2**.",ephemeral=True);return
+                if winner != (match["team1"] if sa > sb else match["team2"]):
+                    await i.response.send_message("\u274c The winner does not match the BO5 score.",ephemeral=True);return
+
+            if finals_type in (1,3):
+                # Finals do not change regular-season MMR or W/L.
+                await db.execute(
+                    "UPDATE matches SET score=?,winner=? WHERE id=? AND winner IS NULL",
+                    (score,winner,match["id"])
+                )
+            else:
+                await db.execute("UPDATE teams SET wins=wins+1,mmr=mmr+? WHERE guild_id=? AND name=?",(delta,gid,w_key))
+                await db.execute("UPDATE teams SET losses=losses+1,mmr=mmr-? WHERE guild_id=? AND name=?",(delta,gid,l_key))
+                await db.execute("UPDATE matches SET score=?,winner=? WHERE id=? AND winner IS NULL",(score,winner,match["id"]))
             await db.commit()
+
         c=self.cfg
-        if c and c.get("results_ch"):
-            rc=i.guild.get_channel(int(c["results_ch"]))
-            if rc:await rc.send(f"\u26a1 **{winner} {score} {l_disp}**\nWinner: **{winner}**\nConfirmed by both captains.")
+        finals_type=int(match["is_finals"] or 0)
+        if finals_type in (1,3):
+            try:
+                sa,sb=[int(x) for x in score.split("-")]
+            except Exception:
+                sa,sb=0,0
+            if finals_type==1:
+                wp,lp=sa,sb
+                if winner==match["team2"]:wp,lp=sb,sa
+                msg=(
+                    f"\U0001f3c6 **FINALS RESULT** \U0001f3c6\n\n"
+                    f"**{winner} {score} {l_disp}**\n\n"
+                    f"\U0001f4ca Finals Points Earned:\n"
+                    f"\u2022 **{winner}: +{wp}**\n"
+                    f"\u2022 **{l_disp}: +{lp}**\n\n"
+                    f"Round-robin Finals match recorded."
+                )
+            else:
+                msg=(
+                    f"\u2694\ufe0f **FINALS TIEBREAKER RESULT** \u2694\ufe0f\n\n"
+                    f"**{winner} {score} {l_disp}**\n\n"
+                    f"Tiebreaker recorded. No regular-season MMR/W-L or Finals Points are changed."
+                )
+            if c and c.get("results_ch"):
+                rc=i.guild.get_channel(int(c["results_ch"]))
+                if rc:await rc.send(msg)
+            await update_finals_bracket(i.guild, gid)
+        else:
+            if c and c.get("results_ch"):
+                rc=i.guild.get_channel(int(c["results_ch"]))
+                if rc:await rc.send(f"\u26a1 **{winner} {score} {l_disp}**\nWinner: **{winner}**\nConfirmed by both captains.")
+
         th=None
         if self.thread_id:
             try:th=i.guild.get_thread(int(self.thread_id))
@@ -384,12 +451,17 @@ class ResultConfirmView(discord.ui.View):
         if th:
             try:
                 if th.archived:await th.edit(archived=False,locked=False)
-                await th.send(f"\u2705 **{winner} {score} {l_disp}** - {winner} wins!")
+                await th.send(f"\u2705 **{winner} {score} {l_disp}** - match complete!")
                 await th.edit(archived=True,locked=True)
             except Exception as e:log.warning("thread close: %s",e)
-        w_t=await team_get(gid,w_key);l_t=await team_get(gid,l_key)
+
         for c2 in self.children:c2.disabled=True
-        await i.response.edit_message(content=f"\u26a1 **Result confirmed!**\n**{winner} {score} {l_disp}**\n{winner} ({get_rank(w_t['mmr'])}) +{delta} | {l_disp} ({get_rank(l_t['mmr'])}) -{delta}",view=self)
+        if finals_type in (1,3):
+            await i.response.edit_message(content=f"\U0001f3c6 **Finals result recorded!**\n**{winner} {score} {l_disp}**",view=self)
+        else:
+            w_t=await team_get(gid,w_key);l_t=await team_get(gid,l_key)
+            await i.response.edit_message(content=f"\u26a1 **Result confirmed!**\n**{winner} {score} {l_disp}**\n{winner} ({get_rank(w_t['mmr'])}) +{delta} | {l_disp} ({get_rank(l_t['mmr'])}) -{delta}",view=self)
+
     @discord.ui.button(label="\u26a0\ufe0f Dispute",style=discord.ButtonStyle.red)
     async def dispute(self,i,btn):
         if str(i.user.id)!=self.ocid:await i.response.send_message("Other captain only.",ephemeral=True);return
@@ -905,7 +977,7 @@ async def league_delete(i):
     if not await need_admin(i):return
     gid=str(i.guild_id);c=await cfg_get(gid)
     async with aiosqlite.connect(DB)as db:
-        for tbl in("config","fa","matches","season"):await db.execute(f"DELETE FROM {tbl} WHERE guild_id=?",(gid,))
+        for tbl in("config","teams","members","fa","matches","season","finals_state"):await db.execute(f"DELETE FROM {tbl} WHERE guild_id=?",(gid,))
         await db.commit()
     await i.response.send_message(f"\U0001f5d1\ufe0f **{c['name']}** deleted.")
 @league.command(name="info",description="League info")
@@ -913,52 +985,308 @@ async def league_info(i):
     if not await need_league(i):return
     c=await cfg_get(str(i.guild_id));ts=await teams_all(str(i.guild_id))
     await i.response.send_message(f"\u2694\ufe0f **{c['name']}**\nTeams:{len(ts)}|{SEASON_WEEKS}w")
-@league.command(name="finals",description="Start Top-4 finals")
+
+async def finals_standings(gid):
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory=aiosqlite.Row
+        async with db.execute(
+            "SELECT id,team1,team2,score,winner,is_finals FROM matches "
+            "WHERE guild_id=? AND is_finals IN (1,3) ORDER BY created_at,id",(gid,)
+        ) as cur:
+            rows=await cur.fetchall()
+    points={};tb_wins={};base_matches=[]
+    for r in rows:
+        if r["is_finals"]==1:
+            points.setdefault(r["team1"],0);points.setdefault(r["team2"],0)
+            base_matches.append(r)
+            if r["score"] and r["winner"]:
+                try:a,b=[int(x) for x in str(r["score"]).split("-")]
+                except Exception:continue
+                if r["winner"]==r["team1"]:points[r["team1"]]+=a;points[r["team2"]]+=b
+                else:points[r["team1"]]+=b;points[r["team2"]]+=a
+        elif r["is_finals"]==3 and r["winner"]:
+            tb_wins[r["winner"]]=tb_wins.get(r["winner"],0)+1
+    ranked=sorted(points,key=lambda t:(points[t],tb_wins.get(t,0),str(t).lower()),reverse=True)
+    return points,tb_wins,ranked,base_matches,rows
+
+async def update_finals_bracket(guild,gid):
+    points,tb_wins,ranked,base_matches,rows=await finals_standings(gid)
+    state=None
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory=aiosqlite.Row
+        async with db.execute("SELECT * FROM finals_state WHERE guild_id=?",(gid,)) as cur:state=await cur.fetchone()
+    if not state or not state["bracket_thread_id"] or not state["bracket_msg_id"]:return
+
+    lines=[]
+    for n,team in enumerate(ranked,1):
+        tb=tb_wins.get(team,0)
+        extra=f"  | TB wins: **{tb}**" if tb else ""
+        lines.append(f"**{n}. {team}** — **{points[team]} pts**{extra}")
+    standings="\n".join(lines) or "No results yet."
+
+    match_lines=[]
+    for idx,r in enumerate(base_matches,1):
+        status=f"**{r['score']}** — {r['winner']}" if r["winner"] else "⏳ Not played"
+        match_lines.append(f"**Match {idx}:** {r['team1']} vs {r['team2']} — {status}")
+    tb_rows=[r for r in rows if r["is_finals"]==3]
+    for r in tb_rows:
+        status=f"**{r['score']}** — {r['winner']}" if r["winner"] else "⏳ Pending"
+        match_lines.append(f"**Tiebreaker:** {r['team1']} vs {r['team2']} — {status}")
+
+    desc=(
+        "Every finalist plays every other finalist once. "
+        "Each BO5 awards points equal to rounds won: **3–0 = 3–0, 3–1 = 3–1, 3–2 = 3–2**.\n\n"
+        "**FINALS POINTS**\n"+standings+
+        "\n\n**ROUND-ROBIN MATCHES**\n"+"\n".join(match_lines)+
+        "\n\n**QUALIFICATION**\nThe two highest resolved point totals advance to the Grand Final. "
+        "A tie is resolved by an admin-hosted BO5 tiebreaker; the tiebreaker is recorded but does not add Finals Points."
+    )
+    embed=discord.Embed(title="🏆 FINALS BRACKET",description=desc,colour=discord.Colour.gold())
+    embed.set_footer(text="Match order uses regular-season seeding to build toward the biggest matchups.")
+    try:
+        th=guild.get_thread(int(state["bracket_thread_id"]))
+        if th is None:th=await guild.fetch_channel(int(state["bracket_thread_id"]))
+        msg=await th.fetch_message(int(state["bracket_msg_id"]))
+        await msg.edit(embed=embed)
+    except Exception as e:
+        log.warning("Finals bracket update: %s",e)
+
+async def _add_thread_members(thread,guild,users):
+    added=set()
+    for uid in users:
+        m=guild.get_member(int(uid))
+        if m and str(m.id) not in added:
+            try:
+                await thread.add_user(m)
+                added.add(str(m.id))
+            except Exception as e:log.warning("Thread member add: %s",e)
+    return added
+
+async def _finals_admin_ids(guild):
+    return [str(m.id) for m in guild.members if is_admin(m)]
+
+async def _create_finals_match_thread(guild,c,gid,mid,a,b,label):
+    ch=guild.get_channel(int(c["matches_ch"]))
+    if not ch or not isinstance(ch,discord.TextChannel):return None
+    try:
+        th=await ch.create_thread(
+            name=f"🏆 {a} vs {b} — {label}",
+            type=discord.ChannelType.private_thread,
+            auto_archive_duration=10080
+        )
+        t1=await team_get(gid,a);t2=await team_get(gid,b)
+        ids=[]
+        for t in (t1,t2):
+            if t:ids.extend(t.get("members",[]))
+        await _add_thread_members(th,guild,ids)
+        await th.send(
+            f"🏆 **FINALS — {a} vs {b}**\n\n"
+            "BO5 — first team to 3 rounds wins.\n"
+            "When the match is complete, either captain uses `/match result` here. "
+            "The confirmed result will be posted to #results and this thread will then close."
+        )
+        async with aiosqlite.connect(DB) as db:
+            await db.execute("UPDATE matches SET thread_id=? WHERE id=?",(str(th.id),mid));await db.commit()
+        return th
+    except Exception as e:
+        log.warning("Finals match thread: %s",e)
+        return None
+
+@league.command(name="finals",description="Start the Top-4 Finals")
 async def league_finals(i):
     if not await need_admin(i):return
     gid=str(i.guild_id);c=await cfg_get(gid)
-    if not c:await i.response.send_message("\u274c No league.",ephemeral=True);return
-    async with aiosqlite.connect(DB)as db:
+    if not c:await i.response.send_message("❌ No league.",ephemeral=True);return
+    async with aiosqlite.connect(DB) as db:
         db.row_factory=aiosqlite.Row
-        async with db.execute("SELECT finals_generated FROM season WHERE guild_id=?",(gid,))as cur:row=await cur.fetchone()
-    if row and row["finals_generated"]:await i.response.send_message("\u274c Already started.",ephemeral=True);return
-    ts=sorted(await teams_all(gid),key=lambda x:x["mmr"],reverse=True)[:4]
-    if len(ts)<4:await i.response.send_message(f"\u274c Need 4 teams, have {len(ts)}.",ephemeral=True);return
-    names=[t["display"]for t in ts]
-    pairs=[(names[x],names[y])for x in range(4)for y in range(x+1,4)]
-    async with aiosqlite.connect(DB)as db:
-        for a,b in pairs:await db.execute("INSERT INTO matches VALUES(?,?,0,?,?,NULL,NULL,NULL,?,NULL,1,NULL,NULL,NULL,NULL)",(str(uuid.uuid4())[:8],gid,a,b,datetime.now(timezone.utc).isoformat()))
-        await db.execute("UPDATE season SET finals_generated=1 WHERE guild_id=?",(gid,));await db.commit()
-    ch=i.guild.get_channel(int(c["matches_ch"]))
-    if ch:
-        seed_txt="\n".join(f"{n+1}. **{nm}**"for n,nm in enumerate(names))
-        match_txt="\n".join(f"Match {n+1}: **{a}** vs **{b}**"for n,(a,b)in enumerate(pairs))
-        await ch.send(f"\U0001f3c6 **TOP 4 FINALS**\n\nSeedings:\n{seed_txt}\n\nMatches:\n{match_txt}\n\nAfter all 6 matches, use `/league grandfinal`!")
-    ann=i.guild.get_channel(int(c["announcements_ch"]))if c.get("announcements_ch")else None
-    if ann:await ann.send(f"\U0001f3c6 **The Top 4 Finals have begun!**\n\nTop 4:\n{seed_txt}\n\nCheck <#{c['matches_ch']}> for the schedule!")
-    await i.response.send_message(f"\U0001f3c6 Finals started! {len(pairs)} matches in <#{c['matches_ch']}>.")
-@league.command(name="grandfinal",description="Generate Grand Final")
+        async with db.execute("SELECT weeks_done,finals_generated FROM season WHERE guild_id=?",(gid,)) as cur:row=await cur.fetchone()
+    if not row:
+        await i.response.send_message("❌ No season record.",ephemeral=True);return
+    if row["finals_generated"]:
+        await i.response.send_message("❌ Finals already started.",ephemeral=True);return
+    if int(row["weeks_done"] or 0)<SEASON_WEEKS:
+        await i.response.send_message(f"❌ The regular season is not finished yet. Week **{row['weeks_done']}/{SEASON_WEEKS}**.",ephemeral=True);return
+
+    ts=sorted(await teams_all(gid),key=lambda x:(x["mmr"],x["wins"],-x["losses"]),reverse=True)[:4]
+    if len(ts)<4:
+        await i.response.send_message(f"❌ Need 4 teams, have {len(ts)}.",ephemeral=True);return
+    names=[t["display"] for t in ts]
+
+    # Seed-based buildup: 1v4, 2v3, 1v3, 2v4, 1v2, 3v4.
+    pairs=[(names[0],names[3]),(names[1],names[2]),(names[0],names[2]),
+           (names[1],names[3]),(names[0],names[1]),(names[2],names[3])]
+
+    matches_ch=i.guild.get_channel(int(c["matches_ch"]))
+    if not matches_ch or not isinstance(matches_ch,discord.TextChannel):
+        await i.response.send_message("❌ The configured #matches channel could not be found.",ephemeral=True);return
+    async with aiosqlite.connect(DB) as db:
+        # Defensive duplicate check: never create another Finals set.
+        async with db.execute("SELECT 1 FROM matches WHERE guild_id=? AND is_finals=1 LIMIT 1",(gid,)) as cur:
+            if await cur.fetchone():
+                await i.response.send_message("❌ Finals matches already exist for this league.",ephemeral=True);return
+        for a,b in pairs:
+            await db.execute(
+                "INSERT INTO matches VALUES(?,?,?,?,?,NULL,NULL,NULL,?,NULL,1,NULL,NULL,NULL,NULL)",
+                (str(uuid.uuid4())[:8],gid,0,a,b,datetime.now(timezone.utc).isoformat())
+            )
+        await db.execute("UPDATE season SET finals_generated=1 WHERE guild_id=?",(gid,))
+        await db.commit()
+
+    category=matches_ch.category
+
+    stage=None
+    if category:
+        try:stage=await i.guild.create_stage_channel(
+            name="🎙️ STAGE MATCHES",category=category,topic="EGL Finals — streamed by League Admins"
+        )
+        except Exception as e:log.warning("Finals Stage creation: %s",e)
+
+    # Public live bracket thread.
+    bracket=None
+    try:
+        bracket=await matches_ch.create_thread(
+            name="🏆 FINALS BRACKET",type=discord.ChannelType.public_thread,auto_archive_duration=10080
+        )
+    except Exception as e:log.warning("Finals bracket thread: %s",e)
+
+    # Private host/captains thread.
+    host=None
+    if category is not None:
+        try:
+            host=await matches_ch.create_thread(
+                name="🎙️ FINALS HOST",type=discord.ChannelType.private_thread,auto_archive_duration=10080
+            )
+            captains=[]
+            for t in ts:captains.append(t["captain_id"])
+            await _add_thread_members(host,i.guild,captains+await _finals_admin_ids(i.guild))
+            await host.send("🎙️ **FINALS HOST / CAPTAINS**\n\nUse this private thread for Finals coordination and streaming logistics.")
+        except Exception as e:log.warning("Finals host thread: %s",e)
+
+    bracket_msg=None
+    if bracket:
+        bracket_msg=await bracket.send("🏆 **FINALS BRACKET**\n\nFinals setup is ready. The live bracket will update as results are confirmed.")
+        try:await bracket.edit(locked=True)
+        except Exception as e:log.warning("Lock Finals bracket thread: %s",e)
+
+    async with aiosqlite.connect(DB) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO finals_state(guild_id,bracket_thread_id,bracket_msg_id,host_thread_id,stage_channel_id,created_at) VALUES(?,?,?,?,?,?)",
+            (gid,str(bracket.id) if bracket else None,str(bracket_msg.id) if bracket_msg else None,
+             str(host.id) if host else None,str(stage.id) if stage else None,datetime.now(timezone.utc).isoformat())
+        )
+        await db.commit()
+
+    for n,(a,b) in enumerate(pairs,1):
+        async with aiosqlite.connect(DB) as db:
+            async with db.execute(
+                "SELECT id FROM matches WHERE guild_id=? AND is_finals=1 AND team1=? AND team2=? AND winner IS NULL ORDER BY created_at DESC LIMIT 1",
+                (gid,a,b)
+            ) as cur:mr=await cur.fetchone()
+        if mr:await _create_finals_match_thread(i.guild,c,gid,mr["id"],a,b,f"Match {n}")
+
+    await update_finals_bracket(i.guild,gid)
+    seed_txt="\n".join(f"{n+1}. **{nm}**" for n,nm in enumerate(names))
+    if matches_ch:
+        await matches_ch.send(
+            "🏆 **TOP 4 FINALS HAVE BEGUN**\n\n"+seed_txt+
+            "\n\n**Match order:**\n"+
+            "\n".join(f"{n}. **{a}** vs **{b}**" for n,(a,b) in enumerate(pairs,1))+
+            "\n\nEvery team plays every other team once. Finals Points are based on rounds won."
+        )
+    ann=i.guild.get_channel(int(c["announcements_ch"])) if c.get("announcements_ch") else None
+    if ann:await ann.send(f"🏆 **The Top 4 Finals have begun!**\n\n{seed_txt}\n\nThe live bracket is in <#{c['matches_ch']}>.")
+    await i.response.send_message("🏆 Finals started: Stage, bracket, Host thread, and 6 private match threads created.",ephemeral=False)
+
+@league.command(name="tiebreaker",description="Create an admin-hosted Finals tiebreaker")
+@app_commands.describe(team1="First tied team",team2="Second tied team")
+async def league_tiebreaker(i,team1:str,team2:str):
+    if not await need_admin(i):return
+    gid=str(i.guild_id);c=await cfg_get(gid)
+    if not c:await i.response.send_message("❌ No league.",ephemeral=True);return
+    if team1.strip().lower()==team2.strip().lower():
+        await i.response.send_message("❌ Choose two different teams.",ephemeral=True);return
+    points,tb_wins,ranked,base_matches,rows=await finals_standings(gid)
+    lookup={x.lower():x for x in points}
+    a=lookup.get(team1.strip().lower());b=lookup.get(team2.strip().lower())
+    if not a or not b:
+        await i.response.send_message("❌ Both teams must be Top-4 Finals teams.",ephemeral=True);return
+    if points[a]!=points[b]:
+        await i.response.send_message(f"❌ A tiebreaker can only be created between teams tied on Finals Points. **{a}: {points[a]}**, **{b}: {points[b]}**.",ephemeral=True);return
+    async with aiosqlite.connect(DB) as db:
+        async with db.execute(
+            "SELECT winner FROM matches WHERE guild_id=? AND is_finals=3 AND ((team1=? AND team2=?) OR (team1=? AND team2=?))",
+            (gid,a,b,b,a)
+        ) as cur:
+            existing=await cur.fetchall()
+        if any(r[0] is None for r in existing):
+            await i.response.send_message("❌ A tiebreaker between these teams is already pending.",ephemeral=True);return
+        if any(r[0] is not None for r in existing):
+            await i.response.send_message("❌ A tiebreaker between these teams has already been recorded.",ephemeral=True);return
+        mid=str(uuid.uuid4())[:8]
+        await db.execute(
+            "INSERT INTO matches VALUES(?,?,?,?,?,NULL,NULL,NULL,?,NULL,3,NULL,NULL,NULL,NULL)",
+            (mid,gid,0,a,b,datetime.now(timezone.utc).isoformat())
+        )
+        await db.commit()
+    th=await _create_finals_match_thread(i.guild,c,gid,mid,a,b,"TIEBREAKER")
+    await update_finals_bracket(i.guild,gid)
+    await i.response.send_message(f"⚔️ Tiebreaker created: **{a} vs {b}**."+(f" <#{th.id}>" if th else ""),ephemeral=False)
+
+@league.command(name="grandfinal",description="Create the Grand Final after Finals are resolved")
 async def league_grandfinal(i):
     if not await need_admin(i):return
     gid=str(i.guild_id);c=await cfg_get(gid)
-    if not c:await i.response.send_message("\u274c No league.",ephemeral=True);return
-    async with aiosqlite.connect(DB)as db:
+    if not c:await i.response.send_message("❌ No league.",ephemeral=True);return
+    async with aiosqlite.connect(DB) as db:
         db.row_factory=aiosqlite.Row
-        async with db.execute("SELECT team1,team2,winner FROM matches WHERE guild_id=? AND is_finals=1 AND winner IS NOT NULL",(gid,))as c2:results=await c2.fetchall()
-    if not results:await i.response.send_message("\u274c No finals results yet.",ephemeral=True);return
-    wins={}
-    for r in results:
-        w=r["winner"]
-        if w:wins[w]=wins.get(w,0)+1
-    if len(wins)<2:await i.response.send_message("\u274c Not enough results.",ephemeral=True);return
-    top2=sorted(wins.items(),key=lambda x:x[1],reverse=True)[:2]
-    t1,t2=top2[0][0],top2[1][0]
-    async with aiosqlite.connect(DB)as db:
-        await db.execute("INSERT INTO matches VALUES(?,?,0,?,?,NULL,NULL,NULL,?,NULL,2,NULL,NULL,NULL,NULL)",(str(uuid.uuid4())[:8],gid,t1,t2,datetime.now(timezone.utc).isoformat()))
+        async with db.execute("SELECT finals_generated FROM season WHERE guild_id=?",(gid,)) as cur:season=await cur.fetchone()
+    if not season or not season["finals_generated"]:
+        await i.response.send_message("❌ Finals have not been started.",ephemeral=True);return
+
+    points,tb_wins,ranked,base_matches,rows=await finals_standings(gid)
+    if len(base_matches)!=6:
+        await i.response.send_message("❌ The 6 Finals round-robin matches have not been created.",ephemeral=True);return
+    if any(not r["winner"] for r in base_matches):
+        await i.response.send_message("❌ All 6 Finals matches must be completed first.",ephemeral=True);return
+
+    # Re-rank using Finals Points, then completed tiebreaker wins.
+    ranked=sorted(points,key=lambda t:(points[t],tb_wins.get(t,0)),reverse=True)
+    if len(ranked)<4:
+        await i.response.send_message("❌ Finals standings are incomplete.",ephemeral=True);return
+
+    # Any unresolved tie crossing a qualification boundary must be resolved first:
+    # - tie for 1st/2nd
+    # - tie for the 2nd Grand Final qualification spot
+    key=lambda t:(points[t],tb_wins.get(t,0))
+    if key(ranked[0])==key(ranked[1]) or key(ranked[1])==key(ranked[2]):
+        boundary_key=key(ranked[0]) if key(ranked[0])==key(ranked[1]) else key(ranked[1])
+        tied=[t for t in ranked if key(t)==boundary_key]
+        await i.response.send_message(
+            "❌ The Grand Final cannot be created yet. Resolve the tied teams with `/league tiebreaker`: **"+", ".join(tied)+"**.",
+            ephemeral=True
+        );return
+
+    # If #3/#4 are tied, require their placement tiebreaker before the Grand Final.
+    if points[ranked[2]]==points[ranked[3]] and tb_wins.get(ranked[2],0)==tb_wins.get(ranked[3],0):
+        tied=[ranked[2],ranked[3]]
+        await i.response.send_message("❌ #3/#4 are tied. Resolve their placement with `/league tiebreaker` before creating the Grand Final: **"+", ".join(tied)+"**.",ephemeral=True);return
+
+    async with aiosqlite.connect(DB) as db:
+        async with db.execute("SELECT 1 FROM matches WHERE guild_id=? AND is_finals=2 LIMIT 1",(gid,)) as cur:
+            if await cur.fetchone():
+                await i.response.send_message("❌ Grand Final already exists.",ephemeral=True);return
+        mid=str(uuid.uuid4())[:8]
+        t1,t2=ranked[0],ranked[1]
+        await db.execute(
+            "INSERT INTO matches VALUES(?,?,?,?,?,NULL,NULL,NULL,?,NULL,2,NULL,NULL,NULL,NULL)",
+            (mid,gid,0,t1,t2,datetime.now(timezone.utc).isoformat())
+        )
         await db.commit()
-    ch=i.guild.get_channel(int(c["matches_ch"]))
-    if ch:await ch.send(f"\U0001f3c6\U0001f525 **GRAND FINAL**\n\n**{t1}** vs **{t2}**\n\nMay the best team win!")
-    await i.response.send_message(f"\U0001f3c6 Grand Final: **{t1}** vs **{t2}**!")
+    th=await _create_finals_match_thread(i.guild,c,gid,mid,t1,t2,"GRAND FINAL")
+    matches_ch=i.guild.get_channel(int(c["matches_ch"]))
+    if matches_ch:await matches_ch.send(f"🏆🔥 **GRAND FINAL**\n\n**{t1}** vs **{t2}**\n\nFinals Points: **{points[t1]}** vs **{points[t2]}**\n\nThe Grand Final is now ready.")
+    await i.response.send_message(f"🏆 Grand Final created: **{t1} vs {t2}**."+(f" <#{th.id}>" if th else ""))
+
 @league.command(name="status",description="Season progress")
 async def league_status(i):
     if not await need_league(i):return
@@ -1149,15 +1477,17 @@ async def deleteteam(i,name:str):
 
 @bot.tree.command(name="resetteams",description="Reset all teams' MMR + record + match history (League Admin only)")
 async def resetteams(i):
-    if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
+    if not is_admin(i.user):await i.response.send_message(f"❌ Need **{ADMIN_ROLE}**.",ephemeral=True);return
     gid=str(i.guild_id)
     await i.response.defer()
-    async with aiosqlite.connect(DB)as db:
+    async with aiosqlite.connect(DB) as db:
+        # Reset ONLY MMR, W/L, and match history.
+        # Do not reset season state, Finals state, teams, members, captains,
+        # player history, Discord roles, or Discord threads.
         await db.execute("UPDATE teams SET mmr=1000,wins=0,losses=0 WHERE guild_id=?",(gid,))
         await db.execute("DELETE FROM matches WHERE guild_id=?",(gid,))
         await db.commit()
-    await i.followup.send("\u2705 All teams reset to 1000 MMR, 0W/0L.")
-
+    await i.followup.send("✅ Teams reset to 1000 MMR, 0W/0L, and match history was cleared.")
 @bot.tree.command(name="spoon",description="Get the Spoon role - anyone can ping you")
 async def spoon_cmd(i):
     await i.response.defer()
