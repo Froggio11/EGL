@@ -38,6 +38,11 @@ async def init_db():
         CREATE TABLE IF NOT EXISTS members(guild_id TEXT,team_name TEXT,user_id TEXT,PRIMARY KEY(guild_id,team_name,user_id));
         CREATE TABLE IF NOT EXISTS fa(guild_id TEXT,user_id TEXT,username TEXT,joined_at TEXT,PRIMARY KEY(guild_id,user_id));
         CREATE TABLE IF NOT EXISTS matches(id TEXT PRIMARY KEY,guild_id TEXT,week INT,team1 TEXT,team2 TEXT,score TEXT,winner TEXT,reporter TEXT,created_at TEXT,thread_id TEXT,is_finals INT DEFAULT 0,map TEXT,scheduled TEXT,reschedule_by TEXT,reschedule_to TEXT);
+        try:
+            await db.execute("ALTER TABLE matches ADD COLUMN reminder_sent INTEGER DEFAULT 0")
+        except Exception:
+            pass
+
         CREATE TABLE IF NOT EXISTS season(guild_id TEXT PRIMARY KEY,weeks_done INT DEFAULT 0,finals_generated INT DEFAULT 0);\n        CREATE TABLE IF NOT EXISTS finals_state(guild_id TEXT PRIMARY KEY,bracket_thread_id TEXT,bracket_msg_id TEXT,host_thread_id TEXT,stage_channel_id TEXT,created_at TEXT);
         CREATE TABLE IF NOT EXISTS player_history(guild_id TEXT,user_id TEXT,last_mmr INT DEFAULT 1000,cooldown_until TEXT,PRIMARY KEY(guild_id,user_id));
         CREATE TABLE IF NOT EXISTS guild_settings(guild_id TEXT PRIMARY KEY,teams_ch TEXT);
@@ -322,7 +327,7 @@ class ScheduleConfirmView(discord.ui.View):
         if not row:await i.response.send_message("Match not found.",ephemeral=True);return
         team=await captain_team(gid,self.actor_id)
         await record_sched_event(gid,self.mid,team or "?","confirm",self.sched)
-        async with aiosqlite.connect(DB)as db:await db.execute("UPDATE matches SET scheduled=? WHERE thread_id=?",(self.sched,self.thread_id));await db.commit()
+        async with aiosqlite.connect(DB)as db:await db.execute("UPDATE matches SET scheduled=?, reminder_sent=0 WHERE thread_id=?",(self.sched,self.thread_id));await db.commit()
         self.done=True
         for c in self.children:c.disabled=True
         await i.response.edit_message(content=f"\U0001f4c5 **Confirmed!** Match scheduled: **{self.sched}**\n\U0001f550 Your time: <t:{self.unix}:f>",view=None)
@@ -686,7 +691,7 @@ class RescheduleView(discord.ui.View):
         gid=str(i.guild_id)
         other=await self._other_cap(gid,str(i.user.id))
         if not other or str(i.user.id)!=other:await i.response.send_message("Other captain only.",ephemeral=True);return
-        async with aiosqlite.connect(DB)as db:await db.execute("UPDATE matches SET scheduled=? WHERE id=?",(self.nt,self.mid));await db.commit()
+        async with aiosqlite.connect(DB)as db:await db.execute("UPDATE matches SET scheduled=?, reminder_sent=0 WHERE id=?",(self.nt,self.mid));await db.commit()
         for c in self.children:c.disabled=True
         await i.response.edit_message(content=f"Rescheduled to **{self.nt}**",view=self)
     @discord.ui.button(label="Deny",style=discord.ButtonStyle.red)
@@ -1078,6 +1083,10 @@ async def _create_finals_match_thread(guild,c,gid,mid,a,b,label):
         ids=[]
         for t in (t1,t2):
             if t:ids.extend(t.get("members",[]))
+
+        # Private Finals match threads are visible/speakable by both teams
+        # and all League Admins.
+        ids.extend(await _finals_admin_ids(guild))
         await _add_thread_members(th,guild,ids)
         await th.send(
             f"🏆 **FINALS — {a} vs {b}**\n\n"
@@ -2039,6 +2048,9 @@ async def create_mixedscrim(i,time:str):
         else: raise ValueError
         utc_h=h%24;scrim_time=f"{h%24:02d}:{mi:02d}"
         dt=datetime.now(timezone.utc).replace(hour=utc_h,minute=mi,second=0,tzinfo=timezone.utc);unix=int(dt.timestamp())
+        if unix <= int(datetime.now(timezone.utc).timestamp()):
+            await i.response.send_message("\u274c Scrims cannot be scheduled in the past. Please choose a future time.",ephemeral=True)
+            return
     except:await i.response.send_message("\u274c Try: 20:00, 20.00, 8pm, 8:30pm",ephemeral=True);return
     await i.response.defer(ephemeral=True)
     if not has_scrims(i.guild):await i.followup.send("\u274c Run `/scrimbot setup` first.",ephemeral=True);return
@@ -2317,13 +2329,16 @@ async def match_reminders():
         try:
             dt=datetime.strptime(sched.replace(" GMT",""),SCHED_FMT).replace(year=now.year,tzinfo=timezone.utc)
             diff=(dt-now).total_seconds()
-            if 3540<=diff<=3660:  # 59-61 min window
+            if 3540<=diff<=3660 and not row.get("reminder_sent",0):  # 59-61 min window, once per schedule
                 g=bot.get_guild(int(row["guild_id"]))
                 if not g:continue
                 th=g.get_thread(int(row["thread_id"]))if row.get("thread_id")else None
                 if th:
                     unix=int(dt.timestamp())
                     await th.send(f"\u23f0 **Match starts in 1 hour!** <t:{unix}:f>\n\nBoth teams be ready! Use `/match result` after the match.")
+                    async with aiosqlite.connect(DB) as db2:
+                        await db2.execute("UPDATE matches SET reminder_sent=1 WHERE id=? AND reminder_sent=0",(row["id"],))
+                        await db2.commit()
         except:continue
 
 @match_reminders.before_loop
