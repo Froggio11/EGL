@@ -367,7 +367,14 @@ class SchedulePickerView(discord.ui.View):
                 if dt.timestamp()<=datetime.now(timezone.utc).timestamp():
                     await i.response.send_message("\u274c That time has already passed. Please choose a future time.",ephemeral=True);return
                 self._show_confirm(dt)
-                await i.response.edit_message(content=f"\U0001f4c5 **{dt.strftime('%A, %d %B')}**\n\U0001f550 **{dt.strftime('%H:%M')} GMT**\n\nConfirm this time?",view=self)
+                unix=int(dt.timestamp())
+                await i.response.edit_message(
+                    content=f"\U0001f4c5 **{dt.strftime('%A, %d %B')}**\n"
+                            f"\U0001f550 **{dt.strftime('%H:%M')} GMT**\n"
+                            f"\U0001f552 **Your time:** <t:{unix}:f>\n\n"
+                            f"Confirm this time?",
+                    view=self
+                )
             sel.callback=choose_time;self.add_item(sel)
         back=discord.ui.Button(label="\u2190 Back",style=discord.ButtonStyle.secondary,row=4)
         async def back_cb(i):
@@ -380,7 +387,10 @@ class SchedulePickerView(discord.ui.View):
         confirm=discord.ui.Button(label="\u2705 Use This Time",style=discord.ButtonStyle.green,row=4)
         async def confirm_cb(i):
             if not await self._owner(i):return
-            self.stop();await self.callback_fn(i,dt)
+            self.stop()
+            try:await i.message.delete()
+            except:pass
+            await self.callback_fn(i,dt)
         confirm.callback=confirm_cb;self.add_item(confirm)
         change=discord.ui.Button(label="\u21a9\ufe0f Change",style=discord.ButtonStyle.secondary,row=4)
         async def change_cb(i):
@@ -406,11 +416,32 @@ async def _send_schedule_proposal(i,row,actor_team,dt,mode):
     await record_sched_event(gid,row["id"],actor_team,"propose",sched)
     v=ScheduleConfirmView(row["id"],ot["captain_id"],str(i.user.id),sched,unix,str(i.channel.id))
     verb="proposes" if mode=="schedule" else "wants"
-    await i.response.send_message(f"\U0001f4c5 {i.user.mention} {verb}: **{sched}**\n\U0001f550 Your time: <t:{unix}:f>\n\n{oc.mention} please confirm:",view=v)
+    await i.response.send_message(
+        f"\U0001f4c5 {i.user.mention} {verb}: **{sched}**\n"
+        f"\U0001f552 **Your time:** <t:{unix}:f>\n\n"
+        f"{oc.mention} please confirm:",
+        view=v
+    )
 
 async def _open_schedule_picker(i,mode):
     row,actor=await _match_schedule_row(i)
     if not row:return
+
+    if mode=="schedule":
+        gid=str(i.guild_id)
+        async with aiosqlite.connect(DB)as db:
+            async with db.execute(
+                "SELECT action FROM sched_events WHERE guild_id=? AND match_id=? ORDER BY id DESC LIMIT 1",
+                (gid,str(row["id"]))
+            )as cur:
+                latest=await cur.fetchone()
+        if latest and latest[0] in ("propose","counter"):
+            await i.response.send_message(
+                "❌ A schedule proposal is already waiting for the other captain. "
+                "Please wait for them to **Confirm**, **Decline**, or **Counter** before using `/schedule` again.",
+                ephemeral=True
+            )
+            return
     dates=await _match_week_dates(str(i.guild_id),row["id"])
     if not dates:
         await i.response.send_message("\u274c Could not determine this match's week.",ephemeral=True);return
@@ -431,7 +462,12 @@ class CounterPickerLauncher:
             await record_sched_event(gid,self.view.mid,team or "?","counter",ns);self.view.done=True
             other_member=i.guild.get_member(int(self.view.proposer_id))
             nv=ScheduleConfirmView(self.view.mid,self.view.proposer_id,self.view.actor_id,ns,unix,self.view.thread_id)
-            await interaction.response.send_message(f"\U0001f504 {interaction.user.mention} counter-proposes **{ns}** (<t:{unix}:f>).\n{other_member.mention if other_member else ''} please reply:",view=nv)
+            await interaction.response.send_message(
+                f"\U0001f504 {interaction.user.mention} counter-proposes **{ns}**\n"
+                f"\U0001f552 **Your time:** <t:{unix}:f>\n\n"
+                f"{other_member.mention if other_member else ''} please reply:",
+                view=nv
+            )
         await i.response.send_message("\U0001f504 **Counter Offer**\n\nChoose a new day and time from this match's week.",view=SchedulePickerView(i.user.id,dates,picked),ephemeral=True)
 
 
