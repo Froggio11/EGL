@@ -123,6 +123,12 @@ async def todays_scrims(gid,date):
         async with db.execute("SELECT * FROM scrim_v2 WHERE guild_id=? AND date=? ORDER BY unix_time",(gid,date))as c:
             return[dict(r)for r in await c.fetchall()]
 
+async def all_scrims(gid):
+    async with aiosqlite.connect(DB)as db:
+        db.row_factory=aiosqlite.Row
+        async with db.execute("SELECT * FROM scrim_v2 WHERE guild_id=? ORDER BY unix_time",(gid,))as c:
+            return[dict(r)for r in await c.fetchall()]
+
 async def scrim_signup_count(sid):
     async with aiosqlite.connect(DB)as db:
         async with db.execute("SELECT COUNT(*) FROM scrim_signups_v2 WHERE sid=?",(sid,))as c:
@@ -509,6 +515,8 @@ async def _scrim_thread(sid):
     except:return None
 
 async def close_scrim(sid,sess=None):
+    # Cleanup is bound to this scrim's unique SID and the exact Discord IDs
+    # stored for that SID. This prevents one scrim from affecting another.
     if sess is None:sess=await get_scrim_session(sid)
     if not sess:return
     g=bot.get_guild(int(sess["guild_id"]))
@@ -526,6 +534,22 @@ async def close_scrim(sid,sess=None):
             except:pass
         try:await th.edit(archived=True,locked=True)
         except:pass
+        try:await th.delete(reason=f"Scrim {sid} finished")
+        except Exception as e:log.warning("scrim thread delete %s: %s",sid,e)
+
+    msg_id=sess.get("msg_id")
+    if msg_id:
+        try:
+            # The message is the one stored against this exact SID.
+            for ch in g.text_channels:
+                if ch.name=="mixed-scrims":
+                    try:
+                        msg=await ch.fetch_message(int(msg_id))
+                        await msg.delete()
+                    except:pass
+                    break
+        except Exception as e:log.warning("scrim message delete %s: %s",sid,e)
+
     async with aiosqlite.connect(DB)as db:
         await db.execute("DELETE FROM scrim_signups_v2 WHERE sid=?",(sid,))
         await db.execute("DELETE FROM scrim_v2 WHERE sid=?",(sid,))
@@ -807,6 +831,7 @@ async def matchrules_cmd(i):
     rules_embed.add_field(name="\U0001f525 Element Rules",value="Play **anything you want**, as long as there are no copies.\n- Example: You can't play 2x fire, but you can play fire and explosion.\n- **No duplicate ultimates** on a team (e.g. 3 players = 3 different ults)",inline=False)
     rules_embed.add_field(name="\U0001f3ae Game Rules",value="- **Control point:** OFF\n- **Damage zone:** ON\n- **Game mode:** Rounds\n- **Rounds to win:** 3 (BO5)\n- **Stage hazards:** ON\n- **Off map damage:** ON\n- **Multipliers:** All x1",inline=False)
     rules_embed.add_field(name="\U0001f3a8 Team Shader Rule",value="All players on the same team must use the same team shader during the match. Captains are responsible for making sure their team follows this rule.",inline=False)
+    rules_embed.add_field(name="\U0001f30d Server Region",value="- All matches are played on **EU servers by default**.\n- **US servers are allowed only when every player in the match is from the US.**\n- If there is **even one EU player**, the match must be played on EU servers.",inline=False)
     rules_embed.add_field(name="\U0001f5fa\ufe0f Map",value="Voted on after the match time is set.",inline=False)
     rules_embed.add_field(name="\u26a1 Toggles",value="- Powerups: OFF\n- Ultimates: ON\n- Techniques: ON\n- Blocking: ON\n- Perfect blocking: ON\n- Dashing: ON",inline=False)
     rules_embed.add_field(name="\u23f0 No-Shows & Forfeits",value="- If some of your team **doesn't show up within 15 minutes**, you either **play down a player** (e.g. 2v3 or 1v3) or **forfeit** (3-0 loss)\n- If a team **can't play** that week, they forfeit the match **3-0**\n- If you **can't agree on a time**, ping the League Admins - they decide based on who tried to schedule\n- Captains are responsible for the rules - a match played with invalid rules **must be replayed**",inline=False)
@@ -984,6 +1009,71 @@ async def league_delete(i):
         for tbl in("config","teams","members","fa","matches","season","finals_state"):await db.execute(f"DELETE FROM {tbl} WHERE guild_id=?",(gid,))
         await db.commit()
     await i.response.send_message(f"\U0001f5d1\ufe0f **{c['name']}** deleted.")
+@league.command(name="end",description="End Finals and clean up Finals Discord infrastructure")
+async def league_end(i):
+    if not await need_admin(i):return
+    gid=str(i.guild_id)
+
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory=aiosqlite.Row
+        async with db.execute(
+            "SELECT bracket_thread_id,host_thread_id,stage_channel_id FROM finals_state WHERE guild_id=?",
+            (gid,)
+        ) as cur:
+            state=await cur.fetchone()
+        async with db.execute(
+            "SELECT thread_id FROM matches WHERE guild_id=? AND is_finals IN (1,2,3) AND thread_id IS NOT NULL",
+            (gid,)
+        ) as cur:
+            match_rows=await cur.fetchall()
+
+    if not state and not match_rows:
+        await i.response.send_message("❌ No active Finals infrastructure was found.",ephemeral=True)
+        return
+
+    deleted=0
+    failed=0
+    ids=[]
+    if state:
+        ids.extend([state["bracket_thread_id"],state["host_thread_id"],state["stage_channel_id"]])
+    ids.extend(row["thread_id"] for row in match_rows)
+
+    seen=set()
+    for raw_id in ids:
+        if not raw_id:continue
+        sid=str(raw_id)
+        if sid in seen:continue
+        seen.add(sid)
+
+        obj=i.guild.get_channel(int(sid))
+        if obj is None:
+            try:obj=await i.guild.fetch_channel(int(sid))
+            except Exception:obj=None
+        if obj is None:continue
+
+        try:
+            await obj.delete(reason="Finals ended by League Admin")
+            deleted+=1
+        except Exception as e:
+            failed+=1
+            log.warning("Finals cleanup failed for %s: %s",sid,e)
+
+    async with aiosqlite.connect(DB) as db:
+        # Preserve historical Finals match/result records.
+        # Only clear Discord thread references and active Finals state.
+        await db.execute(
+            "UPDATE matches SET thread_id=NULL WHERE guild_id=? AND is_finals IN (1,2,3)",
+            (gid,)
+        )
+        await db.execute("DELETE FROM finals_state WHERE guild_id=?",(gid,))
+        await db.commit()
+
+    msg=f"🏁 Finals ended. Cleaned up **{deleted}** Discord item(s)"
+    if failed:msg+=f"; **{failed}** could not be deleted."
+    else:msg+="."
+    msg+="\nHistorical Finals results and match records were preserved."
+    await i.response.send_message(msg)
+
 @league.command(name="info",description="League info")
 async def league_info(i):
     if not await need_league(i):return
@@ -1984,6 +2074,9 @@ async def schedule_cmd(i,datetime_str:str):
     try:
         dt=parse_schedule(datetime_str)
         sched=dt.strftime(SCHED_FMT+" GMT");unix=int(dt.timestamp())
+        if unix <= int(datetime.now(timezone.utc).timestamp()):
+            await i.response.send_message("\u274c Matches cannot be scheduled in the past. Please choose a future time.",ephemeral=True)
+            return
     except Exception as ex:await i.response.send_message(f"\u274c {ex}. Try: 05 Aug 20:00 or 05 Aug 8pm",ephemeral=True);return
     gid=str(i.guild_id)
     async with aiosqlite.connect(DB)as db:
@@ -2010,6 +2103,9 @@ async def reschedule_cmd(i,datetime_str:str):
     try:
         dt=parse_schedule(datetime_str)
         nt=dt.strftime(SCHED_FMT+" GMT");unix=int(dt.timestamp())
+        if unix <= int(datetime.now(timezone.utc).timestamp()):
+            await i.response.send_message("\u274c Matches cannot be rescheduled into the past. Please choose a future time.",ephemeral=True)
+            return
     except:await i.response.send_message(f"\u274c Format: `{SCHED_HELP}`",ephemeral=True);return
     async with aiosqlite.connect(DB)as db:
         db.row_factory=aiosqlite.Row
@@ -2268,7 +2364,7 @@ async def bef():await bot.wait_until_ready()
 @tasks.loop(minutes=1)
 async def scrim_check():
     now=datetime.now(timezone.utc)
-    hour=now.hour;minute=now.minute;today=now.strftime("%Y-%m-%d")
+    hour=now.hour;minute=now.minute
     for g in bot.guilds:
         gid=str(g.id)
         msc=None
@@ -2278,13 +2374,15 @@ async def scrim_check():
                     if ch.name=="mixed-scrims":msc=ch;break
         if not msc:continue
         if not has_scrims(g):continue
-        # Every 5 min - refresh embeds (each scrim has its own)
+
+        # Every 5 min - refresh embeds for every still-active scrim.
+        # Do not filter by calendar date: a scrim's SID/unix_time is its identity.
         if minute%5==0:
-            for s in await todays_scrims(gid,today):
+            for s in await all_scrims(gid):
                 await update_scrim_embed(s["sid"])
-        # 5-min ping and auto-close, per scrim
-        sessions=await todays_scrims(gid,today)
-        for sess in sessions:
+
+        # 5-min ping and auto-close, bound to each scrim's unique SID/time.
+        for sess in await all_scrims(gid):
             sid=sess["sid"]
             if not sess.get("unix_time"):continue
             dt=datetime.fromtimestamp(sess["unix_time"],tz=timezone.utc)
