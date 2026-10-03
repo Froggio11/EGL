@@ -316,9 +316,17 @@ async def _match_week_dates(gid,mid):
             row=await cur.fetchone()
     if not row:return []
     try:
-        start=datetime.fromisoformat(row[0].replace("Z","+00:00")).date()
+        created=datetime.fromisoformat(row[0].replace("Z","+00:00")).date()
     except:
         return []
+    # League scheduling week is Monday through Sunday.
+    # If the match was generated on Sunday, that Sunday is the generation day;
+    # the selectable week therefore starts the following Monday and ends the
+    # following Sunday.
+    if created.weekday()==6:
+        start=created+timedelta(days=1)
+    else:
+        start=created-timedelta(days=created.weekday())
     return [start+timedelta(days=n) for n in range(7)]
 
 class SchedulePickerView(discord.ui.View):
@@ -2179,66 +2187,12 @@ async def test_gen(i):
 bot.tree.add_command(test)
 
 @bot.tree.command(name="schedule",description="Schedule a match")
-@app_commands.describe(datetime_str="Optional legacy DD Mon HH:MM format")
-async def schedule_cmd(i,datetime_str:str|None=None):
-    if datetime_str is None:
-        await _open_schedule_picker(i,"schedule")
-        return
-    if not isinstance(i.channel,discord.Thread):await i.response.send_message("\u274c Match threads only.",ephemeral=True);return
-    d=await need_captain(i)
-    if not d:return
-    try:
-        dt=parse_schedule(datetime_str)
-        sched=dt.strftime(SCHED_FMT+" GMT");unix=int(dt.timestamp())
-        if unix <= int(datetime.now(timezone.utc).timestamp()):
-            await i.response.send_message("\u274c Matches cannot be scheduled in the past. Please choose a future time.",ephemeral=True)
-            return
-    except Exception as ex:await i.response.send_message(f"\u274c {ex}. Try: 05 Aug 20:00 or 05 Aug 8pm",ephemeral=True);return
-    gid=str(i.guild_id)
-    async with aiosqlite.connect(DB)as db:
-        db.row_factory=aiosqlite.Row
-        async with db.execute("SELECT * FROM matches WHERE thread_id=? AND guild_id=?",(str(i.channel.id),gid))as cur:row=await cur.fetchone()
-    if not row:await i.response.send_message("\u274c No match here.",ephemeral=True);return
-    row=dict(row)
-    other=row["team2"]if d==row["team1"]else row["team1"]
-    ot=await team_get(gid,other)
-    if not ot:await i.response.send_message("\u274c Other team gone.",ephemeral=True);return
-    oc=i.guild.get_member(int(ot["captain_id"]))
-    if not oc:await i.response.send_message("\u274c Other captain not found.",ephemeral=True);return
-    await record_sched_event(gid,row["id"],d,"propose",sched)
-    v=ScheduleConfirmView(row["id"],ot["captain_id"],str(i.user.id),sched,unix,str(i.channel.id))
-    await i.response.send_message(f"\U0001f4c5 {i.user.mention} proposes: **{sched}**\n\U0001f550 Your time: <t:{unix}:f>\n\n{oc.mention} please confirm:",view=v)
+async def schedule_cmd(i):
+    await _open_schedule_picker(i,"schedule")
 
 @bot.tree.command(name="reschedule",description="Reschedule a match")
-@app_commands.describe(datetime_str="Optional legacy DD Mon HH:MM format")
-async def reschedule_cmd(i,datetime_str:str|None=None):
-    if datetime_str is None:
-        await _open_schedule_picker(i,"reschedule")
-        return
-    if not isinstance(i.channel,discord.Thread):await i.response.send_message("\u274c Match threads only.",ephemeral=True);return
-    d=await need_captain(i)
-    if not d:return
-    gid=str(i.guild_id)
-    try:
-        dt=parse_schedule(datetime_str)
-        nt=dt.strftime(SCHED_FMT+" GMT");unix=int(dt.timestamp())
-        if unix <= int(datetime.now(timezone.utc).timestamp()):
-            await i.response.send_message("\u274c Matches cannot be rescheduled into the past. Please choose a future time.",ephemeral=True)
-            return
-    except:await i.response.send_message(f"\u274c Format: `{SCHED_HELP}`",ephemeral=True);return
-    async with aiosqlite.connect(DB)as db:
-        db.row_factory=aiosqlite.Row
-        async with db.execute("SELECT * FROM matches WHERE thread_id=? AND guild_id=?",(str(i.channel.id),gid))as cur:row=await cur.fetchone()
-    if not row:await i.response.send_message("\u274c No match here.",ephemeral=True);return
-    row=dict(row);mt=await team_by_player(gid,str(i.user.id))
-    if not mt:await i.response.send_message("\u274c Not on team.",ephemeral=True);return
-    other=row["team2"]if mt["display"]==row["team1"]else row["team1"];ot=await team_get(gid,other)
-    if not ot:await i.response.send_message("\u274c Other team gone.",ephemeral=True);return
-    oc=i.guild.get_member(int(ot["captain_id"]))
-    if not oc:await i.response.send_message("\u274c Other captain gone.",ephemeral=True);return
-    await record_sched_event(gid,row["id"],d,"propose",nt)
-    v=ScheduleConfirmView(row["id"],ot["captain_id"],str(i.user.id),nt,unix,str(i.channel.id))
-    await i.response.send_message(f"\U0001f4c5 {i.user.mention} wants **{nt}** (<t:{unix}:f>).\n{oc.mention} approve?",view=v)
+async def reschedule_cmd(i):
+    await _open_schedule_picker(i,"reschedule")
 
 create_grp=app_commands.Group(name="create",description="Create scrims")
 @create_grp.command(name="mixedscrim",description="Create a mixed scrim")
