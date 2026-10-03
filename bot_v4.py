@@ -519,7 +519,7 @@ class ScheduleConfirmView(discord.ui.View):
                     f"🕐 Your time: <t:{self.unix}:f>\n\n"
                     "👁️ **Overseer spectating is optional.** An Overseer may choose to spectate "
                     f"and record this match with VC OFF.\n\n"
-                    "Click **👁️ Spectate Match** if you want to spectate this match.{overseer_ping}",
+                    f"Click **👁️ Spectate Match** if you want to spectate this match.{overseer_ping}",
             view=OverseerSpectateView()
         )
         await send_map_vote(i.channel,self.mid)
