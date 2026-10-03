@@ -181,6 +181,11 @@ async def is_on_cooldown(gid,uid):
     return False
 
 def find_role(guild,name):return discord.utils.get(guild.roles,name=name)
+
+async def _overseer_ids(guild):
+    role=find_role(guild,"Overseer")
+    if not role:return []
+    return [str(m.id) for m in role.members]
 def is_admin(member):return any(r.name==ADMIN_ROLE for r in member.roles)
 def is_tester(member):return any(r.name==TESTER_ROLE for r in member.roles)
 def has_scrims(guild):
@@ -456,6 +461,31 @@ class CounterPickerLauncher:
         await i.response.send_message("\U0001f504 **Counter Offer**\n\nChoose a new day and time from this match's week.",view=SchedulePickerView(i.user.id,dates,picked),ephemeral=True)
 
 
+class OverseerSpectateView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.claimed=False
+
+    @discord.ui.button(label="👁️ Spectate Match",style=discord.ButtonStyle.secondary)
+    async def spectate(self,i,btn):
+        role=find_role(i.guild,"Overseer")
+        if not role or role not in i.user.roles:
+            await i.response.send_message("❌ Only members with the **Overseer** role can choose to spectate a match.",ephemeral=True)
+            return
+        if self.claimed:
+            await i.response.send_message("❌ An Overseer has already chosen to spectate this match.",ephemeral=True)
+            return
+        self.claimed=True
+        btn.disabled=True
+        btn.label=f"👁️ Overseer: {i.user.display_name}"
+        await i.response.edit_message(
+            content=i.message.content+
+                    f"\n\n👁️ **Overseer spectating:** {i.user.mention}\n"
+                    "🎥 **Recording the match only — VC must remain OFF.**",
+            view=self
+        )
+
+
 class ScheduleConfirmView(discord.ui.View):
     def __init__(self,mid,actor_id,proposer_id,sched,unix,thread_id):
         super().__init__(timeout=86400);self.mid=mid;self.actor_id=actor_id;self.proposer_id=proposer_id;self.sched=sched;self.unix=unix;self.thread_id=thread_id;self.done=False
@@ -476,7 +506,22 @@ class ScheduleConfirmView(discord.ui.View):
         async with aiosqlite.connect(DB)as db:await db.execute("UPDATE matches SET scheduled=?, reminder_sent=0 WHERE thread_id=?",(self.sched,self.thread_id));await db.commit()
         self.done=True
         for c in self.children:c.disabled=True
-        await i.response.edit_message(content=f"\U0001f4c5 **Confirmed!** Match scheduled: **{self.sched}**\n\U0001f550 Your time: <t:{self.unix}:f>",view=None)
+        await i.response.defer()
+        try:
+            await i.message.delete()
+        except Exception:
+            pass
+
+        overseer_role=find_role(i.guild,"Overseer")
+        overseer_ping=f" {overseer_role.mention}" if overseer_role else ""
+        await i.channel.send(
+            content=f"📅 **Confirmed!** Match scheduled: **{self.sched}**\n"
+                    f"🕐 Your time: <t:{self.unix}:f>\n\n"
+                    "👁️ **Overseer spectating is optional.** An Overseer may choose to spectate "
+                    f"and record this match with VC OFF.\n\n"
+                    "Click **👁️ Spectate Match** if you want to spectate this match.{overseer_ping}",
+            view=OverseerSpectateView()
+        )
         await send_map_vote(i.channel,self.mid)
     @discord.ui.button(label="\u274c Decline",style=discord.ButtonStyle.red)
     async def decline(self,i,btn):
@@ -928,6 +973,12 @@ async def gen_matches(guild,c,force=False):
                     if is_admin(m)and str(m.id)not in added:
                         try:await th.add_user(m);added.add(str(m.id))
                         except:pass
+                for uid in await _overseer_ids(guild):
+                    if uid not in added:
+                        m=guild.get_member(int(uid))
+                        if m:
+                            try:await th.add_user(m);added.add(uid)
+                            except:pass
                 await th.send(f"\u26a1 **{a} vs {b}** - Week {week}\n\nEveryone's here! Captain, set a time with `/schedule {SCHED_HELP}` (GMT). Once both captains confirm, the map vote will open.")
             except Exception as e:log.warning("Thread: %s",e)
         lines=[f"\u26a1 **Week {week} Matches**",""]+[f"\u2022 **{a}** vs **{b}**"for _,a,b in match_ids]+["","Check threads!"]
@@ -1315,9 +1366,10 @@ async def _create_finals_match_thread(guild,c,gid,mid,a,b,label):
         for t in (t1,t2):
             if t:ids.extend(t.get("members",[]))
 
-        # Private Finals match threads are visible/speakable by both teams
-        # and all League Admins.
+        # Private Finals match threads are visible/speakable by both teams,
+        # all League Admins, and everyone with the Overseer role.
         ids.extend(await _finals_admin_ids(guild))
+        ids.extend(await _overseer_ids(guild))
         await _add_thread_members(th,guild,ids)
         await th.send(
             f"🏆 **FINALS — {a} vs {b}**\n\n"
@@ -2526,7 +2578,12 @@ async def match_reminders():
                 th=g.get_thread(int(row["thread_id"]))if row.get("thread_id")else None
                 if th:
                     unix=int(dt.timestamp())
-                    await th.send(f"\u23f0 **Match starts in 1 hour!** <t:{unix}:f>\n\nBoth teams be ready! Use `/match result` after the match.")
+                    overseer_role=find_role(g,"Overseer")
+                    overseer_ping=f" {overseer_role.mention}" if overseer_role else ""
+                    await th.send(
+                        f"\u23f0 **Match starts in 1 hour!** <t:{unix}:f>{overseer_ping}\n\n"
+                        "Both teams be ready! Use `/match result` after the match."
+                    )
                     async with aiosqlite.connect(DB) as db2:
                         await db2.execute("UPDATE matches SET reminder_sent=1 WHERE id=? AND reminder_sent=0",(row["id"],))
                         await db2.commit()
