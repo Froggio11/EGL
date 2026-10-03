@@ -295,24 +295,137 @@ async def send_map_vote(channel,mid):
         btn.callback=cb;mv.add_item(btn)
     return await channel.send("**\U0001f5fa\ufe0f Map Vote:**",view=mv)
 
-class CounterModal(discord.ui.Modal,title="Counter-proposal"):
-    def __init__(self,view):
-        super().__init__();self.view=view
-        self.t=discord.ui.TextInput(label="New time (e.g. 12 Sep 20:00 or 8pm)",style=discord.TextStyle.short)
-        self.add_item(self.t)
-    async def on_submit(self,i):
-        try:
-            dt=parse_schedule(self.t.value)
-            ns=dt.strftime(SCHED_FMT+" GMT");unix=int(dt.timestamp())
-        except:
-            await i.response.send_message("Invalid time format.",ephemeral=True);return
-        gid=str(i.guild_id)
-        team=await captain_team(gid,self.view.actor_id)
-        await record_sched_event(gid,self.view.mid,team or "?","counter",ns)
-        self.view.done=True
-        other_member=i.guild.get_member(int(self.view.proposer_id))
-        nv=ScheduleConfirmView(self.view.mid,self.view.proposer_id,self.view.actor_id,ns,unix,self.view.thread_id)
-        await i.response.send_message(f"\U0001f504 {i.user.mention} counter-proposes **{ns}** (<t:{unix}:f>).\n{other_member.mention if other_member else ''} please reply:",view=nv)
+
+async def _match_schedule_row(i):
+    if not isinstance(i.channel,discord.Thread):
+        await i.response.send_message("\u274c Match threads only.",ephemeral=True);return None,None
+    captain=await need_captain(i)
+    if not captain:return None,None
+    gid=str(i.guild_id)
+    async with aiosqlite.connect(DB)as db:
+        db.row_factory=aiosqlite.Row
+        async with db.execute("SELECT * FROM matches WHERE thread_id=? AND guild_id=?",(str(i.channel.id),gid))as cur:
+            row=await cur.fetchone()
+    if not row:
+        await i.response.send_message("\u274c No match here.",ephemeral=True);return None,None
+    return dict(row),captain
+
+async def _match_week_dates(gid,mid):
+    async with aiosqlite.connect(DB)as db:
+        async with db.execute("SELECT created_at,week FROM matches WHERE id=? AND guild_id=?",(mid,gid))as cur:
+            row=await cur.fetchone()
+    if not row:return []
+    try:
+        start=datetime.fromisoformat(row[0].replace("Z","+00:00")).date()
+    except:
+        return []
+    return [start+timedelta(days=n) for n in range(7)]
+
+class SchedulePickerView(discord.ui.View):
+    def __init__(self,author_id,dates,callback):
+        super().__init__(timeout=300)
+        self.author_id=str(author_id);self.dates=dates;self.callback_fn=callback;self.selected_date=None
+        self._show_days()
+
+    async def _owner(self,i):
+        if str(i.user.id)!=self.author_id:
+            await i.response.send_message("\u274c Only the captain who opened this scheduler can use it.",ephemeral=True);return False
+        return True
+
+    def _show_days(self):
+        self.clear_items()
+        opts=[discord.SelectOption(label=d.strftime("%a %d %b"),value=d.isoformat(),description=d.strftime("%A")) for d in self.dates]
+        sel=discord.ui.Select(placeholder="\U0001f4c5 Choose a day",options=opts,row=0)
+        async def choose(i):
+            if not await self._owner(i):return
+            self.selected_date=datetime.fromisoformat(sel.values[0]).date();self._show_times()
+            await i.response.edit_message(content=f"\U0001f4c5 **{self.selected_date.strftime('%A, %d %B')}**\n\nChoose a time (GMT):",view=self)
+        sel.callback=choose;self.add_item(sel)
+        cancel=discord.ui.Button(label="\u274c Cancel",style=discord.ButtonStyle.secondary,row=4)
+        async def cancel_cb(i):
+            if not await self._owner(i):return
+            self.stop();await i.response.edit_message(content="\u274c Scheduling cancelled.",view=None)
+        cancel.callback=cancel_cb;self.add_item(cancel)
+
+    def _show_times(self):
+        self.clear_items()
+        for row,(start,end,label) in enumerate(((0,12,"00:00 \u2013 11:30"),(12,24,"12:00 \u2013 23:30"))):
+            opts=[discord.SelectOption(label=f"{h:02d}:{m:02d} GMT",value=f"{h:02d}:{m:02d}") for h in range(start,end) for m in (0,30)]
+            sel=discord.ui.Select(placeholder=f"\U0001f550 {label}",options=opts,row=row)
+            async def choose_time(i,sel=sel):
+                if not await self._owner(i):return
+                hh,mm=map(int,sel.values[0].split(":"))
+                dt=datetime.combine(self.selected_date,datetime.min.time(),tzinfo=timezone.utc).replace(hour=hh,minute=mm)
+                if dt.timestamp()<=datetime.now(timezone.utc).timestamp():
+                    await i.response.send_message("\u274c That time has already passed. Please choose a future time.",ephemeral=True);return
+                self._show_confirm(dt)
+                await i.response.edit_message(content=f"\U0001f4c5 **{dt.strftime('%A, %d %B')}**\n\U0001f550 **{dt.strftime('%H:%M')} GMT**\n\nConfirm this time?",view=self)
+            sel.callback=choose_time;self.add_item(sel)
+        back=discord.ui.Button(label="\u2190 Back",style=discord.ButtonStyle.secondary,row=4)
+        async def back_cb(i):
+            if not await self._owner(i):return
+            self._show_days();await i.response.edit_message(content="\U0001f4c5 **Choose a day for this match**",view=self)
+        back.callback=back_cb;self.add_item(back)
+
+    def _show_confirm(self,dt):
+        self.clear_items()
+        confirm=discord.ui.Button(label="\u2705 Use This Time",style=discord.ButtonStyle.green,row=4)
+        async def confirm_cb(i):
+            if not await self._owner(i):return
+            self.stop();await self.callback_fn(i,dt)
+        confirm.callback=confirm_cb;self.add_item(confirm)
+        change=discord.ui.Button(label="\u21a9\ufe0f Change",style=discord.ButtonStyle.secondary,row=4)
+        async def change_cb(i):
+            if not await self._owner(i):return
+            self._show_times();await i.response.edit_message(content=f"\U0001f4c5 **{self.selected_date.strftime('%A, %d %B')}**\n\nChoose a time (GMT):",view=self)
+        change.callback=change_cb;self.add_item(change)
+        cancel=discord.ui.Button(label="\u274c Cancel",style=discord.ButtonStyle.red,row=4)
+        async def cancel_cb(i):
+            if not await self._owner(i):return
+            self.stop();await i.response.edit_message(content="\u274c Scheduling cancelled.",view=None)
+        cancel.callback=cancel_cb;self.add_item(cancel)
+
+async def _send_schedule_proposal(i,row,actor_team,dt,mode):
+    if dt.timestamp()<=datetime.now(timezone.utc).timestamp():
+        await i.response.send_message("\u274c That time has already passed. Please choose a future time.",ephemeral=True);return
+    gid=str(i.guild_id);other=row["team2"] if actor_team==row["team1"] else row["team1"];ot=await team_get(gid,other)
+    if not ot:
+        await i.response.send_message("\u274c Other team gone.",ephemeral=True);return
+    oc=i.guild.get_member(int(ot["captain_id"]))
+    if not oc:
+        await i.response.send_message("\u274c Other captain not found.",ephemeral=True);return
+    sched=dt.strftime(SCHED_FMT+" GMT");unix=int(dt.timestamp())
+    await record_sched_event(gid,row["id"],actor_team,"propose",sched)
+    v=ScheduleConfirmView(row["id"],ot["captain_id"],str(i.user.id),sched,unix,str(i.channel.id))
+    verb="proposes" if mode=="schedule" else "wants"
+    await i.response.send_message(f"\U0001f4c5 {i.user.mention} {verb}: **{sched}**\n\U0001f550 Your time: <t:{unix}:f>\n\n{oc.mention} please confirm:",view=v)
+
+async def _open_schedule_picker(i,mode):
+    row,actor=await _match_schedule_row(i)
+    if not row:return
+    dates=await _match_week_dates(str(i.guild_id),row["id"])
+    if not dates:
+        await i.response.send_message("\u274c Could not determine this match's week.",ephemeral=True);return
+    async def picked(interaction,dt): await _send_schedule_proposal(interaction,row,actor,dt,mode)
+    view=SchedulePickerView(i.user.id,dates,picked)
+    await i.response.send_message(f"\U0001f4c5 **Choose a day for {row['team1']} vs {row['team2']}**\n\nOnly the 7 days belonging to **Week {row['week']}** are available.",view=view,ephemeral=True)
+
+class CounterPickerLauncher:
+    def __init__(self,view):self.view=view
+    async def open(self,i):
+        gid=str(i.guild_id);dates=await _match_week_dates(gid,self.view.mid)
+        if not dates:
+            await i.response.send_message("\u274c Could not determine this match's week.",ephemeral=True);return
+        async def picked(interaction,dt):
+            if dt.timestamp()<=datetime.now(timezone.utc).timestamp():
+                await interaction.response.send_message("\u274c That time has already passed. Please choose a future time.",ephemeral=True);return
+            team=await captain_team(gid,self.view.actor_id);ns=dt.strftime(SCHED_FMT+" GMT");unix=int(dt.timestamp())
+            await record_sched_event(gid,self.view.mid,team or "?","counter",ns);self.view.done=True
+            other_member=i.guild.get_member(int(self.view.proposer_id))
+            nv=ScheduleConfirmView(self.view.mid,self.view.proposer_id,self.view.actor_id,ns,unix,self.view.thread_id)
+            await interaction.response.send_message(f"\U0001f504 {interaction.user.mention} counter-proposes **{ns}** (<t:{unix}:f>).\n{other_member.mention if other_member else ''} please reply:",view=nv)
+        await i.response.send_message("\U0001f504 **Counter Offer**\n\nChoose a new day and time from this match's week.",view=SchedulePickerView(i.user.id,dates,picked),ephemeral=True)
+
 
 class ScheduleConfirmView(discord.ui.View):
     def __init__(self,mid,actor_id,proposer_id,sched,unix,thread_id):
@@ -348,7 +461,7 @@ class ScheduleConfirmView(discord.ui.View):
     @discord.ui.button(label="\U0001f504 Counter",style=discord.ButtonStyle.blurple)
     async def counter(self,i,btn):
         if not await self._check(i):return
-        await i.response.send_modal(CounterModal(self))
+        await CounterPickerLauncher(self).open(i)
 
 class ResultConfirmView(discord.ui.View):
     def __init__(self,ocid,rep_key,rep_disp,opp_key,opp_disp,score,won,winner,delta,gid,cfg,thread_id=""):
@@ -2065,9 +2178,12 @@ async def test_gen(i):
     await i.followup.send(f"\u2705 {n or 0} matches in <#{c['matches_ch']}>.")
 bot.tree.add_command(test)
 
-@bot.tree.command(name="schedule",description="Set match time GMT (match thread)")
-@app_commands.describe(datetime_str=SCHED_HELP)
-async def schedule_cmd(i,datetime_str:str):
+@bot.tree.command(name="schedule",description="Schedule a match")
+@app_commands.describe(datetime_str="Optional legacy DD Mon HH:MM format")
+async def schedule_cmd(i,datetime_str:str|None=None):
+    if datetime_str is None:
+        await _open_schedule_picker(i,"schedule")
+        return
     if not isinstance(i.channel,discord.Thread):await i.response.send_message("\u274c Match threads only.",ephemeral=True);return
     d=await need_captain(i)
     if not d:return
@@ -2093,9 +2209,12 @@ async def schedule_cmd(i,datetime_str:str):
     v=ScheduleConfirmView(row["id"],ot["captain_id"],str(i.user.id),sched,unix,str(i.channel.id))
     await i.response.send_message(f"\U0001f4c5 {i.user.mention} proposes: **{sched}**\n\U0001f550 Your time: <t:{unix}:f>\n\n{oc.mention} please confirm:",view=v)
 
-@bot.tree.command(name="reschedule",description="Reschedule (other captain approves)")
-@app_commands.describe(datetime_str=SCHED_HELP)
-async def reschedule_cmd(i,datetime_str:str):
+@bot.tree.command(name="reschedule",description="Reschedule a match")
+@app_commands.describe(datetime_str="Optional legacy DD Mon HH:MM format")
+async def reschedule_cmd(i,datetime_str:str|None=None):
+    if datetime_str is None:
+        await _open_schedule_picker(i,"reschedule")
+        return
     if not isinstance(i.channel,discord.Thread):await i.response.send_message("\u274c Match threads only.",ephemeral=True);return
     d=await need_captain(i)
     if not d:return
