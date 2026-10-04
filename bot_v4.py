@@ -37,7 +37,7 @@ async def init_db():
         CREATE TABLE IF NOT EXISTS teams(guild_id TEXT,name TEXT,display TEXT,captain_id TEXT,wins INT DEFAULT 0,losses INT DEFAULT 0,mmr INT DEFAULT 1000,thread_id TEXT,role_id TEXT,created_at TEXT,clantag TEXT,PRIMARY KEY(guild_id,name));
         CREATE TABLE IF NOT EXISTS members(guild_id TEXT,team_name TEXT,user_id TEXT,PRIMARY KEY(guild_id,team_name,user_id));
         CREATE TABLE IF NOT EXISTS fa(guild_id TEXT,user_id TEXT,username TEXT,joined_at TEXT,PRIMARY KEY(guild_id,user_id));
-        CREATE TABLE IF NOT EXISTS matches(id TEXT PRIMARY KEY,guild_id TEXT,week INT,team1 TEXT,team2 TEXT,score TEXT,winner TEXT,reporter TEXT,created_at TEXT,thread_id TEXT,is_finals INT DEFAULT 0,map TEXT,scheduled TEXT,reschedule_by TEXT,reschedule_to TEXT,reminder_sent INTEGER DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS matches(id TEXT PRIMARY KEY,guild_id TEXT,week INT,team1 TEXT,team2 TEXT,score TEXT,winner TEXT,reporter TEXT,created_at TEXT,thread_id TEXT,is_finals INT DEFAULT 0,map TEXT,scheduled TEXT,reschedule_by TEXT,reschedule_to TEXT,reminder_sent INTEGER DEFAULT 0,overseer_id TEXT);
         CREATE TABLE IF NOT EXISTS season(guild_id TEXT PRIMARY KEY,weeks_done INT DEFAULT 0,finals_generated INT DEFAULT 0);\n        CREATE TABLE IF NOT EXISTS finals_state(guild_id TEXT PRIMARY KEY,bracket_thread_id TEXT,bracket_msg_id TEXT,host_thread_id TEXT,stage_channel_id TEXT,created_at TEXT);
         CREATE TABLE IF NOT EXISTS player_history(guild_id TEXT,user_id TEXT,last_mmr INT DEFAULT 1000,cooldown_until TEXT,PRIMARY KEY(guild_id,user_id));
         CREATE TABLE IF NOT EXISTS guild_settings(guild_id TEXT PRIMARY KEY,teams_ch TEXT);
@@ -50,6 +50,9 @@ async def init_db():
         """)
         # Migrate: add reminder_sent column for existing databases.
         try:await db.execute("ALTER TABLE matches ADD COLUMN reminder_sent INTEGER DEFAULT 0")
+        except:pass
+        # Migrate: store the Overseer who claims a match.
+        try:await db.execute("ALTER TABLE matches ADD COLUMN overseer_id TEXT")
         except:pass
         # Migrate: add clantag column if missing
         try:await db.execute("ALTER TABLE teams ADD COLUMN clantag TEXT")
@@ -182,10 +185,6 @@ async def is_on_cooldown(gid,uid):
 
 def find_role(guild,name):return discord.utils.get(guild.roles,name=name)
 
-async def _overseer_ids(guild):
-    role=find_role(guild,"Overseer")
-    if not role:return []
-    return [str(m.id) for m in role.members]
 def is_admin(member):return any(r.name==ADMIN_ROLE for r in member.roles)
 def is_tester(member):return any(r.name==TESTER_ROLE for r in member.roles)
 def has_scrims(guild):
@@ -462,8 +461,9 @@ class CounterPickerLauncher:
 
 
 class OverseerSpectateView(discord.ui.View):
-    def __init__(self):
+    def __init__(self,mid):
         super().__init__(timeout=None)
+        self.mid=mid
         self.claimed=False
 
     @discord.ui.button(label="👁️ Spectate Match",style=discord.ButtonStyle.secondary)
@@ -475,6 +475,26 @@ class OverseerSpectateView(discord.ui.View):
         if self.claimed:
             await i.response.send_message("❌ An Overseer has already chosen to spectate this match.",ephemeral=True)
             return
+        async with aiosqlite.connect(DB) as db:
+            db.row_factory=aiosqlite.Row
+            async with db.execute("SELECT overseer_id FROM matches WHERE id=?",(self.mid,)) as cur:
+                row=await cur.fetchone()
+        if row and row["overseer_id"]:
+            await i.response.send_message("❌ An Overseer has already chosen to spectate this match.",ephemeral=True)
+            self.claimed=True
+            return
+
+        async with aiosqlite.connect(DB) as db:
+            cur=await db.execute(
+                "UPDATE matches SET overseer_id=? WHERE id=? AND (overseer_id IS NULL OR overseer_id='')",
+                (str(i.user.id),self.mid)
+            )
+            await db.commit()
+            if cur.rowcount != 1:
+                await i.response.send_message("❌ An Overseer has already chosen to spectate this match.",ephemeral=True)
+                self.claimed=True
+                return
+
         self.claimed=True
         btn.disabled=True
         btn.label=f"👁️ Overseer: {i.user.display_name}"
@@ -517,10 +537,9 @@ class ScheduleConfirmView(discord.ui.View):
         await i.channel.send(
             content=f"📅 **Confirmed!** Match scheduled: **{self.sched}**\n"
                     f"🕐 Your time: <t:{self.unix}:f>\n\n"
-                    "👁️ **Overseer spectating is optional.** An Overseer may choose to spectate "
-                    f"and record this match with VC OFF.\n\n"
-                    f"Click **👁️ Spectate Match** if you want to spectate this match.{overseer_ping}",
-            view=OverseerSpectateView()
+                    f"First {overseer_ping} to Click **👁️ Spectate Match** will record the match. "
+                    "Overseer's VC will be turned OFF and will NOT interfere with your match.",
+            view=OverseerSpectateView(self.mid)
         )
         await send_map_vote(i.channel,self.mid)
     @discord.ui.button(label="\u274c Decline",style=discord.ButtonStyle.red)
@@ -973,12 +992,6 @@ async def gen_matches(guild,c,force=False):
                     if is_admin(m)and str(m.id)not in added:
                         try:await th.add_user(m);added.add(str(m.id))
                         except:pass
-                for uid in await _overseer_ids(guild):
-                    if uid not in added:
-                        m=guild.get_member(int(uid))
-                        if m:
-                            try:await th.add_user(m);added.add(uid)
-                            except:pass
                 await th.send(f"\u26a1 **{a} vs {b}** - Week {week}\n\nEveryone's here! Captain, set a time with `/schedule {SCHED_HELP}` (GMT). Once both captains confirm, the map vote will open.")
             except Exception as e:log.warning("Thread: %s",e)
         lines=[f"\u26a1 **Week {week} Matches**",""]+[f"\u2022 **{a}** vs **{b}**"for _,a,b in match_ids]+["","Check threads!"]
@@ -1167,6 +1180,34 @@ async def setchannel(i,channel:discord.TextChannel):
     if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
     async with aiosqlite.connect(DB)as db:await db.execute("INSERT OR REPLACE INTO guild_settings VALUES(?,?)",(str(i.guild_id),str(channel.id)));await db.commit()
     await i.response.send_message(f"\u2705 Team threads: {channel.mention}.")
+
+overseer=app_commands.Group(name="overseer",description="Overseer statistics")
+
+@overseer.command(name="leaderboard",description="Show the Overseer spectating leaderboard")
+async def overseer_leaderboard(i):
+    gid=str(i.guild_id)
+    async with aiosqlite.connect(DB) as db:
+        async with db.execute(
+            "SELECT overseer_id,COUNT(*) FROM matches "
+            "WHERE guild_id=? AND overseer_id IS NOT NULL AND overseer_id!='' "
+            "GROUP BY overseer_id ORDER BY COUNT(*) DESC",
+            (gid,)
+        ) as cur:
+            rows=await cur.fetchall()
+
+    if not rows:
+        await i.response.send_message(
+            "👁️ **Overseer Spectating Leaderboard**\n\nNo matches have been claimed by an Overseer yet."
+        )
+        return
+
+    lines=["👁️ **Overseer Spectating Leaderboard**",""]
+    for rank,(uid,count) in enumerate(rows,1):
+        member=i.guild.get_member(int(uid))
+        name=member.mention if member else f"<@{uid}>"
+        lines.append(f"**{rank}.** {name} — **{count}** match{'es' if count != 1 else ''}")
+
+    await i.response.send_message("\n".join(lines))
 
 league=app_commands.Group(name="league",description="League management")
 @league.command(name="create",description="Create a season")
@@ -1366,10 +1407,8 @@ async def _create_finals_match_thread(guild,c,gid,mid,a,b,label):
         for t in (t1,t2):
             if t:ids.extend(t.get("members",[]))
 
-        # Private Finals match threads are visible/speakable by both teams,
-        # all League Admins, and everyone with the Overseer role.
+        # Private Finals match threads are visible/speakable by both teams and League Admins.
         ids.extend(await _finals_admin_ids(guild))
-        ids.extend(await _overseer_ids(guild))
         await _add_thread_members(th,guild,ids)
         await th.send(
             f"🏆 **FINALS — {a} vs {b}**\n\n"
@@ -2578,8 +2617,15 @@ async def match_reminders():
                 th=g.get_thread(int(row["thread_id"]))if row.get("thread_id")else None
                 if th:
                     unix=int(dt.timestamp())
-                    overseer_role=find_role(g,"Overseer")
-                    overseer_ping=f" {overseer_role.mention}" if overseer_role else ""
+                    overseer_ping=""
+                    overseer_id=row.get("overseer_id")
+                    if overseer_id:
+                        try:
+                            overseer_member=g.get_member(int(overseer_id))
+                            if overseer_member:
+                                overseer_ping=f" {overseer_member.mention}"
+                        except Exception:
+                            pass
                     await th.send(
                         f"\u23f0 **Match starts in 1 hour!** <t:{unix}:f>{overseer_ping}\n\n"
                         "Both teams be ready! Use `/match result` after the match."
