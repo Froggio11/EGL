@@ -2706,6 +2706,7 @@ async def on_ready():
     match_reminders.start()
     leaderboard_refresh.start()
 
+bot.tree.add_command(overseer)
 bot.tree.add_command(scrimbot_grp)
 bot.tree.add_command(setup)
 
