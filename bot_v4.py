@@ -38,7 +38,7 @@ async def init_db():
         CREATE TABLE IF NOT EXISTS members(guild_id TEXT,team_name TEXT,user_id TEXT,PRIMARY KEY(guild_id,team_name,user_id));
         CREATE TABLE IF NOT EXISTS fa(guild_id TEXT,user_id TEXT,username TEXT,joined_at TEXT,PRIMARY KEY(guild_id,user_id));
         CREATE TABLE IF NOT EXISTS matches(id TEXT PRIMARY KEY,guild_id TEXT,week INT,team1 TEXT,team2 TEXT,score TEXT,winner TEXT,reporter TEXT,created_at TEXT,thread_id TEXT,is_finals INT DEFAULT 0,map TEXT,scheduled TEXT,reschedule_by TEXT,reschedule_to TEXT,reminder_sent INTEGER DEFAULT 0,overseer_id TEXT);
-        CREATE TABLE IF NOT EXISTS season(guild_id TEXT PRIMARY KEY,weeks_done INT DEFAULT 0,finals_generated INT DEFAULT 0);\n        CREATE TABLE IF NOT EXISTS finals_state(guild_id TEXT PRIMARY KEY,bracket_thread_id TEXT,bracket_msg_id TEXT,host_thread_id TEXT,stage_channel_id TEXT,created_at TEXT);
+        CREATE TABLE IF NOT EXISTS season(guild_id TEXT PRIMARY KEY,weeks_done INT DEFAULT 0,finals_generated INT DEFAULT 0,last_generation_cycle TEXT);\n        CREATE TABLE IF NOT EXISTS finals_state(guild_id TEXT PRIMARY KEY,bracket_thread_id TEXT,bracket_msg_id TEXT,host_thread_id TEXT,stage_channel_id TEXT,created_at TEXT);
         CREATE TABLE IF NOT EXISTS player_history(guild_id TEXT,user_id TEXT,last_mmr INT DEFAULT 1000,cooldown_until TEXT,PRIMARY KEY(guild_id,user_id));
         CREATE TABLE IF NOT EXISTS guild_settings(guild_id TEXT PRIMARY KEY,teams_ch TEXT);
         CREATE TABLE IF NOT EXISTS leaderboard_state(guild_id TEXT PRIMARY KEY,ch TEXT,msg TEXT);
@@ -48,6 +48,9 @@ async def init_db():
         CREATE TABLE IF NOT EXISTS scrim_v2(sid TEXT PRIMARY KEY,guild_id TEXT,date TEXT,thread_id TEXT,msg_id TEXT,thread_msg_id TEXT,max_players INT DEFAULT 6,scrim_title TEXT,unix_time INT,pinged INT DEFAULT 0);
         CREATE TABLE IF NOT EXISTS scrim_signups_v2(sid TEXT,guild_id TEXT,user_id TEXT,position INT,PRIMARY KEY(sid,user_id));
         """)
+        # Migrate: track which Sunday generation cycle has already run.
+        try:await db.execute("ALTER TABLE season ADD COLUMN last_generation_cycle TEXT")
+        except:pass
         # Migrate: add reminder_sent column for existing databases.
         try:await db.execute("ALTER TABLE matches ADD COLUMN reminder_sent INTEGER DEFAULT 0")
         except:pass
@@ -971,7 +974,13 @@ async def gen_matches(guild,c,force=False):
             mid=str(uuid.uuid4())[:8]
             await db.execute("INSERT INTO matches VALUES(?,?,?,?,?,NULL,NULL,NULL,?,NULL,0,NULL,NULL,NULL,NULL)",(mid,gid,week,a,b,datetime.now(timezone.utc).isoformat()))
             match_ids.append((mid,a,b))
-        if not force:await db.execute("UPDATE season SET weeks_done=? WHERE guild_id=?",(week,gid))
+        if not force:
+            now_cycle=datetime.now(timezone.utc)
+            cycle_date=(now_cycle.date()-timedelta(days=(now_cycle.weekday()+1)%7)).isoformat()
+            await db.execute(
+                "UPDATE season SET weeks_done=?,last_generation_cycle=? WHERE guild_id=?",
+                (week,cycle_date,gid)
+            )
         await db.commit()
     ch=guild.get_channel(int(c["matches_ch"]))
     if ch and isinstance(ch,discord.TextChannel):
@@ -1223,7 +1232,7 @@ async def league_create(i,name:str):
     sd=dict(sd)
     async with aiosqlite.connect(DB)as db:
         await db.execute("INSERT INTO config VALUES(?,?,?,?,?,?,?,?,?,?)",(gid,name,str(i.user.id),sd["announcements_ch"],sd["matches_ch"],sd["results_ch"],sd["general_ch"],sd["fa_ch"],sd["teams_ch"],datetime.now(timezone.utc).isoformat()))
-        await db.execute("INSERT OR IGNORE INTO season VALUES(?,0,0)",(gid,));await db.commit()
+        await db.execute("INSERT OR IGNORE INTO season(guild_id,weeks_done,finals_generated) VALUES(?,0,0)",(gid,));await db.commit()
     end_date=datetime.now(timezone.utc)+timedelta(weeks=SEASON_WEEKS)
     now=datetime.now(timezone.utc)
     days_until_sunday=(6-now.weekday())%7
@@ -1233,7 +1242,7 @@ async def league_create(i,name:str):
     if sd.get("announcements_ch"):
         ann=i.guild.get_channel(int(sd["announcements_ch"]))
         if ann:
-            await ann.send(f"\U0001f3c6 **{name}** has begun!\n\n\u2022 **{SEASON_WEEKS}-week season**  -  every team plays every other team\n\u2022 Matches generated **every Sunday at 10pm GMT** (<t:{sun_unix}:t> your time)\n\u2022 End of regular season: **{end_date.strftime('%d %b %Y')}**\n\u2022 Top 4 advance to Finals, then Grand Final\n\nGood luck, Goons!")
+            await ann.send(f"\U0001f3c6 **{name}** has begun!\n\n\u2022 **{SEASON_WEEKS}-week season**  -  every team plays every other team\n\u2022 Matches generated **Sunday at 10pm GMT** (automatic recovery runs until **Monday 4am GMT** if the bot was offline) (<t:{sun_unix}:t> your time)\n\u2022 End of regular season: **{end_date.strftime('%d %b %Y')}**\n\u2022 Top 4 advance to Finals, then Grand Final\n\nGood luck, Goons!")
     await i.response.send_message(f"\u2694\ufe0f **{name}** season started!")
 @league.command(name="delete",description="Delete league")
 async def league_delete(i):
@@ -2289,6 +2298,83 @@ async def recordadjust(i,team:str,wins:int=0,losses:int=0):
     await refresh_rosters(i.guild)
 
 test=app_commands.Group(name="test",description="Test (Admin)")
+@bot.tree.command(name="generatematches",description="Generate the next league week's matches")
+async def generate_matches_cmd(i):
+    if not await need_admin(i):return
+    gid=str(i.guild_id)
+    c=await cfg_get(gid)
+    if not c:
+        await i.response.send_message("❌ No league.",ephemeral=True)
+        return
+
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory=aiosqlite.Row
+        async with db.execute(
+            "SELECT weeks_done FROM season WHERE guild_id=?",
+            (gid,)
+        ) as cur:
+            season=await cur.fetchone()
+
+    if not season:
+        await i.response.send_message("❌ No active season found.",ephemeral=True)
+        return
+
+    next_week=int(season["weeks_done"])+1
+    if next_week>SEASON_WEEKS:
+        await i.response.send_message(
+            f"❌ The season is already at **Week {season['weeks_done']}/{SEASON_WEEKS}**.",
+            ephemeral=True
+        )
+        return
+
+    async with aiosqlite.connect(DB) as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM matches WHERE guild_id=? AND week=?",
+            (gid,next_week)
+        ) as cur:
+            existing=(await cur.fetchone())[0]
+
+    if existing:
+        await i.response.send_message(
+            f"❌ **Week {next_week}** already has **{existing}** match record(s). "
+            "No new matches were generated.",
+            ephemeral=True
+        )
+        return
+
+    await i.response.defer(ephemeral=True)
+
+    # Use the normal generator so pairing logic stays identical to automation,
+    # but do not use force=True: we want weeks_done to advance normally.
+    n=await gen_matches(i.guild,c,force=False)
+
+    if not n:
+        await i.followup.send(
+            f"❌ No matches were generated for **Week {next_week}**. "
+            "Check that at least two eligible teams have 3+ players.",
+            ephemeral=True
+        )
+        return
+
+    # Mark the Sunday generation cycle that this manual recovery fulfilled.
+    now_cycle=datetime.now(timezone.utc)
+    if now_cycle.weekday()==6:
+        cycle_date=now_cycle.date()
+    else:
+        cycle_date=now_cycle.date()-timedelta(days=(now_cycle.weekday()+1)%7)
+    async with aiosqlite.connect(DB) as db:
+        await db.execute(
+            "UPDATE season SET last_generation_cycle=? WHERE guild_id=?",
+            (cycle_date.isoformat(),gid)
+        )
+        await db.commit()
+
+    await i.followup.send(
+        f"✅ Generated **Week {next_week}** — **{n}** match(es). "
+        f"The season has advanced to **Week {next_week}/{SEASON_WEEKS}**.",
+        ephemeral=True
+    )
+
 @test.command(name="generatematches",description="Force generate")
 async def test_gen(i):
     if not await need_admin(i):return
@@ -2539,10 +2625,38 @@ async def restore_cmd(i,file:discord.Attachment):
 @tasks.loop(hours=1)
 async def weekly_check():
     now=datetime.now(timezone.utc)
-    if now.weekday()!=6 or now.hour!=22:return
+
+    # Normal target: Sunday 22:00 GMT.
+    # Recovery window: Sunday 22:00 through Monday 04:00 GMT.
+    if now.weekday()==6 and now.hour>=22:
+        cycle_date=now.date()
+    elif now.weekday()==0 and now.hour<=4:
+        cycle_date=now.date()-timedelta(days=1)
+    else:
+        return
+
+    cycle_key=cycle_date.isoformat()
+
     for g in bot.guilds:
-        c=await cfg_get(str(g.id))
-        if c:await gen_matches(g,c)
+        gid=str(g.id)
+        c=await cfg_get(gid)
+        if not c:continue
+
+        async with aiosqlite.connect(DB) as db:
+            db.row_factory=aiosqlite.Row
+            async with db.execute(
+                "SELECT weeks_done,last_generation_cycle FROM season WHERE guild_id=?",
+                (gid,)
+            ) as cur:
+                season=await cur.fetchone()
+
+        if not season:continue
+
+        # If this Sunday's generation has already happened, do nothing.
+        if season["last_generation_cycle"]==cycle_key:
+            continue
+
+        await gen_matches(g,c,force=False)
 @weekly_check.before_loop
 async def bef():await bot.wait_until_ready()
 
@@ -2706,7 +2820,6 @@ async def on_ready():
     match_reminders.start()
     leaderboard_refresh.start()
 
-bot.tree.add_command(overseer)
 bot.tree.add_command(scrimbot_grp)
 bot.tree.add_command(setup)
 
