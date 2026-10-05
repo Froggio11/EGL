@@ -30,6 +30,48 @@ RANKS=[(0,"Awakened"),(900,"Adept"),(1000,"Elementalist"),(1050,"Master"),(1100,
 intents=discord.Intents.default();intents.members=True;intents.message_content=True
 bot=commands.Bot(command_prefix="!",intents=intents)
 
+# Serialize private-thread member additions so match generation does not
+# burst Discord's thread-member endpoint and trigger repeated 429s.
+_thread_member_lock=asyncio.Lock()
+_thread_member_last=0.0
+_THREAD_MEMBER_INTERVAL=1.0
+
+async def add_thread_member_safely(thread,member):
+    global _thread_member_last
+    async with _thread_member_lock:
+        now=asyncio.get_running_loop().time()
+        wait=_THREAD_MEMBER_INTERVAL-(now-_thread_member_last)
+        if wait>0:
+            await asyncio.sleep(wait)
+
+        while True:
+            try:
+                await thread.add_user(member)
+                _thread_member_last=asyncio.get_running_loop().time()
+                return True
+            except discord.HTTPException as e:
+                if e.status==429:
+                    retry_after=getattr(e,"retry_after",None)
+                    if retry_after is None:
+                        retry_after=5.0
+                    log.warning(
+                        "Discord rate limit adding %s to thread %s; retrying in %.2fs",
+                        member.id,thread.id,retry_after
+                    )
+                    await asyncio.sleep(float(retry_after))
+                    continue
+                log.warning(
+                    "Could not add %s to thread %s: %s",
+                    member.id,thread.id,e
+                )
+                return False
+            except Exception as e:
+                log.warning(
+                    "Could not add %s to thread %s: %s",
+                    member.id,thread.id,e
+                )
+                return False
+
 async def init_db():
     async with aiosqlite.connect(DB)as db:
         await db.executescript("""
@@ -998,13 +1040,13 @@ async def gen_matches(guild,c,force=False):
                     for uid in t["members"]:
                         m=guild.get_member(int(uid))
                         if m and uid not in added:
-                            try:await th.add_user(m);added.add(uid)
-                            except:pass
+                            if await add_thread_member_safely(th,m):
+                                added.add(uid)
                 for m in guild.members:
                     if is_admin(m)and str(m.id)not in added:
-                        try:await th.add_user(m);added.add(str(m.id))
-                        except:pass
-                await th.send(f"\u26a1 **{a} vs {b}** - Week {week}\n\nEveryone's here! Captain, set a time with `/schedule {SCHED_HELP}` (GMT). Once both captains confirm, the map vote will open.")
+                        if await add_thread_member_safely(th,m):
+                            added.add(str(m.id))
+                await th.send(f"⚡ **{a} vs {b} - Week {week}**\nEveryone's here! **Captains, use `/schedule` to choose a match day and time.** Once both captains confirm, the map vote will open.")
             except Exception as e:log.warning("Thread: %s",e)
         lines=[f"\u26a1 **Week {week} Matches**",""]+[f"\u2022 **{a}** vs **{b}**"for _,a,b in match_ids]+["","Check threads!"]
         await ch.send("\n".join(lines))
@@ -2838,4 +2880,3 @@ bot.tree.add_command(setup)
 if __name__=="__main__":
     if not TOKEN:print("\n\u274c Set DISCORD_BOT_TOKEN!\n")
     else:bot.run(TOKEN)
-
