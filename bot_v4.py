@@ -972,7 +972,10 @@ async def gen_matches(guild,c,force=False):
     async with aiosqlite.connect(DB)as db:
         for a,b in all_pairs:
             mid=str(uuid.uuid4())[:8]
-            await db.execute("INSERT INTO matches VALUES(?,?,?,?,?,NULL,NULL,NULL,?,NULL,0,NULL,NULL,NULL,NULL)",(mid,gid,week,a,b,datetime.now(timezone.utc).isoformat()))
+            await db.execute(
+                "INSERT INTO matches (id,guild_id,week,team1,team2,created_at) VALUES(?,?,?,?,?,?)",
+                (mid,gid,week,a,b,datetime.now(timezone.utc).isoformat())
+            )
             match_ids.append((mid,a,b))
         if not force:
             now_cycle=datetime.now(timezone.utc)
@@ -2346,7 +2349,16 @@ async def generate_matches_cmd(i):
 
     # Use the normal generator so pairing logic stays identical to automation,
     # but do not use force=True: we want weeks_done to advance normally.
-    n=await gen_matches(i.guild,c,force=False)
+    try:
+        n=await gen_matches(i.guild,c,force=False)
+    except Exception as e:
+        log.exception("Manual match generation failed: %s",e)
+        await i.followup.send(
+            "❌ Match generation failed. Nothing was completed. "
+            "Check the bot logs for the exact error.",
+            ephemeral=True
+        )
+        return
 
     if not n:
         await i.followup.send(
