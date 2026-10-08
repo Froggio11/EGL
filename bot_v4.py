@@ -99,6 +99,9 @@ async def init_db():
         # Migrate: store the Overseer who claims a match.
         try:await db.execute("ALTER TABLE matches ADD COLUMN overseer_id TEXT")
         except:pass
+        # Migrate: store the League Admin reason when /closematch is used.
+        try:await db.execute("ALTER TABLE matches ADD COLUMN close_reason TEXT")
+        except:pass
         # Migrate: add clantag column if missing
         try:await db.execute("ALTER TABLE teams ADD COLUMN clantag TEXT")
         except:pass
@@ -2076,6 +2079,27 @@ async def schedulereview(i):
     embed=discord.Embed(title="\U0001f4c5 Scheduling Review",description="\n".join(lines)+verdict,color=0x5865F2)
     await i.followup.send(embed=embed,ephemeral=True)
 
+class CloseReasonModal(discord.ui.Modal):
+    def __init__(self,callback_fn):
+        super().__init__(title="Reason for closing match")
+        self.callback_fn=callback_fn
+        self.reason=discord.ui.TextInput(
+            label="Reason",
+            placeholder="Enter the reason this match is being closed...",
+            required=True,
+            min_length=1,
+            max_length=1000,
+            style=discord.TextStyle.paragraph
+        )
+        self.add_item(self.reason)
+
+    async def on_submit(self,i):
+        reason=self.reason.value.strip()
+        if not reason:
+            await i.response.send_message("❌ A reason is required.",ephemeral=True)
+            return
+        await self.callback_fn(i,reason)
+
 class AdminScoreView(discord.ui.View):
     def __init__(self,gid,wk,wd,lk,ld,thread_id):
         super().__init__(timeout=600)
@@ -2087,12 +2111,33 @@ class AdminScoreView(discord.ui.View):
         ])
         sel.callback=self._submit
         self.add_item(sel)
+
     async def _submit(self,i):
         score=self.children[0].values[0]
-        await i.response.defer()
-        await admin_close_win(i,self.gid,self.wk,self.wd,self.lk,self.ld,score,self.tid)
-        try:await i.edit_original_response(content=f"\u2705 Closed as **{self.wd} {score} {self.ld}**",view=None)
-        except:pass
+
+        async def finish(interaction,reason):
+            await interaction.response.defer(ephemeral=True)
+            result=await admin_close_win(
+                interaction,self.gid,self.wk,self.wd,self.lk,self.ld,
+                score,self.tid,reason
+            )
+            status=[]
+            if result["results_sent"]:
+                status.append("posted to #results")
+            else:
+                status.append("⚠️ could not post to #results")
+            if result["thread_closed"]:
+                status.append("thread closed")
+            else:
+                status.append("⚠️ thread could not be archived/locked")
+            await interaction.followup.send(
+                f"✅ Closed as **{self.wd} {score} {self.ld}**.\n"
+                f"Reason: **{reason}**\n"
+                f"{' • '.join(status)}",
+                ephemeral=True
+            )
+
+        await i.response.send_modal(CloseReasonModal(finish))
 
 class ClosematchView(discord.ui.View):
     def __init__(self,gid,t1k,t1d,t2k,t2d,thread_id):
@@ -2108,23 +2153,66 @@ class ClosematchView(discord.ui.View):
         bc=discord.ui.Button(label="Cancel (no changes)",style=discord.ButtonStyle.danger)
         bc.callback=self._cancel
         self.add_item(bc)
+
     def _mk(self,wk,wd):
         async def cb(i):
             lk=self.t2k if wk==self.t1k else self.t1k
             ld=self.t2d if wk==self.t1k else self.t1d
             v=AdminScoreView(self.gid,wk,wd,lk,ld,self.tid)
-            await i.response.edit_message(content=f"**Step 2:** pick the final score - {wd} vs {ld}",view=v)
+            await i.response.edit_message(
+                content=f"**Step 2:** pick the final score - {wd} vs {ld}",
+                view=v
+            )
         return cb
+
     async def _both(self,i):
-        await i.response.defer()
-        await admin_close_both(i,self.gid,self.t1k,self.t1d,self.t2k,self.t2d,self.tid)
-        try:await i.edit_original_response(content=f"\u2705 Closed: both forfeit ({self.t1d} vs {self.t2d})",view=None)
-        except:pass
+        async def finish(interaction,reason):
+            await interaction.response.defer(ephemeral=True)
+            result=await admin_close_both(
+                interaction,self.gid,self.t1k,self.t1d,self.t2k,self.t2d,
+                self.tid,reason
+            )
+            status=[]
+            if result["results_sent"]:
+                status.append("posted to #results")
+            else:
+                status.append("⚠️ could not post to #results")
+            if result["thread_closed"]:
+                status.append("thread closed")
+            else:
+                status.append("⚠️ thread could not be archived/locked")
+            await interaction.followup.send(
+                f"✅ Closed: both forfeit ({self.t1d} vs {self.t2d}).\n"
+                f"Reason: **{reason}**\n"
+                f"{' • '.join(status)}",
+                ephemeral=True
+            )
+
+        await i.response.send_modal(CloseReasonModal(finish))
+
     async def _cancel(self,i):
-        await i.response.defer()
-        await admin_close_cancel(i,self.gid,self.t1d,self.t2d,self.tid)
-        try:await i.edit_original_response(content=f"\u2705 Canceled: {self.t1d} vs {self.t2d} - no changes",view=None)
-        except:pass
+        async def finish(interaction,reason):
+            await interaction.response.defer(ephemeral=True)
+            result=await admin_close_cancel(
+                interaction,self.gid,self.t1d,self.t2d,self.tid,reason
+            )
+            status=[]
+            if result["results_sent"]:
+                status.append("posted to #results")
+            else:
+                status.append("⚠️ could not post to #results")
+            if result["thread_closed"]:
+                status.append("thread closed")
+            else:
+                status.append("⚠️ thread could not be archived/locked")
+            await interaction.followup.send(
+                f"✅ Canceled: {self.t1d} vs {self.t2d} - no changes.\n"
+                f"Reason: **{reason}**\n"
+                f"{' • '.join(status)}",
+                ephemeral=True
+            )
+
+        await i.response.send_modal(CloseReasonModal(finish))
 
 async def _admin_thread(i,thread_id):
     t=None
@@ -2133,79 +2221,199 @@ async def _admin_thread(i,thread_id):
         except:t=None
         if t is None:
             try:t=await i.guild.fetch_channel(int(thread_id))
-            except:t=None
+            except Exception as e:
+                log.warning("Could not fetch match thread %s: %s",thread_id,e)
+                t=None
     if t is None and isinstance(i.channel,discord.Thread):t=i.channel
     return t
 
 async def _admin_close_thread(i,thread_id,msg):
     th=await _admin_thread(i,thread_id)
-    if not th:return
-    try:
-        if th.archived:await th.edit(archived=False,locked=False)
-        await th.send(msg)
-        await th.edit(archived=True,locked=True)
-    except Exception as e:log.warning("admin close thread: %s",e)
+    if not th:
+        log.warning("Could not find match thread %s to close.",thread_id)
+        return False
+
+    for attempt in range(3):
+        try:
+            if th.archived or th.locked:
+                await th.edit(archived=False,locked=False)
+            await th.send(msg)
+            await th.edit(archived=True,locked=True)
+            return True
+        except discord.HTTPException as e:
+            log.warning(
+                "Admin close thread attempt %d/3 failed for %s: %s",
+                attempt+1,thread_id,e
+            )
+        except Exception as e:
+            log.warning(
+                "Admin close thread attempt %d/3 failed for %s: %s",
+                attempt+1,thread_id,e
+            )
+
+        if attempt<2:
+            await asyncio.sleep(1.0*(attempt+1))
+            refreshed=await _admin_thread(i,thread_id)
+            if refreshed:
+                th=refreshed
+
+    return False
 
 async def _admin_post_results(i,gid,line):
     c=await cfg_get(gid)
-    if c and c.get("results_ch"):
-        rc=i.guild.get_channel(int(c["results_ch"]))
-        if rc:
-            try:await rc.send(line)
-            except:pass
+    if not c or not c.get("results_ch"):
+        log.warning("No results channel configured for guild %s.",gid)
+        return False
 
-async def admin_close_win(i,gid,wk,wd,lk,ld,score,thread_id):
+    channel_id=int(c["results_ch"])
+    rc=i.guild.get_channel(channel_id)
+    if rc is None:
+        try:
+            rc=await i.guild.fetch_channel(channel_id)
+        except Exception as e:
+            log.warning("Could not fetch results channel %s: %s",channel_id,e)
+            return False
+
+    for attempt in range(3):
+        try:
+            await rc.send(line)
+            return True
+        except discord.HTTPException as e:
+            log.warning(
+                "Admin results post attempt %d/3 failed for %s: %s",
+                attempt+1,channel_id,e
+            )
+        except Exception as e:
+            log.warning(
+                "Admin results post attempt %d/3 failed for %s: %s",
+                attempt+1,channel_id,e
+            )
+        if attempt<2:
+            await asyncio.sleep(1.0*(attempt+1))
+            if rc is None:
+                try:rc=await i.guild.fetch_channel(channel_id)
+                except:pass
+
+    return False
+
+async def admin_close_win(i,gid,wk,wd,lk,ld,score,thread_id,reason):
     wt=await team_get(gid,wk);lt=await team_get(gid,lk)
-    if not wt or not lt:return
+    if not wt or not lt:
+        return {"results_sent":False,"thread_closed":False}
+
     wmmr=int(wt["mmr"]);lmmr=int(lt["mmr"])
     expected=0.5 if wmmr==lmmr else 1/(1+10**((lmmr-wmmr)/400))
     try:our,their=map(int,score.split("-"))
     except:our,their=3,0
     delta=round(50*(1-expected)*{3:1.25,2:1.0,1:0.75}.get(abs(our-their),1.0))
+
     async with aiosqlite.connect(DB)as db:
-        await db.execute("UPDATE teams SET wins=wins+1,mmr=mmr+? WHERE guild_id=? AND name=?",(delta,gid,wk))
-        await db.execute("UPDATE teams SET losses=losses+1,mmr=mmr-? WHERE guild_id=? AND name=?",(delta,gid,lk))
-        await db.execute("UPDATE matches SET score=?,winner=?,reporter=? WHERE thread_id=? AND guild_id=? AND winner IS NULL",(score,wd,str(i.user.id),str(thread_id),gid))
+        await db.execute(
+            "UPDATE teams SET wins=wins+1,mmr=mmr+? WHERE guild_id=? AND name=?",
+            (delta,gid,wk)
+        )
+        await db.execute(
+            "UPDATE teams SET losses=losses+1,mmr=mmr-? WHERE guild_id=? AND name=?",
+            (delta,gid,lk)
+        )
+        await db.execute(
+            "UPDATE matches SET score=?,winner=?,reporter=?,close_reason=? "
+            "WHERE thread_id=? AND guild_id=? AND winner IS NULL",
+            (score,wd,str(i.user.id),reason,str(thread_id),gid)
+        )
         await db.commit()
-    await _admin_post_results(i,gid,f"\u26a1 **{wd} {score} {ld}**\nWinner: **{wd}**\nClosed by an admin.")
-    await _admin_close_thread(i,thread_id,f"\U0001f512 Match closed by an admin: **{wd} {score} {ld}**.")
+
+    results_sent=await _admin_post_results(
+        i,gid,
+        f"⚡ **{wd} {score} {ld}**\n"
+        f"Winner: **{wd}**\n"
+        f"Closed by an admin.\n"
+        f"📝 **Reason:** {reason}"
+    )
+    thread_closed=await _admin_close_thread(
+        i,thread_id,
+        f"🔒 Match closed by an admin: **{wd} {score} {ld}**.\n"
+        f"📝 **Reason:** {reason}"
+    )
     try:await refresh_leaderboard(i.guild)
     except:pass
+    return {"results_sent":results_sent,"thread_closed":thread_closed}
 
-async def admin_close_both(i,gid,k1,d1,k2,d2,thread_id):
+async def admin_close_both(i,gid,k1,d1,k2,d2,thread_id,reason):
     async with aiosqlite.connect(DB)as db:
-        await db.execute("UPDATE teams SET mmr=mmr-10 WHERE guild_id=? AND name IN (?,?)",(gid,k1,k2))
-        await db.execute("UPDATE matches SET score='forfeit',winner='both-forfeit',reporter=? WHERE thread_id=? AND guild_id=? AND winner IS NULL",(str(i.user.id),str(thread_id),gid))
+        await db.execute(
+            "UPDATE teams SET mmr=mmr-10 WHERE guild_id=? AND name IN (?,?)",
+            (gid,k1,k2)
+        )
+        await db.execute(
+            "UPDATE matches SET score='forfeit',winner='both-forfeit',reporter=?,close_reason=? "
+            "WHERE thread_id=? AND guild_id=? AND winner IS NULL",
+            (str(i.user.id),reason,str(thread_id),gid)
+        )
         await db.commit()
-    await _admin_post_results(i,gid,f"\u26a0\ufe0f **{d1} vs {d2}**\nBoth teams forfeit - no W/L change, -10 MMR each.")
-    await _admin_close_thread(i,thread_id,"\U0001f512 Match closed by an admin: **both teams forfeit**.")
+
+    results_sent=await _admin_post_results(
+        i,gid,
+        f"⚠️ **{d1} vs {d2}**\n"
+        f"Both teams forfeit - no W/L change, -10 MMR each.\n"
+        f"📝 **Reason:** {reason}"
+    )
+    thread_closed=await _admin_close_thread(
+        i,thread_id,
+        f"🔒 Match closed by an admin: **both teams forfeit**.\n"
+        f"📝 **Reason:** {reason}"
+    )
     try:await refresh_leaderboard(i.guild)
     except:pass
+    return {"results_sent":results_sent,"thread_closed":thread_closed}
 
-async def admin_close_cancel(i,gid,d1,d2,thread_id):
+async def admin_close_cancel(i,gid,d1,d2,thread_id,reason):
     async with aiosqlite.connect(DB)as db:
-        await db.execute("UPDATE matches SET score='canceled',winner='canceled',reporter=? WHERE thread_id=? AND guild_id=? AND winner IS NULL",(str(i.user.id),str(thread_id),gid))
+        await db.execute(
+            "UPDATE matches SET score='canceled',winner='canceled',reporter=?,close_reason=? "
+            "WHERE thread_id=? AND guild_id=? AND winner IS NULL",
+            (str(i.user.id),reason,str(thread_id),gid)
+        )
         await db.commit()
-    await _admin_post_results(i,gid,f"\U0001f6ab **{d1} vs {d2}**\nCanceled by an admin - no MMR or W/L changes.")
-    await _admin_close_thread(i,thread_id,"\U0001f512 Match canceled by an admin - no changes.")
+
+    results_sent=await _admin_post_results(
+        i,gid,
+        f"🚫 **{d1} vs {d2}**\n"
+        f"Canceled by an admin - no MMR or W/L changes.\n"
+        f"📝 **Reason:** {reason}"
+    )
+    thread_closed=await _admin_close_thread(
+        i,thread_id,
+        f"🔒 Match canceled by an admin - no changes.\n"
+        f"📝 **Reason:** {reason}"
+    )
+    return {"results_sent":results_sent,"thread_closed":thread_closed}
 
 @bot.tree.command(name="closematch",description="Close a match using the result picker (League Admin only, in match thread)")
 async def closematch(i):
-    if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
-    if not isinstance(i.channel,discord.Thread):await i.response.send_message("\u274c Use inside the match thread.",ephemeral=True);return
+    if not is_admin(i.user):await i.response.send_message(f"❌ Need **{ADMIN_ROLE}**.",ephemeral=True);return
+    if not isinstance(i.channel,discord.Thread):await i.response.send_message("❌ Use inside the match thread.",ephemeral=True);return
     gid=str(i.guild_id)
     await i.response.defer(ephemeral=True)
     async with aiosqlite.connect(DB)as db:
         db.row_factory=aiosqlite.Row
         async with db.execute("SELECT * FROM matches WHERE thread_id=? AND guild_id=? AND winner IS NULL",(str(i.channel.id),gid))as cur:
             row=await cur.fetchone()
-    if not row:await i.followup.send("\u274c No open match in this thread (or already resolved).",ephemeral=True);return
+    if not row:
+        await i.followup.send("❌ No open match in this thread (or already resolved).",ephemeral=True)
+        return
     row=dict(row);t1=row["team1"];t2=row["team2"]
     tt=await teams_all(gid)
     t1k=next((x["name"]for x in tt if x["display"]==t1),t1.lower())
     t2k=next((x["name"]for x in tt if x["display"]==t2),t2.lower())
     v=ClosematchView(gid,t1k,t1,t2k,t2,str(i.channel.id))
-    await i.followup.send(f"\U0001f512 **Close match** - {t1} vs {t2}\n\n**Step 1:** who won? (or use forfeit / cancel below)",view=v,ephemeral=True)
+    await i.followup.send(
+        f"🔒 **Close match** - {t1} vs {t2}\n\n"
+        "**Step 1:** who won? (or use forfeit / cancel below)\n"
+        "**Final step:** you will be asked for the reason for closing the match.",
+        view=v,ephemeral=True
+    )
+
 @bot.tree.command(name="teaminfo",description="Team info")
 @app_commands.describe(team="Team name")
 async def teaminfo(i,team:str):
@@ -2770,38 +2978,78 @@ async def match_reminders():
     now=datetime.now(timezone.utc)
     async with aiosqlite.connect(DB)as db:
         db.row_factory=aiosqlite.Row
-        async with db.execute("SELECT * FROM matches WHERE scheduled IS NOT NULL AND winner IS NULL AND score IS NULL")as c:
+        async with db.execute(
+            "SELECT * FROM matches WHERE scheduled IS NOT NULL "
+            "AND winner IS NULL AND score IS NULL"
+        )as c:
             rows=await c.fetchall()
+
     for row in rows:
         row=dict(row)
         sched=row.get("scheduled")
         if not sched:continue
+
         try:
-            dt=datetime.strptime(sched.replace(" GMT",""),SCHED_FMT).replace(year=now.year,tzinfo=timezone.utc)
-            diff=(dt-now).total_seconds()
-            if 3540<=diff<=3660 and not row.get("reminder_sent",0):  # 59-61 min window, once per schedule
-                g=bot.get_guild(int(row["guild_id"]))
-                if not g:continue
-                th=g.get_thread(int(row["thread_id"]))if row.get("thread_id")else None
-                if th:
-                    unix=int(dt.timestamp())
-                    overseer_ping=""
-                    overseer_id=row.get("overseer_id")
-                    if overseer_id:
-                        try:
-                            overseer_member=g.get_member(int(overseer_id))
-                            if overseer_member:
-                                overseer_ping=f" {overseer_member.mention}"
-                        except Exception:
-                            pass
-                    await th.send(
-                        f"\u23f0 **Match starts in 1 hour!** <t:{unix}:f>{overseer_ping}\n\n"
-                        "Both teams be ready! Use `/match result` after the match."
-                    )
-                    async with aiosqlite.connect(DB) as db2:
-                        await db2.execute("UPDATE matches SET reminder_sent=1 WHERE id=? AND reminder_sent=0",(row["id"],))
-                        await db2.commit()
-        except:continue
+            # Schedules are stored as "DD Mon HH:MM GMT". Include the year
+            # explicitly so Python 3.13 does not warn about yearless dates.
+            dt=datetime.strptime(
+                f"{now.year} {sched.replace(' GMT','')}",
+                "%Y %d %b %H:%M"
+            ).replace(tzinfo=timezone.utc)
+        except Exception as e:
+            log.warning("Could not parse scheduled match %s (%s): %s",row.get("id"),sched,e)
+            continue
+
+        diff=(dt-now).total_seconds()
+
+        # Normal case: send around 1 hour before the match.
+        # Restart-safe case: if the bot was offline during that exact window,
+        # send the reminder when it comes back online, as long as the match
+        # has not started and is no more than 1 hour overdue.
+        if not (0 <= diff <= 3660 or -3600 < diff < 0):
+            continue
+        if row.get("reminder_sent",0):
+            continue
+
+        g=bot.get_guild(int(row["guild_id"]))
+        if not g:continue
+
+        th=None
+        if row.get("thread_id"):
+            try:th=g.get_thread(int(row["thread_id"]))
+            except:th=None
+            if th is None:
+                try:th=await g.fetch_channel(int(row["thread_id"]))
+                except Exception as e:
+                    log.warning("Could not fetch match thread %s: %s",row["thread_id"],e)
+                    th=None
+        if not th:continue
+
+        unix=int(dt.timestamp())
+        overseer_ping=""
+        overseer_id=row.get("overseer_id")
+        if overseer_id:
+            try:
+                overseer_member=g.get_member(int(overseer_id))
+                if overseer_member:
+                    overseer_ping=f" {overseer_member.mention}"
+            except Exception:
+                pass
+
+        try:
+            minutes_remaining=max(1,int(diff // 60))
+            await th.send(
+                f"⏰ **Match starts in {minutes_remaining} minutes!** <t:{unix}:f>{overseer_ping}\n\n"
+                "Both teams be ready! Use `/match result` after the match."
+            )
+            async with aiosqlite.connect(DB)as db2:
+                await db2.execute(
+                    "UPDATE matches SET reminder_sent=1 WHERE id=? AND reminder_sent=0",
+                    (row["id"],)
+                )
+                await db2.commit()
+        except Exception as e:
+            log.warning("Match reminder failed for %s: %s",row["id"],e)
 
 @match_reminders.before_loop
 async def mr_bef():await bot.wait_until_ready()
