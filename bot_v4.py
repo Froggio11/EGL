@@ -2230,24 +2230,23 @@ async def _admin_thread(i,thread_id):
 async def _admin_close_thread(i,thread_id,msg):
     th=await _admin_thread(i,thread_id)
     if not th:
-        log.warning("Could not find match thread %s to close.",thread_id)
+        log.warning("Could not find match thread %s to delete.",thread_id)
         return False
 
     for attempt in range(3):
         try:
-            if th.archived or th.locked:
-                await th.edit(archived=False,locked=False)
-            await th.send(msg)
-            await th.edit(archived=True,locked=True)
+            # Match threads should be permanently deleted when /closematch
+            # completes, not archived or locked.
+            await th.delete(reason="Match closed by league admin")
             return True
         except discord.HTTPException as e:
             log.warning(
-                "Admin close thread attempt %d/3 failed for %s: %s",
+                "Admin delete thread attempt %d/3 failed for %s: %s",
                 attempt+1,thread_id,e
             )
         except Exception as e:
             log.warning(
-                "Admin close thread attempt %d/3 failed for %s: %s",
+                "Admin delete thread attempt %d/3 failed for %s: %s",
                 attempt+1,thread_id,e
             )
 
