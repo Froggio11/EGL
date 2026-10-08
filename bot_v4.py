@@ -694,7 +694,18 @@ class ResultConfirmView(discord.ui.View):
         else:
             if c and c.get("results_ch"):
                 rc=i.guild.get_channel(int(c["results_ch"]))
-                if rc:await rc.send(f"\u26a1 **{winner} {score} {l_disp}**\nWinner: **{winner}**\nConfirmed by both captains.")
+                if rc:
+                    w_after=int((await team_get(gid,w_key))["mmr"])
+                    l_after=int((await team_get(gid,l_key))["mmr"])
+                    w_before=w_after-delta
+                    l_before=l_after+delta
+                    await rc.send(
+                        f"\u26a1 **{winner} {score} {l_disp}**\n"
+                        f"Winner: **{winner}**\n"
+                        f"**{w_key}**: **{w_before} \u2192 {w_after} MMR** (**+{delta} MMR**)\n"
+                        f"**{l_key}**: **{l_before} \u2192 {l_after} MMR** (**-{delta} MMR**)\n"
+                        f"Confirmed by both captains."
+                    )
 
         th=None
         if self.thread_id:
@@ -712,18 +723,56 @@ class ResultConfirmView(discord.ui.View):
                     async for t in mc.archived_threads():
                         if rep_disp.lower() in t.name.lower() and opp_disp.lower() in t.name.lower():th=t;break
         if th:
-            try:
-                if th.archived:await th.edit(archived=False,locked=False)
-                await th.send(f"\u2705 **{winner} {score} {l_disp}** - match complete!")
-                await th.edit(archived=True,locked=True)
-            except Exception as e:log.warning("thread close: %s",e)
+            # Match result has already been saved above. Permanently delete the
+            # Discord thread so it is no longer visible, while keeping the
+            # match history in the database/results channel.
+            deleted=False
+            for attempt in range(3):
+                try:
+                    await th.delete(
+                        reason=f"Match result confirmed: {winner} {score} {l_disp}"
+                    )
+                    deleted=True
+                    break
+                except discord.HTTPException as e:
+                    log.warning(
+                        "match result thread delete attempt %d/3 failed for %s: %s",
+                        attempt+1,self.thread_id,e
+                    )
+                    if attempt<2:
+                        await asyncio.sleep(1.0*(attempt+1))
+                        try:
+                            th=await i.guild.fetch_channel(int(self.thread_id))
+                        except Exception:
+                            th=None
+                        if th is None:
+                            deleted=True
+                            break
+                except Exception as e:
+                    log.warning(
+                        "match result thread delete attempt %d/3 failed for %s: %s",
+                        attempt+1,self.thread_id,e
+                    )
+                    break
+            if not deleted:
+                log.warning("Could not permanently delete match result thread %s.",self.thread_id)
 
         for c2 in self.children:c2.disabled=True
         if finals_type in (1,3):
             await i.response.edit_message(content=f"\U0001f3c6 **Finals result recorded!**\n**{winner} {score} {l_disp}**",view=self)
         else:
             w_t=await team_get(gid,w_key);l_t=await team_get(gid,l_key)
-            await i.response.edit_message(content=f"\u26a1 **Result confirmed!**\n**{winner} {score} {l_disp}**\n{winner} ({get_rank(w_t['mmr'])}) +{delta} | {l_disp} ({get_rank(l_t['mmr'])}) -{delta}",view=self)
+            w_after=int(w_t["mmr"]);l_after=int(l_t["mmr"])
+            w_before=w_after-delta;l_before=l_after+delta
+            await i.response.edit_message(
+                content=(
+                    f"\u26a1 **Result confirmed!**\n"
+                    f"**{winner} {score} {l_disp}**\n"
+                    f"{winner}: **{w_before} \u2192 {w_after} MMR** (**+{delta} MMR**)\n"
+                    f"{l_disp}: **{l_before} \u2192 {l_after} MMR** (**-{delta} MMR**)"
+                ),
+                view=self
+            )
 
     @discord.ui.button(label="\u26a0\ufe0f Dispute",style=discord.ButtonStyle.red)
     async def dispute(self,i,btn):
@@ -2322,10 +2371,14 @@ async def admin_close_win(i,gid,wk,wd,lk,ld,score,thread_id,reason):
         )
         await db.commit()
 
+    w_after=wmmr+delta
+    l_after=lmmr-delta
     results_sent=await _admin_post_results(
         i,gid,
         f"⚡ **{wd} {score} {ld}**\n"
         f"Winner: **{wd}**\n"
+        f"**{wd}**: **{wmmr} → {w_after} MMR** (**+{delta} MMR**)\n"
+        f"**{ld}**: **{lmmr} → {l_after} MMR** (**-{delta} MMR**)\n"
         f"Closed by an admin.\n"
         f"📝 **Reason:** {reason}"
     )
@@ -2339,6 +2392,10 @@ async def admin_close_win(i,gid,wk,wd,lk,ld,score,thread_id,reason):
     return {"results_sent":results_sent,"thread_closed":thread_closed}
 
 async def admin_close_both(i,gid,k1,d1,k2,d2,thread_id,reason):
+    t1=await team_get(gid,k1);t2=await team_get(gid,k2)
+    if not t1 or not t2:
+        return {"results_sent":False,"thread_closed":False}
+    m1=int(t1["mmr"]);m2=int(t2["mmr"])
     async with aiosqlite.connect(DB)as db:
         await db.execute(
             "UPDATE teams SET mmr=mmr-10 WHERE guild_id=? AND name IN (?,?)",
@@ -2354,7 +2411,9 @@ async def admin_close_both(i,gid,k1,d1,k2,d2,thread_id,reason):
     results_sent=await _admin_post_results(
         i,gid,
         f"⚠️ **{d1} vs {d2}**\n"
-        f"Both teams forfeit - no W/L change, -10 MMR each.\n"
+        f"**{d1}**: **{m1} → {m1-10} MMR** (**-10 MMR**)\n"
+        f"**{d2}**: **{m2} → {m2-10} MMR** (**-10 MMR**)\n"
+        f"Both teams forfeit - no W/L change.\n"
         f"📝 **Reason:** {reason}"
     )
     thread_closed=await _admin_close_thread(
@@ -2530,7 +2589,7 @@ async def mmr_adjust(i,team:str,amount:int):
     if not t:await i.response.send_message("\u274c Not found.",ephemeral=True);return
     old=t["mmr"];new=old+amount
     async with aiosqlite.connect(DB)as db:await db.execute("UPDATE teams SET mmr=? WHERE guild_id=? AND name=?",(new,gid,t["name"]));await db.commit()
-    await i.response.send_message(f"\U0001f4ca **{t['display']}** Rank:{get_rank(old)}\u2192{get_rank(new)}")
+    await i.response.send_message(f"\U0001f4ca **{t['display']}** MMR: **{old} \u2192 {new}** (**{amount:+d} MMR**)\nRank: {get_rank(old)} \u2192 {get_rank(new)}")
     await refresh_leaderboard(i.guild)
 bot.tree.add_command(mmr)
 
