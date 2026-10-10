@@ -76,7 +76,7 @@ async def init_db():
     async with aiosqlite.connect(DB)as db:
         await db.executescript("""
         CREATE TABLE IF NOT EXISTS config(guild_id TEXT PRIMARY KEY,name TEXT,admin_id TEXT,announcements_ch TEXT,matches_ch TEXT,results_ch TEXT,general_ch TEXT,fa_ch TEXT,teams_ch TEXT,created_at TEXT);
-        CREATE TABLE IF NOT EXISTS teams(guild_id TEXT,name TEXT,display TEXT,captain_id TEXT,wins INT DEFAULT 0,losses INT DEFAULT 0,mmr INT DEFAULT 1000,thread_id TEXT,role_id TEXT,created_at TEXT,clantag TEXT,PRIMARY KEY(guild_id,name));
+        CREATE TABLE IF NOT EXISTS teams(guild_id TEXT,name TEXT,display TEXT,captain_id TEXT,secondary_captain_id TEXT,wins INT DEFAULT 0,losses INT DEFAULT 0,mmr INT DEFAULT 1000,thread_id TEXT,role_id TEXT,created_at TEXT,clantag TEXT,PRIMARY KEY(guild_id,name));
         CREATE TABLE IF NOT EXISTS members(guild_id TEXT,team_name TEXT,user_id TEXT,PRIMARY KEY(guild_id,team_name,user_id));
         CREATE TABLE IF NOT EXISTS fa(guild_id TEXT,user_id TEXT,username TEXT,joined_at TEXT,PRIMARY KEY(guild_id,user_id));
         CREATE TABLE IF NOT EXISTS matches(id TEXT PRIMARY KEY,guild_id TEXT,week INT,team1 TEXT,team2 TEXT,score TEXT,winner TEXT,reporter TEXT,created_at TEXT,thread_id TEXT,is_finals INT DEFAULT 0,map TEXT,scheduled TEXT,reschedule_by TEXT,reschedule_to TEXT,reminder_sent INTEGER DEFAULT 0,overseer_id TEXT);
@@ -87,7 +87,7 @@ async def init_db():
         CREATE TABLE IF NOT EXISTS setup_data(guild_id TEXT PRIMARY KEY,league_name TEXT,league_category_id TEXT,matches_category_id TEXT,announcements_ch TEXT,general_ch TEXT,teams_ch TEXT,fa_ch TEXT,matches_ch TEXT,results_ch TEXT);
         CREATE TABLE IF NOT EXISTS scrim_sessions(guild_id TEXT,date TEXT,thread_id TEXT,msg_id TEXT,max_players INT DEFAULT 6,PRIMARY KEY(guild_id,date));
         CREATE TABLE IF NOT EXISTS scrim_signups(guild_id TEXT,date TEXT,user_id TEXT,position INT,PRIMARY KEY(guild_id,date,user_id));
-        CREATE TABLE IF NOT EXISTS scrim_v2(sid TEXT PRIMARY KEY,guild_id TEXT,date TEXT,thread_id TEXT,msg_id TEXT,thread_msg_id TEXT,max_players INT DEFAULT 6,scrim_title TEXT,unix_time INT,pinged INT DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS scrim_v2(sid TEXT PRIMARY KEY,guild_id TEXT,date TEXT,thread_id TEXT,msg_id TEXT,thread_msg_id TEXT,max_players INT DEFAULT 6,scrim_title TEXT,unix_time INT,pinged INT DEFAULT 0,cleanup_retry_at INT);
         CREATE TABLE IF NOT EXISTS scrim_signups_v2(sid TEXT,guild_id TEXT,user_id TEXT,position INT,PRIMARY KEY(sid,user_id));
         """)
         # Migrate: track which Sunday generation cycle has already run.
@@ -102,6 +102,9 @@ async def init_db():
         # Migrate: store the League Admin reason when /closematch is used.
         try:await db.execute("ALTER TABLE matches ADD COLUMN close_reason TEXT")
         except:pass
+        # Migrate: add optional second captain to existing teams.
+        try:await db.execute("ALTER TABLE teams ADD COLUMN secondary_captain_id TEXT")
+        except:pass
         # Migrate: add clantag column if missing
         try:await db.execute("ALTER TABLE teams ADD COLUMN clantag TEXT")
         except:pass
@@ -109,6 +112,9 @@ async def init_db():
         for col,typ in [("max_players","INT DEFAULT 6"),("scrim_title","TEXT"),("unix_time","INT"),("thread_id","TEXT"),("thread_msg_id","TEXT"),("pinged","INT DEFAULT 0")]:
             try:await db.execute(f"ALTER TABLE scrim_sessions ADD COLUMN {col} {typ}")
             except:pass
+        # Persist mixed-scrim deletion retries across scheduler iterations/restarts.
+        try:await db.execute("ALTER TABLE scrim_v2 ADD COLUMN cleanup_retry_at INT")
+        except:pass
         # Migrate legacy scrims into scrim_v2 so their threads still close
         try:
             db.row_factory=aiosqlite.Row
@@ -297,11 +303,55 @@ async def need_admin(i):
         await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return False
     return True
 
+def team_captain_ids(t):
+    if not t:return []
+    return [str(uid) for uid in (t.get("captain_id"),t.get("secondary_captain_id")) if uid]
+
 async def need_captain(i):
     t=await team_by_player(str(i.guild_id),str(i.user.id))
     if not t:await i.response.send_message("\u274c Not on team.",ephemeral=True);return False
-    if t["captain_id"]!=str(i.user.id):await i.response.send_message("\u274c Captain only.",ephemeral=True);return False
+    if str(i.user.id) not in team_captain_ids(t):await i.response.send_message("\u274c Captain only.",ephemeral=True);return False
     return t["display"]
+
+@bot.tree.command(name="addcaptain",description="Add a second captain to your team (captains only)")
+@app_commands.describe(name="Player on your team to make the second captain")
+async def addcaptain_cmd(i,name:discord.Member):
+    gid=str(i.guild_id);uid=str(i.user.id)
+    t=await team_by_player(gid,uid)
+    if not t or uid not in team_captain_ids(t):
+        await i.response.send_message("\u274c Only a captain of your team can use this command.",ephemeral=True);return
+    if t.get("secondary_captain_id"):
+        await i.response.send_message("\u274c Your team already has two captains.",ephemeral=True);return
+    target_id=str(name.id)
+    if target_id in team_captain_ids(t):
+        await i.response.send_message("\u274c That player is already a captain.",ephemeral=True);return
+    if target_id not in t["members"]:
+        await i.response.send_message("\u274c The second captain must already be on your team.",ephemeral=True);return
+    captain_role=find_role(i.guild,"Captain")
+    if not captain_role:
+        await i.response.send_message("\u274c The **Captain** role wasn't found. Ask a League Admin to run setup first.",ephemeral=True);return
+    try:
+        await name.add_roles(captain_role,reason=f"Added as second captain of {t['display']}")
+    except discord.Forbidden:
+        await i.response.send_message("\u274c I can't assign the Captain role. Check the bot's role permissions and role hierarchy.",ephemeral=True);return
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("UPDATE teams SET secondary_captain_id=? WHERE guild_id=? AND name=? AND (secondary_captain_id IS NULL OR secondary_captain_id='')",(target_id,gid,t["name"]))
+        await db.commit()
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory=aiosqlite.Row
+        async with db.execute("SELECT thread_id FROM matches WHERE guild_id=? AND winner IS NULL AND (team1=? OR team2=?) AND thread_id IS NOT NULL",(gid,t["name"],t["name"])) as cur:
+            active_threads=await cur.fetchall()
+    added_threads=0
+    for tr in active_threads:
+        try:
+            th=i.guild.get_thread(int(tr["thread_id"]))
+            if th is None: th=await i.guild.fetch_channel(int(tr["thread_id"]))
+            if isinstance(th,discord.Thread) and th.is_private():
+                await add_thread_member_safely(th,name)
+                added_threads+=1
+        except Exception as e:
+            log.warning("Could not add second captain %s to match thread %s: %s",target_id,tr["thread_id"],e)
+    await i.response.send_message(f"\u2705 {name.mention} is now the second captain of **{t['display']}** and has the same **Captain** role. Added to {added_threads} active match thread(s).")
 
 # ===== Views =====
 async def captain_team(gid,uid):
@@ -326,7 +376,7 @@ class MapVoteView(discord.ui.View):
         if not row:await i.response.send_message("Match not found.",ephemeral=True);return
         gid=str(i.guild_id)
         t1=await team_get(gid,row["team1"]);t2=await team_get(gid,row["team2"])
-        caps=[t1["captain_id"]if t1 else"",t2["captain_id"]if t2 else""]
+        caps=team_captain_ids(t1)+team_captain_ids(t2)
         if uid not in caps:await i.response.send_message("Captains only.",ephemeral=True);return
         if uid in self.p:await i.response.send_message("Already voted.",ephemeral=True);return
         self.p[uid]=mn;await i.response.send_message(f"{mn}!",ephemeral=True)
@@ -559,7 +609,9 @@ class ScheduleConfirmView(discord.ui.View):
         super().__init__(timeout=86400);self.mid=mid;self.actor_id=actor_id;self.proposer_id=proposer_id;self.sched=sched;self.unix=unix;self.thread_id=thread_id;self.done=False
     async def _check(self,i):
         if self.done:await i.response.send_message("Stale proposal.",ephemeral=True);return False
-        if str(i.user.id)!=self.actor_id:await i.response.send_message("Other captain only.",ephemeral=True);return False
+        team_name=await captain_team(str(i.guild_id),self.actor_id)
+        team=await team_get(str(i.guild_id),team_name) if team_name else None
+        if str(i.user.id) not in team_captain_ids(team):await i.response.send_message("Other captain only.",ephemeral=True);return False
         return True
     @discord.ui.button(label="\u2705 Confirm",style=discord.ButtonStyle.green)
     async def confirm(self,i,btn):
@@ -620,7 +672,8 @@ class ResultConfirmView(discord.ui.View):
             return str(score)
     @discord.ui.button(label="\u2705 Confirm Result",style=discord.ButtonStyle.green)
     async def confirm(self,i,btn):
-        if str(i.user.id)!=self.ocid:
+        opponent_team=await team_get(self.gid,self.opp_key)
+        if str(i.user.id) not in team_captain_ids(opponent_team):
             await i.response.send_message("Other captain only.",ephemeral=True);return
         score=self.score;winner=self.winner;delta=self.delta;gid=self.gid
         rep=self.rep_key;opp=self.opp_key
@@ -818,42 +871,73 @@ async def _scrim_thread(sid):
     except:return None
 
 async def close_scrim(sid,sess=None):
-    # Cleanup is bound to this scrim's unique SID and the exact Discord IDs
-    # stored for that SID. This prevents one scrim from affecting another.
-    if sess is None:sess=await get_scrim_session(sid)
-    if not sess:return
+    # Delete both the mixed-scrim thread and its signup/embed message.
+    # Keep the database row until both are confirmed gone, so failures can
+    # be retried by scrim_check five minutes later.
+    if sess is None:
+        sess=await get_scrim_session(sid)
+    if not sess:
+        return
+
     g=bot.get_guild(int(sess["guild_id"]))
-    if not g:return
-    members=await scrim_signups_active(sid)
-    queue=await scrim_queue_list(sid)
-    th=await _scrim_thread(sid)
-    if th:
-        try:await th.send("\U0001f512 **Scrim finished** - closing the thread. GG!")
-        except:pass
-        for uid in set(list(members)+list(queue)):
-            try:
-                m=g.get_member(int(uid))
-                if m:await th.remove_user(m)
-            except:pass
-        try:await th.edit(archived=True,locked=True)
-        except:pass
-        try:await th.delete(reason=f"Scrim {sid} finished")
-        except Exception as e:log.warning("scrim thread delete %s: %s",sid,e)
+    if not g:
+        log.warning("Mixed scrim cleanup cannot find guild (sid=%s)",sid)
+        return
 
-    msg_id=sess.get("msg_id")
-    if msg_id:
+    cleanup_ok=True
+
+    # 1) Delete the thread directly. No archive/lock step.
+    thread_id=sess.get("thread_id")
+    if thread_id:
         try:
-            # The message is the one stored against this exact SID.
-            for ch in g.text_channels:
-                if ch.name=="mixed-scrims":
-                    try:
-                        msg=await ch.fetch_message(int(msg_id))
-                        await msg.delete()
-                    except:pass
-                    break
-        except Exception as e:log.warning("scrim message delete %s: %s",sid,e)
+            th=g.get_thread(int(thread_id))
+            if th is None:
+                th=await g.fetch_channel(int(thread_id))
+            await th.delete(reason=f"Scrim {sid} finished")
+            log.info("Deleted mixed scrim thread (sid=%s, thread_id=%s)",sid,thread_id)
+        except discord.NotFound:
+            # Already deleted is the desired final state.
+            log.info("Mixed scrim thread already deleted (sid=%s, thread_id=%s)",sid,thread_id)
+        except Exception as e:
+            cleanup_ok=False
+            log.warning("Mixed scrim thread delete failed (sid=%s, thread_id=%s): %s",sid,thread_id,e)
 
-    async with aiosqlite.connect(DB)as db:
+    # 2) Delete the signup embed in #mixed-scrims as well.
+    msg_id=sess.get("msg_id")
+    msc=None
+    for cat in g.categories:
+        if cat.name=="Scrims":
+            msc=discord.utils.get(cat.text_channels,name="mixed-scrims")
+            if msc:
+                break
+    if msg_id:
+        if not msc:
+            cleanup_ok=False
+            log.warning("Mixed scrim signup message channel not found (sid=%s, msg_id=%s)",sid,msg_id)
+        else:
+            try:
+                msg=await msc.fetch_message(int(msg_id))
+                await msg.delete()
+                log.info("Deleted mixed scrim signup message (sid=%s, msg_id=%s)",sid,msg_id)
+            except discord.NotFound:
+                # Already deleted is the desired final state.
+                log.info("Mixed scrim signup message already deleted (sid=%s, msg_id=%s)",sid,msg_id)
+            except Exception as e:
+                cleanup_ok=False
+                log.warning("Mixed scrim signup message delete failed (sid=%s, msg_id=%s): %s",sid,msg_id,e)
+
+    if not cleanup_ok:
+        retry_at=int(datetime.now(timezone.utc).timestamp())+300
+        async with aiosqlite.connect(DB) as db:
+            await db.execute(
+                "UPDATE scrim_v2 SET cleanup_retry_at=? WHERE sid=?",
+                (retry_at,sid)
+            )
+            await db.commit()
+        log.warning("Mixed scrim cleanup will retry in 5 minutes (sid=%s)",sid)
+        return
+
+    async with aiosqlite.connect(DB) as db:
         await db.execute("DELETE FROM scrim_signups_v2 WHERE sid=?",(sid,))
         await db.execute("DELETE FROM scrim_v2 WHERE sid=?",(sid,))
         await db.commit()
@@ -1006,23 +1090,24 @@ class RescheduleView(discord.ui.View):
             db.row_factory=aiosqlite.Row
             async with db.execute("SELECT team1,team2 FROM matches WHERE id=?",(self.mid,))as cur:
                 row=await cur.fetchone()
-        if not row:return None
-        t1=await team_get(gid,row["team1"]);t2=await team_get(gid,row["team2"])
-        caps=[t1["captain_id"]if t1 else"",t2["captain_id"]if t2 else""]
-        other=[c for c in caps if c!=user_id]
-        return other[0]if other else None
+        if not row:return []
+        own_team=await team_by_player(gid,user_id)
+        if not own_team:return []
+        other_name=row["team2"] if own_team["name"]==row["team1"] else row["team1"]
+        other_team=await team_get(gid,other_name)
+        return team_captain_ids(other_team)
     @discord.ui.button(label="Approve",style=discord.ButtonStyle.green)
     async def approve(self,i,btn):
         gid=str(i.guild_id)
         other=await self._other_cap(gid,str(i.user.id))
-        if not other or str(i.user.id)!=other:await i.response.send_message("Other captain only.",ephemeral=True);return
+        if not other or str(i.user.id) not in other:await i.response.send_message("Other captain only.",ephemeral=True);return
         async with aiosqlite.connect(DB)as db:await db.execute("UPDATE matches SET scheduled=?, reminder_sent=0 WHERE id=?",(self.nt,self.mid));await db.commit()
         for c in self.children:c.disabled=True
         await i.response.edit_message(content=f"Rescheduled to **{self.nt}**",view=self)
     @discord.ui.button(label="Deny",style=discord.ButtonStyle.red)
     async def deny(self,i,btn):
         other=await self._other_cap(str(i.guild_id),str(i.user.id))
-        if not other or str(i.user.id)!=other:await i.response.send_message("Other captain only.",ephemeral=True);return
+        if not other or str(i.user.id) not in other:await i.response.send_message("Other captain only.",ephemeral=True);return
         for c in self.children:c.disabled=True;await i.response.edit_message(content="Denied.",view=self)
 
 # ===== Gen Matches =====
@@ -3019,7 +3104,8 @@ async def scrim_check():
                         await msc.send(txt)
                 async with aiosqlite.connect(DB)as db:
                     await db.execute("UPDATE scrim_v2 SET pinged=1 WHERE sid=?",(sid,));await db.commit()
-            if diff<=-5400:
+            retry_at=sess.get("cleanup_retry_at")
+            if diff<=-5400 and (not retry_at or int(retry_at)<=int(now.timestamp())):
                 await close_scrim(sid,sess)
                 continue
         # Midnight cleanup
