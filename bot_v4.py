@@ -1111,41 +1111,112 @@ class RescheduleView(discord.ui.View):
         for c in self.children:c.disabled=True;await i.response.edit_message(content="Denied.",view=self)
 
 # ===== Gen Matches =====
-async def gen_matches(guild,c,force=False):
+def _build_week_pairs(names, history, week, seed):
+    """Build a 2-matches-per-team schedule, minimizing repeats and recent rematches.
+
+    For 3+ teams this creates a cycle: each team appears in exactly two matches
+    and no pairing appears twice in the same generated week. With only two teams,
+    playing the same opponent twice is unavoidable if both teams must play twice.
+    """
+    names = list(names)
+    n = len(names)
+    if n < 2:
+        return []
+    if n == 2:
+        return [(names[0], names[1]), (names[0], names[1])]
+
+    # History is keyed by normalized pair and stores every week in which it played.
+    def pair_cost(a, b):
+        weeks = history.get(_pairkey(a, b), [])
+        if not weeks:
+            return 0
+        last_week = max(weeks)
+        gap = max(0, int(week) - int(last_week))
+        # Strongly avoid a week-to-week rematch. If all opponents have been faced,
+        # prefer the least-recently-played and least-frequent pairings.
+        recent_penalty = 18000 if gap == 1 else (7000 if gap == 2 else (2500 if gap == 3 else 0))
+        return 10000 + (len(weeks) * 750) + recent_penalty
+
+    def cycle_score(order):
+        return sum(pair_cost(order[i], order[(i + 1) % n]) for i in range(n))
+
+    # Seeded randomness makes the same input produce the same proposed schedule,
+    # while allowing different weeks/team lists to explore different cycles.
+    rng = random.Random(str(seed))
+    best_order = names[:]
+    best_score = float("inf")
+    iterations = min(2500, max(500, n * 100))
+    restarts = 12
+
+    for _ in range(restarts):
+        order = names[:]
+        rng.shuffle(order)
+        score = cycle_score(order)
+        if score < best_score:
+            best_order, best_score = order[:], score
+
+        # Simulated annealing explores alternative cycles, including when every
+        # possible opponent has already been faced at least once.
+        temperature = 5000.0
+        cooling = 0.995
+        for _step in range(iterations):
+            i, j = rng.sample(range(n), 2)
+            order[i], order[j] = order[j], order[i]
+            new_score = cycle_score(order)
+            delta = new_score - score
+            if delta <= 0 or rng.random() < (2.718281828 ** (-delta / max(temperature, 1.0))):
+                score = new_score
+                if score < best_score:
+                    best_order, best_score = order[:], score
+            else:
+                order[i], order[j] = order[j], order[i]
+            temperature *= cooling
+
+    return [(best_order[i], best_order[(i + 1) % n]) for i in range(n)]
+
+
+async def gen_matches(guild,c,force=False,target_week=None):
     gid=str(guild.id)
     async with aiosqlite.connect(DB)as db:
         db.row_factory=aiosqlite.Row
         async with db.execute("SELECT weeks_done FROM season WHERE guild_id=?",(gid,))as cur:
             row=await cur.fetchone()
     if not row:return
-    week=row["weeks_done"]+1
+    # An explicit target_week generates that week without changing season progress.
+    # Normal/automatic generation still targets the next week.
+    week=int(target_week) if target_week is not None else int(row["weeks_done"])+1
+    if week<1:return
     if week>SEASON_WEEKS and not force:return
     ts=await teams_all(gid)
     eligible=[t for t in ts if len(t.get("members",[]))>=3]
     names=[t["display"]for t in eligible]
     n=len(names)
     if n<2:return
-    # Matches per week by team count
-    rounds_needed=n if n%2 else n-1
-    mpw=1 if rounds_needed<=SEASON_WEEKS else 2
-    # Load already-scheduled pairings so nobody meets twice before all have met
-    played=set()
+
+    # Read the full non-finals history for this guild. Pair frequency and the
+    # latest week played are both used so repeat opponents are spread apart.
+    history={}
     async with aiosqlite.connect(DB)as db:
-        async with db.execute("SELECT team1,team2 FROM matches WHERE guild_id=?",(gid,))as cur:
-            for r in await cur.fetchall():
-                played.add(_pairkey(r[0],r[1]))
+        async with db.execute(
+            "SELECT team1,team2,week FROM matches WHERE guild_id=? AND COALESCE(is_finals,0)=0",
+            (gid,)
+        )as cur:
+            for a,b,played_week in await cur.fetchall():
+                if not a or not b:
+                    continue
+                try:
+                    played_week=int(played_week or 0)
+                except (TypeError,ValueError):
+                    played_week=0
+                history.setdefault(_pairkey(a,b),[]).append(played_week)
+
     names_sorted=sorted(names,key=str.lower)
-    rounds=[make_pairs(names_sorted,rnd) for rnd in range(1,rounds_needed+1)]
-    # Prefer rounds with the most not-yet-played pairings (clean rounds first)
-    rounds.sort(key=lambda r:-sum(1 for a,b in r if _pairkey(a,b)not in played))
-    target=mpw*(n//2)
-    all_pairs=[];used=set()
-    for rnd in rounds:
-        if len(all_pairs)>=target:break
-        for a,b in rnd:
-            k=_pairkey(a,b)
-            if k in used:continue
-            used.add(k);played.add(k);all_pairs.append((a,b))
+    all_pairs=_build_week_pairs(
+        names_sorted,
+        history,
+        week,
+        seed=f"{gid}:{week}:{'|'.join(names_sorted)}"
+    )
     if not all_pairs:return
     match_ids=[]
     async with aiosqlite.connect(DB)as db:
@@ -1156,7 +1227,7 @@ async def gen_matches(guild,c,force=False):
                 (mid,gid,week,a,b,datetime.now(timezone.utc).isoformat())
             )
             match_ids.append((mid,a,b))
-        if not force:
+        if not force and target_week is None:
             now_cycle=datetime.now(timezone.utc)
             cycle_date=(now_cycle.date()-timedelta(days=(now_cycle.weekday()+1)%7)).isoformat()
             await db.execute(
@@ -1185,17 +1256,17 @@ async def gen_matches(guild,c,force=False):
                             added.add(str(m.id))
                 await th.send(f"⚡ **{a} vs {b} - Week {week}**\nEveryone's here! **Captains, use `/schedule` to choose a match day and time.** Once both captains confirm, the map vote will open.")
             except Exception as e:log.warning("Thread: %s",e)
-        lines=[f"\u26a1 **Week {week} Matches**",""]+[f"\u2022 **{a}** vs **{b}**"for _,a,b in match_ids]+["","Check threads!"]
+        lines=[f"⚡ **Week {week} Matches**",""]+[f"• **{a}** vs **{b}**"for _,a,b in match_ids]+["","Check threads!"]
         await ch.send("\n".join(lines))
         c2=await cfg_get(gid)
-        if c2 and c2.get("announcements_ch"):
+        if target_week is None and c2 and c2.get("announcements_ch"):
             ann=guild.get_channel(int(c2["announcements_ch"]))
             if ann:
                 weeks_left=SEASON_WEEKS-week
                 ts_all=await teams_all(gid)
                 total_matches=sum(t["wins"]+t["losses"]for t in ts_all)//2
-                finals_note="\U0001f3c6 Finals next week! Top 4 teams advance."if weeks_left==0 else f"Top 4 by rank advance to finals after Week {SEASON_WEEKS}."
-                await ann.send(f"\U0001f4ca **Season Update  -  Week {week}/{SEASON_WEEKS}**\n\nWeeks remaining: **{weeks_left}**\nMatches played: **{total_matches}**\nTeams in league: **{len(ts_all)}**\n\n{finals_note}")
+                finals_note="🏆 Finals next week! Top 4 teams advance."if weeks_left==0 else f"Top 4 by rank advance to finals after Week {SEASON_WEEKS}."
+                await ann.send(f"📊 **Season Update  -  Week {week}/{SEASON_WEEKS}**\n\nWeeks remaining: **{weeks_left}**\nMatches played: **{total_matches}**\nTeams in league: **{len(ts_all)}**\n\n{finals_note}")
     return len(match_ids)
 
 # ===== /guide =====
@@ -2693,9 +2764,11 @@ async def recordadjust(i,team:str,wins:int=0,losses:int=0):
     await refresh_leaderboard(i.guild)
     await refresh_rosters(i.guild)
 
-test=app_commands.Group(name="test",description="Test (Admin)")
-@bot.tree.command(name="generatematches",description="Generate the next league week's matches")
-async def generate_matches_cmd(i):
+generatematch=app_commands.Group(name="generatematch",description="Generate and manage league match fixtures")
+
+@generatematch.command(name="week",description="Generate matches for a specific week without changing the week counter")
+@app_commands.describe(number="Week number to generate")
+async def generate_week_cmd(i,number:app_commands.Range[int,1,SEASON_WEEKS]):
     if not await need_admin(i):return
     gid=str(i.guild_id)
     c=await cfg_get(gid)
@@ -2703,6 +2776,164 @@ async def generate_matches_cmd(i):
         await i.response.send_message("❌ No league.",ephemeral=True)
         return
 
+    await i.response.defer(ephemeral=True)
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory=aiosqlite.Row
+        async with db.execute(
+            "SELECT weeks_done FROM season WHERE guild_id=?",
+            (gid,)
+        ) as cur:
+            season=await cur.fetchone()
+        async with db.execute(
+            "SELECT COUNT(*) FROM matches WHERE guild_id=? AND week=?",
+            (gid,number)
+        ) as cur:
+            existing=(await cur.fetchone())[0]
+
+    if not season:
+        await i.followup.send("❌ No active season found.",ephemeral=True)
+        return
+    if existing:
+        await i.followup.send(
+            f"❌ **Week {number}** already has **{existing}** match record(s). "
+            "No new matches were generated. Use the reset command after it is added if you need to replace these fixtures.",
+            ephemeral=True
+        )
+        return
+
+    try:
+        n=await gen_matches(i.guild,c,force=True,target_week=number)
+    except Exception:
+        log.exception("Specific-week match generation failed for Week %s",number)
+        await i.followup.send(
+            "❌ Match generation failed. Check the bot logs for details.",
+            ephemeral=True
+        )
+        return
+
+    if not n:
+        await i.followup.send(
+            f"❌ No matches were generated for **Week {number}**. "
+            "Check that at least two eligible teams have 3+ players.",
+            ephemeral=True
+        )
+        return
+
+    await i.followup.send(
+        f"✅ Generated **Week {number}** — **{n}** match(es). "
+        f"The season counter remains at **Week {int(season['weeks_done'])}/{SEASON_WEEKS}**.",
+        ephemeral=True
+    )
+
+
+
+@generatematch.command(name="reset",description="Remove unfinished match fixtures and their open private threads for a week")
+@app_commands.describe(week="Week number to reset")
+async def reset_week_cmd(i, week:app_commands.Range[int,1,SEASON_WEEKS]):
+    if not await need_admin(i):return
+    gid=str(i.guild_id)
+    c=await cfg_get(gid)
+    if not c:
+        await i.response.send_message("❌ No league.",ephemeral=True)
+        return
+
+    await i.response.defer(ephemeral=True)
+
+    # Refuse to remove results, including forfeits or matches with a winner.
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory=aiosqlite.Row
+        async with db.execute(
+            "SELECT id,team1,team2,score,winner,thread_id FROM matches "
+            "WHERE guild_id=? AND week=? AND COALESCE(is_finals,0)=0",
+            (gid,week)
+        ) as cur:
+            rows=await cur.fetchall()
+
+    if not rows:
+        await i.followup.send(f"ℹ️ Week {week} has no match records to reset.",ephemeral=True)
+        return
+
+    completed=[r for r in rows if r["score"] is not None or r["winner"] is not None]
+    if completed:
+        await i.followup.send(
+            f"❌ Reset cancelled: Week {week} contains {len(completed)} match(es) with a score or winner. "
+            "Completed results and forfeits are protected.",
+            ephemeral=True
+        )
+        return
+
+    matches_ch=guild_channel=None
+    try:
+        matches_ch=i.guild.get_channel(int(c["matches_ch"]))
+    except (KeyError,TypeError,ValueError):
+        matches_ch=None
+
+    # Only delete active/open private threads directly associated with this week's rows.
+    # Archived/closed threads are intentionally left untouched.
+    active_threads={}
+    if matches_ch and isinstance(matches_ch,discord.TextChannel):
+        for th in getattr(matches_ch,"threads",[]):
+            active_threads[str(th.id)]=th
+    for th in getattr(i.guild,"threads",[]):
+        active_threads.setdefault(str(th.id),th)
+
+    thread_errors=[]
+    deleted_threads=0
+    for r in rows:
+        tid=r["thread_id"]
+        if not tid:
+            continue
+        th=active_threads.get(str(tid))
+        if th is None:
+            # A thread absent from active thread collections is treated as closed/archived.
+            continue
+        if not isinstance(th,discord.Thread) or th.type != discord.ChannelType.private_thread:
+            continue
+        try:
+            await th.delete(reason=f"Admin reset of unfinished Week {week} match {r['id']}")
+            deleted_threads+=1
+        except discord.HTTPException as e:
+            thread_errors.append(f"{r['team1']} vs {r['team2']}: {type(e).__name__}")
+
+    if thread_errors:
+        await i.followup.send(
+            f"⚠️ Reset stopped before deleting database records because {len(thread_errors)} open private thread(s) "
+            "could not be deleted. Some threads may already have been removed; check the week before retrying. "
+            "Season counters were not changed.\n" + "\n".join(f"• {x}" for x in thread_errors),
+            ephemeral=True
+        )
+        return
+
+    # Delete only the selected week's non-finals match rows. Season state is untouched.
+    async with aiosqlite.connect(DB) as db:
+        await db.execute(
+            "DELETE FROM matches WHERE guild_id=? AND week=? AND COALESCE(is_finals,0)=0",
+            (gid,week)
+        )
+        await db.commit()
+
+    await i.followup.send(
+        f"✅ Reset Week {week}: removed {len(rows)} unfinished match record(s) and "
+        f"{deleted_threads} open private thread(s). Archived/closed threads were left untouched. "
+        "The season counter and generation-cycle date were not changed.",
+        ephemeral=True
+    )
+
+bot.tree.add_command(generatematch)
+
+@generatematch.command(name="test",description="Generate playable test fixtures for the current week without advancing the week counter")
+async def generate_test_matches_cmd(i):
+    if not await need_admin(i):return
+    gid=str(i.guild_id)
+    c=await cfg_get(gid)
+    if not c:
+        await i.response.send_message("\u274c No league.",ephemeral=True)
+        return
+
+    await i.response.defer(ephemeral=True)
+
+    # weeks_done is the current week once that week's fixtures have been generated.
+    # If the season has not generated any week yet, use Week 1.
     async with aiosqlite.connect(DB) as db:
         db.row_factory=aiosqlite.Row
         async with db.execute(
@@ -2712,82 +2943,56 @@ async def generate_matches_cmd(i):
             season=await cur.fetchone()
 
     if not season:
-        await i.response.send_message("❌ No active season found.",ephemeral=True)
+        await i.followup.send("\u274c No active season found.",ephemeral=True)
         return
 
-    next_week=int(season["weeks_done"])+1
-    if next_week>SEASON_WEEKS:
-        await i.response.send_message(
-            f"❌ The season is already at **Week {season['weeks_done']}/{SEASON_WEEKS}**.",
-            ephemeral=True
-        )
-        return
+    current_week=max(1,int(season["weeks_done"] or 0))
 
+    # Do not silently duplicate existing fixtures. Use /generatematch reset week:<week>
+    # first if the current week's unfinished fixtures need to be replaced.
     async with aiosqlite.connect(DB) as db:
         async with db.execute(
             "SELECT COUNT(*) FROM matches WHERE guild_id=? AND week=?",
-            (gid,next_week)
+            (gid,current_week)
         ) as cur:
             existing=(await cur.fetchone())[0]
 
     if existing:
-        await i.response.send_message(
-            f"❌ **Week {next_week}** already has **{existing}** match record(s). "
-            "No new matches were generated.",
+        await i.followup.send(
+            f"\u274c Week {current_week} already has {existing} match record(s). "
+            f"No test fixtures were created. If these are all unfinished, use "
+            f"`/generatematch reset week:{current_week}` first.",
             ephemeral=True
         )
         return
 
-    await i.response.defer(ephemeral=True)
-
-    # Use the normal generator so pairing logic stays identical to automation,
-    # but do not use force=True: we want weeks_done to advance normally.
     try:
-        n=await gen_matches(i.guild,c,force=False)
-    except Exception as e:
-        log.exception("Manual match generation failed: %s",e)
+        # Explicit target_week prevents this test path from changing weeks_done or
+        # last_generation_cycle. These are ordinary match records, so the existing
+        # scheduling, result confirmation, wins/losses, and MMR flow remains available.
+        n=await gen_matches(i.guild,c,force=True,target_week=current_week)
+    except Exception:
+        log.exception("Test match generation failed for Week %s",current_week)
         await i.followup.send(
-            "❌ Match generation failed. Nothing was completed. "
-            "Check the bot logs for the exact error.",
+            "\u274c Test match generation failed. Check the bot logs for details.",
             ephemeral=True
         )
         return
 
     if not n:
         await i.followup.send(
-            f"❌ No matches were generated for **Week {next_week}**. "
+            f"\u274c No test matches were generated for Week {current_week}. "
             "Check that at least two eligible teams have 3+ players.",
             ephemeral=True
         )
         return
 
-    # Mark the Sunday generation cycle that this manual recovery fulfilled.
-    now_cycle=datetime.now(timezone.utc)
-    if now_cycle.weekday()==6:
-        cycle_date=now_cycle.date()
-    else:
-        cycle_date=now_cycle.date()-timedelta(days=(now_cycle.weekday()+1)%7)
-    async with aiosqlite.connect(DB) as db:
-        await db.execute(
-            "UPDATE season SET last_generation_cycle=? WHERE guild_id=?",
-            (cycle_date.isoformat(),gid)
-        )
-        await db.commit()
-
     await i.followup.send(
-        f"✅ Generated **Week {next_week}** — **{n}** match(es). "
-        f"The season has advanced to **Week {next_week}/{SEASON_WEEKS}**.",
+        f"\u2705 Created {n} playable test match(es) for **Week {current_week}** in "
+        f"<#{c['matches_ch']}>. They use the normal match result flow and can affect "
+        "wins, losses, and MMR. The week counter and generation-cycle date were not changed.",
         ephemeral=True
     )
-
-@test.command(name="generatematches",description="Force generate")
-async def test_gen(i):
-    if not await need_admin(i):return
-    gid=str(i.guild_id);c=await cfg_get(gid)
-    if not c:await i.response.send_message("\u274c No league.",ephemeral=True);return
-    await i.response.defer();n=await gen_matches(i.guild,c,force=True)
-    await i.followup.send(f"\u2705 {n or 0} matches in <#{c['matches_ch']}>.")
-bot.tree.add_command(test)
 
 @bot.tree.command(name="schedule",description="Schedule a match")
 async def schedule_cmd(i):
