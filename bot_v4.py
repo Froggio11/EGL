@@ -905,13 +905,19 @@ async def close_scrim(sid,sess=None):
     # 2) Delete the signup embed in #mixed-scrims as well.
     msg_id=sess.get("msg_id")
     msc=None
+    scrims_category_exists=False
     for cat in g.categories:
         if cat.name=="Scrims":
+            scrims_category_exists=True
             msc=discord.utils.get(cat.text_channels,name="mixed-scrims")
-            if msc:
-                break
+            break
     if msg_id:
-        if not msc:
+        if not scrims_category_exists:
+            # If the whole Scrims category is gone, its signup message is gone too.
+            log.info("Scrims category no longer exists; signup message is already gone (sid=%s)",sid)
+        elif not msc:
+            # Category exists but expected channel cannot be found. Keep the DB row
+            # so this can be retried/logged rather than silently forgetting the message.
             cleanup_ok=False
             log.warning("Mixed scrim signup message channel not found (sid=%s, msg_id=%s)",sid,msg_id)
         else:
@@ -1315,7 +1321,7 @@ async def scrimguide_cmd(i):
     embed.add_field(name="\u23f1\ufe0f Before you sign up",value="Scrims usually last **around an hour**.\nMake sure you have the **time and the charge** before you sign up - don't leave your team short.",inline=False)
     embed.add_field(name="\U0001f6aa If you drop out",value="You **have to get a new player in** to replace you.\nDon't just sign off and leave - the next person in the **Up Next** queue gets pulled in automatically, but it's on you to make sure the spot is filled.",inline=False)
     embed.add_field(name="\U0001f9f5 The scrim thread",value="Every scrim gets its own thread - everyone signed up (and everyone in the queue) is added automatically.\n\nIn the thread you'll see the live list, plus:\n- **Sign Off** - drop out\n- **Ask for Queue** - ping the next player in line to fill a spot",inline=False)
-    embed.add_field(name="\u23f0 Reminder",value="**5 minutes before start**, everyone in the scrim gets pinged in the thread.\nGet a lobby ready and drop the code in the chat!",inline=False)
+    embed.add_field(name="\u23f0 Reminder",value="**15 minutes before start**, signed-up players get pinged in the thread. Queued players are not pinged.\nGet a lobby ready and drop the code in the chat!",inline=False)
     await i.response.send_message(embed=embed)
 
 # ===== /setup /setchannel /league /team /disband /teaminfo /captain /match /stats /fa /mmr /test /schedule /reschedule /backup /restore =====
@@ -3273,51 +3279,73 @@ async def bef():await bot.wait_until_ready()
 @tasks.loop(minutes=1)
 async def scrim_check():
     now=datetime.now(timezone.utc)
-    hour=now.hour;minute=now.minute
+    today=now.strftime("%Y-%m-%d")
     for g in bot.guilds:
         gid=str(g.id)
         msc=None
         for cat in g.categories:
             if cat.name=="Scrims":
-                for ch in cat.text_channels:
-                    if ch.name=="mixed-scrims":msc=ch;break
-        if not msc:continue
-        if not has_scrims(g):continue
+                msc=discord.utils.get(cat.text_channels,name="mixed-scrims")
+                break
 
-        # Every 5 min - refresh embeds for every still-active scrim.
-        # Do not filter by calendar date: a scrim's SID/unix_time is its identity.
-        if minute%5==0:
-            for s in await all_scrims(gid):
-                await update_scrim_embed(s["sid"])
+        # Cleanup must continue even if #mixed-scrims or the Scrims category
+        # was deleted/renamed; otherwise old thread records would never be retried.
+        sessions=await all_scrims(gid)
 
-        # 5-min ping and auto-close, bound to each scrim's unique SID/time.
-        for sess in await all_scrims(gid):
+        # Refresh signup embeds only while their channel is available.
+        if msc and now.minute%5==0:
+            for sess in sessions:
+                await update_scrim_embed(sess["sid"])
+
+        # Close each scrim 90 minutes after its scheduled start. Legacy rows with
+        # no unix_time are cleaned once their stored date is older than today.
+        for sess in sessions:
             sid=sess["sid"]
-            if not sess.get("unix_time"):continue
-            dt=datetime.fromtimestamp(sess["unix_time"],tz=timezone.utc)
-            diff=(dt-now).total_seconds()
-            if 0<diff<=300 and not sess.get("pinged"):
+            unix_time=sess.get("unix_time")
+            if unix_time:
+                diff=(int(unix_time)-int(now.timestamp()))
+                should_close=diff<=-5400
+                should_ping=0<diff<=900
+            else:
+                should_close=bool(sess.get("date") and sess["date"]<today)
+                should_ping=False
+
+            if should_ping and not sess.get("pinged"):
                 members=await scrim_signups_active(sid)
-                if members:
-                    pings=" ".join(f"<@{uid}>"for uid in members)
-                    txt=f"\U0001f514 **Scrim starting in 5 minutes!**\n\nGet a lobby ready and drop the code in this chat.\n{pings}"
-                    th=g.get_thread(int(sess["thread_id"]))if sess.get("thread_id")else None
+                if not members:
+                    # No active signups to notify; mark this reminder as handled.
+                    async with aiosqlite.connect(DB) as db:
+                        await db.execute("UPDATE scrim_v2 SET pinged=1 WHERE sid=?",(sid,))
+                        await db.commit()
+                else:
+                    pings=" ".join(f"<@{uid}>" for uid in members)
+                    txt=f"🔔 **Scrim starting in 15 minutes!**\n\nGet a lobby ready and drop the code in this chat.\n{pings}"
+                    th=g.get_thread(int(sess["thread_id"])) if sess.get("thread_id") else None
+                    sent=False
                     if th:
-                        try:await th.send(txt)
-                        except:pass
-                    else:
-                        await msc.send(txt)
-                async with aiosqlite.connect(DB)as db:
-                    await db.execute("UPDATE scrim_v2 SET pinged=1 WHERE sid=?",(sid,));await db.commit()
+                        try:
+                            await th.send(txt, allowed_mentions=discord.AllowedMentions(users=True))
+                            sent=True
+                        except discord.NotFound:
+                            log.warning("Mixed scrim reminder thread not found (sid=%s, thread_id=%s)",sid,sess.get("thread_id"))
+                        except Exception as e:
+                            log.warning("Mixed scrim 15-minute ping failed (sid=%s): %s",sid,e)
+                    if not sent and msc:
+                        try:
+                            await msc.send(txt, allowed_mentions=discord.AllowedMentions(users=True))
+                            sent=True
+                        except Exception as e:
+                            log.warning("Mixed scrim 15-minute fallback ping failed (sid=%s): %s",sid,e)
+                    # Only mark sent after a successful Discord message, so transient
+                    # failures are retried on the next loop instead of losing the ping.
+                    if sent:
+                        async with aiosqlite.connect(DB) as db:
+                            await db.execute("UPDATE scrim_v2 SET pinged=1 WHERE sid=?",(sid,))
+                            await db.commit()
+
             retry_at=sess.get("cleanup_retry_at")
-            if diff<=-5400 and (not retry_at or int(retry_at)<=int(now.timestamp())):
+            if should_close and (not retry_at or int(retry_at)<=int(now.timestamp())):
                 await close_scrim(sid,sess)
-                continue
-        # Midnight cleanup
-        if hour==0 and minute==0:
-            async with aiosqlite.connect(DB)as db:
-                await db.execute("DELETE FROM scrim_signups_v2 WHERE guild_id=? AND sid IN (SELECT sid FROM scrim_v2 WHERE guild_id=? AND date<?)",(gid,gid,today))
-                await db.execute("DELETE FROM scrim_v2 WHERE guild_id=? AND date<?",(gid,today));await db.commit()
 
 @scrim_check.before_loop
 async def scrim_bef():await bot.wait_until_ready()
