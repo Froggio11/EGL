@@ -694,17 +694,22 @@ class ResultConfirmView(discord.ui.View):
                 await i.response.send_message("This match has already been recorded.",ephemeral=True);return
 
             finals_type=int(match["is_finals"] or 0)
-            if finals_type in (1,3):
+            if finals_type in (1,2,3):
                 try:
                     sa,sb=[int(x) for x in score.split("-")]
                 except Exception:
-                    await i.response.send_message("\u274c Finals results must be a BO5 score such as **3-0**, **3-1**, or **3-2**.",ephemeral=True);return
-                if sorted((sa,sb)) not in ([0,3],[1,3],[2,3]):
-                    await i.response.send_message("\u274c Finals results must be **3-0**, **3-1**, or **3-2**.",ephemeral=True);return
+                    expected = "BO7" if finals_type == 2 else "BO5"
+                    await i.response.send_message(f"\u274c {expected} finals results must be a valid score.",ephemeral=True);return
+                target = 4 if finals_type == 2 else 3
+                valid_scores = [(target, other) for other in range(target)] + [(other, target) for other in range(target)]
+                if (sa,sb) not in valid_scores:
+                    if finals_type == 2:
+                        await i.response.send_message("\u274c Grand Final results must be **4-0**, **4-1**, **4-2**, or **4-3** (in either order).",ephemeral=True);return
+                    await i.response.send_message("\u274c Finals results must be **3-0**, **3-1**, or **3-2** (in either order).",ephemeral=True);return
                 if winner != (match["team1"] if sa > sb else match["team2"]):
-                    await i.response.send_message("\u274c The winner does not match the BO5 score.",ephemeral=True);return
+                    await i.response.send_message(f"\u274c The winner does not match the {'BO7' if finals_type == 2 else 'BO5'} score.",ephemeral=True);return
 
-            if finals_type in (1,3):
+            if finals_type in (1,2,3):
                 # Finals do not change regular-season MMR or W/L.
                 await db.execute(
                     "UPDATE matches SET score=?,winner=? WHERE id=? AND winner IS NULL",
@@ -718,26 +723,33 @@ class ResultConfirmView(discord.ui.View):
 
         c=self.cfg
         finals_type=int(match["is_finals"] or 0)
-        if finals_type in (1,3):
+        if finals_type in (1,2,3):
             try:
                 sa,sb=[int(x) for x in score.split("-")]
             except Exception:
                 sa,sb=0,0
+            display_score = score if winner == match["team1"] else f"{sb}-{sa}"
             if finals_type==1:
                 wp,lp=sa,sb
                 if winner==match["team2"]:wp,lp=sb,sa
                 msg=(
                     f"\U0001f3c6 **FINALS RESULT** \U0001f3c6\n\n"
-                    f"**{winner} {score} {l_disp}**\n\n"
+                    f"**{winner} {display_score} {l_disp}**\n\n"
                     f"\U0001f4ca Finals Points Earned:\n"
                     f"\u2022 **{winner}: +{wp}**\n"
                     f"\u2022 **{l_disp}: +{lp}**\n\n"
                     f"Round-robin Finals match recorded."
                 )
+            elif finals_type==2:
+                msg=(
+                    f"\U0001f3c6🔥 **GRAND FINAL RESULT** 🔥\n\n"
+                    f"**{winner} {display_score} {l_disp}**\n\n"
+                    f"Grand Final BO7 recorded. No regular-season MMR/W-L or round-robin Finals Points are changed."
+                )
             else:
                 msg=(
                     f"\u2694\ufe0f **FINALS TIEBREAKER RESULT** \u2694\ufe0f\n\n"
-                    f"**{winner} {score} {l_disp}**\n\n"
+                    f"**{winner} {display_score} {l_disp}**\n\n"
                     f"Tiebreaker recorded. No regular-season MMR/W-L or Finals Points are changed."
                 )
             if c and c.get("results_ch"):
@@ -753,7 +765,7 @@ class ResultConfirmView(discord.ui.View):
                     w_before=w_after-delta
                     l_before=l_after+delta
                     await rc.send(
-                        f"\u26a1 **{winner} {score} {l_disp}**\n"
+                        f"\u26a1 **{winner} {display_score} {l_disp}**\n"
                         f"Winner: **{winner}**\n"
                         f"**{w_key}**: **{w_before} \u2192 {w_after} MMR** (**+{delta} MMR**)\n"
                         f"**{l_key}**: **{l_before} \u2192 {l_after} MMR** (**-{delta} MMR**)\n"
@@ -1280,21 +1292,20 @@ async def gen_matches(guild,c,force=False,target_week=None):
 async def guide_cmd(i):
     if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
     embed1=discord.Embed(title="\U0001f4d6 EGL - Elite Goon League",description="Welcome to the EGL, our own 3v3 competitive league for Elements Divided.",color=0x5865F2)
-    embed1.add_field(name="\U0001f3c6 League Format",value="- Teams of **up to 5 players**\n- Season lasts **8 weeks**\n- Matches every **Sunday 10pm GMT**\n- You play **1 match a week** - sometimes **2** if there are lots of teams, so everyone gets to play everyone\n- Captains vote on map (coin flip on tie)\n- **Top 4** advance to Finals, then Grand Final!",inline=False)
+    embed1.add_field(name="\U0001f3c6 League Format",value="- Teams of **up to 5 players**\n- Season lasts **8 weeks**\n- New weekly fixtures are generated on **Sunday at 10pm GMT**\n- Each eligible team is scheduled for **2 matches per week**\n- The generator prioritizes opponents you have not faced and spreads repeat matchups apart when possible\n- Captains vote on map (coin flip on tie)\n- **Top 4** advance to Finals, then Grand Final!",inline=False)
     embed1.add_field(name="\U0001f4ca Ranks",value="\U0001f7e4 Awakened\n\u26aa Adept\n\U0001f7e1 **Elementalist** *(start)*\n\U0001f7e2 Master\n\U0001f535 Ascendant\n\U0001f451 Avatar",inline=True)
     embed1.add_field(name="MMR System",value="**Who you play matters:**\nWin vs a stronger team = **bigger gain**\nWin vs a weaker team = **smaller gain**\nLose vs a stronger team = **smaller loss**\nLose vs a weaker team = **bigger loss**\n\n**How you play matters too:**\nSweep (3-0) = **bigger reward**\nClose game (3-2) = **smaller reward**",inline=True)
     embed1.add_field(name="\u23f1\ufe0f Rules",value="- **24h cooldown** after leaving/disbanding\n- Returning players inherit **old team's MMR**",inline=False)
     await i.response.send_message(embed=embed1)
     flow_embed=discord.Embed(title="\U0001f451 Captain's Role & How a Match Works",color=0xe67e22)
     flow_embed.add_field(name="What is the Captain?",value="The **captain** is the team leader. They:\n- Created the team\n- Invite & kick players\n- Vote on the map\n- Schedule matches\n- Report results\n\n*Only the captain can do these things!*",inline=False)
-    flow_embed.add_field(name="\U0001f504 Match Flow - Step by Step",value="**1.** Matches are generated every **Sunday 10pm GMT**\n**2.** A private thread appears in #matches for your team\n**3.** Both captains **vote on the map** in that thread\n**4.** Captain picks a time with `/schedule` - other captain confirms\n**5.** Play the match! (BO5, first to **3 wins**)\n**6.** Winning captain reports with `/match result` - other captain confirms\n**7.** Result posts to #results, MMR updates, done!\n",inline=False)
+    flow_embed.add_field(name="\U0001f504 Match Flow - Step by Step",value="**1.** Weekly fixtures are normally generated on **Sunday at 10pm GMT**\n**2.** A private thread appears in #matches for each match\n**3.** Both captains **vote on the map** in that thread\n**4.** A captain opens `/schedule` to pick a time; the other captain confirms\n**5.** Play the match! (BO5, first to **3 wins**)\n**6.** The winning captain reports with `/match result`; the other captain confirms\n**7.** The result posts to #results and MMR updates\n",inline=False)
     flow_embed.set_footer(text="If you're ever confused, ask a League Admin!")
     await i.followup.send(embed=flow_embed)
-    embed2=discord.Embed(title="\U0001f4cb Commands",color=0x5865F2)
-    embed2.add_field(name="\u2694\ufe0f Team",value="`/team create` - Start a team (you become captain)\n`/team invite @player` - Invite someone\n`/team kick @player` - Remove someone\n`/team leave` - Leave your team\n`/disband` - Delete your team\n`/captain swap @player` - Transfer captain\n`/teaminfo name:Name` - Look up any team",inline=False)
-    embed2.add_field(name="\U0001f4c5 Match *(captains only, in match thread)*",value="`/schedule 05 Aug 19:00` - Set match time\n`/reschedule 05 Aug 20:00` - Change time (other captain approves)\n`/match result opponent:Name score:2-1` - Report result",inline=False)
-    embed2.add_field(name="\U0001f4ca Stats",value="`/teaminfo name:Name` - Rank, MMR, progress bar\n`/leaderboard` - Full leaderboard (live)\n`/league status` - Season progress + top 4",inline=False)
-    embed2.set_footer(text="Questions? Ask a League Admin. Good luck, Goons!")
+    embed2=discord.Embed(title="\U0001f4cb Captain Commands",color=0x5865F2)
+    embed2.add_field(name="\u2694\ufe0f Team Management",value="`/team create` - Create a team and become captain\n`/team invite @player` - Invite a player\n`/team kick @player` - Remove a player from your team\n`/team leave` - Leave your team\n`/disband` - Disband your team\n`/captain swap @player` - Transfer captaincy",inline=False)
+    embed2.add_field(name="\U0001f4c5 Match Management *(captains)*",value="`/schedule` - Propose a match time\n`/reschedule` - Request a new time (the other captain approves)\n`/match result` - Report the match result for confirmation",inline=False)
+    embed2.set_footer(text="For general stats or admin help, ask in the server. Good luck, Goons!")
     await i.followup.send(embed=embed2)
 
 # ===== /matchrules =====
@@ -1678,10 +1689,12 @@ async def _create_finals_match_thread(guild,c,gid,mid,a,b,label):
         # Private Finals match threads are visible/speakable by both teams and League Admins.
         ids.extend(await _finals_admin_ids(guild))
         await _add_thread_members(th,guild,ids)
+        is_grand_final = "GRAND FINAL" in label.upper()
+        format_line = "BO7 — first team to 4 rounds wins.\n" if is_grand_final else "BO5 — first team to 3 rounds wins.\n"
         await th.send(
-            f"🏆 **FINALS — {a} vs {b}**\n\n"
-            "BO5 — first team to 3 rounds wins.\n"
-            "When the match is complete, either captain uses `/match result` here. "
+            f"🏆 **{label} — {a} vs {b}**\n\n"
+            + format_line
+            + "When the match is complete, either captain uses `/match result` here. "
             "The confirmed result will be posted to #results and this thread will then close."
         )
         async with aiosqlite.connect(DB) as db:
@@ -2671,14 +2684,19 @@ bot.tree.add_command(cap)
 
 mat=app_commands.Group(name="match",description="Match")
 class ResultScoreView(discord.ui.View):
-    def __init__(self,gid,reporter,opp_key,winner,loser):
+    def __init__(self,gid,reporter,opp_key,winner,loser,is_grand_final=False,winner_is_team1=True):
         super().__init__(timeout=600)
         self.gid=gid;self.reporter=reporter;self.opp_key=opp_key;self.winner=winner;self.loser=loser
-        sel=discord.ui.Select(placeholder="Pick the final score",options=[
-            discord.SelectOption(label=f"{winner} 3-0 {loser}",value="3-0"),
-            discord.SelectOption(label=f"{winner} 3-1 {loser}",value="3-1"),
-            discord.SelectOption(label=f"{winner} 3-2 {loser}",value="3-2"),
-        ])
+        self.is_grand_final=is_grand_final
+        target=4 if is_grand_final else 3
+        options=[
+            discord.SelectOption(
+                label=f"{winner} {target}-{n} {loser}",
+                value=f"{target}-{n}" if winner_is_team1 else f"{n}-{target}"
+            )
+            for n in range(target)
+        ]
+        sel=discord.ui.Select(placeholder=f"Pick the final {'BO7' if is_grand_final else 'BO5'} score",options=options)
         sel.callback=self._submit
         self.add_item(sel)
     async def _submit(self,i):
@@ -2687,9 +2705,9 @@ class ResultScoreView(discord.ui.View):
         await finalize_report(i,self.gid,self.reporter,self.opp_key,self.winner,self.loser,score)
 
 class ResultWinnerView(discord.ui.View):
-    def __init__(self,gid,t1,t2,reporter,opp_key):
+    def __init__(self,gid,t1,t2,reporter,opp_key,is_grand_final=False):
         super().__init__(timeout=600)
-        self.gid=gid;self.t1=t1;self.t2=t2;self.reporter=reporter;self.opp_key=opp_key
+        self.gid=gid;self.t1=t1;self.t2=t2;self.reporter=reporter;self.opp_key=opp_key;self.is_grand_final=is_grand_final
         for nm in(t1,t2):
             b=discord.ui.Button(label=nm,style=discord.ButtonStyle.primary)
             b.callback=self._mk(nm)
@@ -2697,13 +2715,20 @@ class ResultWinnerView(discord.ui.View):
     def _mk(self,name):
         async def cb(i):
             loser=self.t2 if name==self.t1 else self.t1
-            v=ResultScoreView(self.gid,self.reporter,self.opp_key,name,loser)
-            await i.response.edit_message(content=f"**Step 2:** pick the final score - {name} vs {loser}",view=v)
+            v=ResultScoreView(self.gid,self.reporter,self.opp_key,name,loser,self.is_grand_final,name==self.t1)
+            await i.response.edit_message(content=f"**Step 2:** pick the final {'BO7' if self.is_grand_final else 'BO5'} score - {name} vs {loser}",view=v)
         return cb
 
 async def finalize_report(i,gid,reporter,opp_key,winner,loser,score):
     my_t=await team_get(gid,reporter);opp_t=await team_get(gid,opp_key)
     if not my_t or not opp_t:return False
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory=aiosqlite.Row
+        async with db.execute("SELECT is_finals FROM matches WHERE guild_id=? AND thread_id=? AND winner IS NULL",(gid,str(i.channel.id))) as cur:
+            match_row=await cur.fetchone()
+    finals_type=int(match_row["is_finals"] or 0) if match_row else 0
+    is_finals=finals_type in (1,2,3)
+    is_grand_final=finals_type==2
     my_mmr=int(my_t["mmr"]);opp_mmr=int(opp_t["mmr"])
     won=(str(winner).strip().lower()!=str(opp_t["display"]).strip().lower())
     if my_mmr==opp_mmr:expected=0.5
@@ -2718,7 +2743,18 @@ async def finalize_report(i,gid,reporter,opp_key,winner,loser,score):
     if not oc:return False
     su="+"if won else"-";st="-"if won else"+"
     v=ResultConfirmView(opp_t["captain_id"],my_t["name"],my_t["display"],opp_t["name"],opp_t["display"],score,won,winner,delta,gid,c,str(i.channel.id))
-    await i.channel.send(f"\u26a1 {i.user.mention} reports: **{winner} {score} {loser}**\n{reporter}({get_rank(my_mmr)}) {su}{delta} | {opp_t['display']}({get_rank(opp_mmr)}) {st}{delta}\n\n{oc.mention} please confirm:",view=v)
+    if is_finals:
+        try:
+            sa,sb=[int(x) for x in score.split("-")]
+            display_score=score if winner==my_t["name"] else f"{sb}-{sa}"
+        except Exception:
+            display_score=score
+        report_text=f"🏆 {i.user.mention} reports finals result: **{winner} {display_score} {loser}**"
+        report_text += " (BO7 — first to 4)" if is_grand_final else " (BO5 — first to 3)"
+        report_text += f"\n\n{oc.mention} please confirm:"
+    else:
+        report_text=f"\u26a1 {i.user.mention} reports: **{winner} {score} {loser}**\n{reporter}({get_rank(my_mmr)}) {su}{delta} | {opp_t['display']}({get_rank(opp_mmr)}) {st}{delta}\n\n{oc.mention} please confirm:"
+    await i.channel.send(report_text,view=v)
     return True
 
 @mat.command(name="result",description="Report the result of this match (captain)")
@@ -2738,8 +2774,11 @@ async def match_report(i):
     if d not in(t1,t2):
         await i.response.send_message("\u274c You're not in this match.",ephemeral=True);return
     opp=t2 if d==t1 else t1
-    v=ResultWinnerView(gid,t1,t2,d,opp)
-    await i.response.send_message(f"\u26a1 **Report result** - {t1} vs {t2}\n\n**Step 1:** which team won?",view=v,ephemeral=True)
+    is_grand_final=int(row.get("is_finals") or 0)==2
+    is_finals=int(row.get("is_finals") or 0) in (1,2,3)
+    v=ResultWinnerView(gid,t1,t2,d,opp,is_grand_final)
+    fmt="BO7 (first to 4)" if is_grand_final else "BO5 (first to 3)" if is_finals else "regular match"
+    await i.response.send_message(f"\u26a1 **Report result** - {t1} vs {t2}\nFormat: **{fmt}**\n\n**Step 1:** which team won?",view=v,ephemeral=True)
 bot.tree.add_command(mat)
 
 mmr=app_commands.Group(name="mmr",description="MMR (Admin)")
