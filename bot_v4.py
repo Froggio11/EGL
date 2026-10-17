@@ -709,26 +709,31 @@ class ResultConfirmView(discord.ui.View):
                 if winner != (match["team1"] if sa > sb else match["team2"]):
                     await i.response.send_message(f"\u274c The winner does not match the {'BO7' if finals_type == 2 else 'BO5'} score.",ephemeral=True);return
 
-            if finals_type in (1,2,3):
-                # Finals do not change regular-season MMR or W/L.
-                await db.execute(
-                    "UPDATE matches SET score=?,winner=? WHERE id=? AND winner IS NULL",
-                    (score,winner,match["id"])
-                )
-            else:
+            # Atomically claim this exact match before changing team statistics.
+            # A second/stale confirmation must not award MMR or W/L again.
+            cur = await db.execute(
+                "UPDATE matches SET score=?,winner=? WHERE id=? AND winner IS NULL",
+                (score,winner,match["id"])
+            )
+            if cur.rowcount != 1:
+                await db.rollback()
+                await i.response.send_message("This match has already been recorded.",ephemeral=True)
+                return
+
+            if finals_type not in (1,2,3):
                 await db.execute("UPDATE teams SET wins=wins+1,mmr=mmr+? WHERE guild_id=? AND name=?",(delta,gid,w_key))
                 await db.execute("UPDATE teams SET losses=losses+1,mmr=mmr-? WHERE guild_id=? AND name=?",(delta,gid,l_key))
-                await db.execute("UPDATE matches SET score=?,winner=? WHERE id=? AND winner IS NULL",(score,winner,match["id"]))
             await db.commit()
 
         c=self.cfg
         finals_type=int(match["is_finals"] or 0)
+        # Scores are stored in match team1/team2 order; present them winner-first.
+        try:
+            sa,sb=[int(x) for x in score.split("-")]
+        except Exception:
+            sa,sb=0,0
+        display_score = score if winner == match["team1"] else f"{sb}-{sa}"
         if finals_type in (1,2,3):
-            try:
-                sa,sb=[int(x) for x in score.split("-")]
-            except Exception:
-                sa,sb=0,0
-            display_score = score if winner == match["team1"] else f"{sb}-{sa}"
             if finals_type==1:
                 wp,lp=sa,sb
                 if winner==match["team2"]:wp,lp=sb,sa
@@ -779,14 +784,8 @@ class ResultConfirmView(discord.ui.View):
             if th is None:
                 try:th=await i.guild.fetch_channel(int(self.thread_id))
                 except:th=None
-        if th is None and c and c.get("matches_ch"):
-            mc=i.guild.get_channel(int(c["matches_ch"]))
-            if mc:
-                for t in mc.threads:
-                    if rep_disp.lower() in t.name.lower() and opp_disp.lower() in t.name.lower():th=t;break
-                if th is None:
-                    async for t in mc.archived_threads():
-                        if rep_disp.lower() in t.name.lower() and opp_disp.lower() in t.name.lower():th=t;break
+        # Do not fall back to searching by team names: rematches can share the
+        # same names, and that could delete an older match's thread.
         if th:
             # Match result has already been saved above. Permanently delete the
             # Discord thread so it is no longer visible, while keeping the
