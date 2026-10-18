@@ -831,7 +831,7 @@ class ResultConfirmView(discord.ui.View):
             await i.response.edit_message(
                 content=(
                     f"\u26a1 **Result confirmed!**\n"
-                    f"**{winner} {score} {l_disp}**\n"
+                    f"**{winner} {display_score} {l_disp}**\n"
                     f"{winner}: **{w_before} \u2192 {w_after} MMR** (**+{delta} MMR**)\n"
                     f"{l_disp}: **{l_before} \u2192 {l_after} MMR** (**-{delta} MMR**)"
                 ),
@@ -2723,9 +2723,16 @@ async def finalize_report(i,gid,reporter,opp_key,winner,loser,score):
     if not my_t or not opp_t:return False
     async with aiosqlite.connect(DB) as db:
         db.row_factory=aiosqlite.Row
-        async with db.execute("SELECT is_finals FROM matches WHERE guild_id=? AND thread_id=? AND winner IS NULL",(gid,str(i.channel.id))) as cur:
+        async with db.execute("SELECT team1,team2,is_finals FROM matches WHERE guild_id=? AND thread_id=? AND winner IS NULL",(gid,str(i.channel.id))) as cur:
             match_row=await cur.fetchone()
     finals_type=int(match_row["is_finals"] or 0) if match_row else 0
+    # The score picker stores scores in match team1/team2 order. Display the
+    # score winner-first in messages, without changing the stored score order.
+    try:
+        score_a,score_b=[int(x) for x in score.split("-")]
+        display_score = score if match_row and winner == match_row["team1"] else f"{score_b}-{score_a}"
+    except Exception:
+        display_score=score
     is_finals=finals_type in (1,2,3)
     is_grand_final=finals_type==2
     my_mmr=int(my_t["mmr"]);opp_mmr=int(opp_t["mmr"])
@@ -2743,16 +2750,11 @@ async def finalize_report(i,gid,reporter,opp_key,winner,loser,score):
     su="+"if won else"-";st="-"if won else"+"
     v=ResultConfirmView(opp_t["captain_id"],my_t["name"],my_t["display"],opp_t["name"],opp_t["display"],score,won,winner,delta,gid,c,str(i.channel.id))
     if is_finals:
-        try:
-            sa,sb=[int(x) for x in score.split("-")]
-            display_score=score if winner==my_t["name"] else f"{sb}-{sa}"
-        except Exception:
-            display_score=score
         report_text=f"🏆 {i.user.mention} reports finals result: **{winner} {display_score} {loser}**"
         report_text += " (BO7 — first to 4)" if is_grand_final else " (BO5 — first to 3)"
         report_text += f"\n\n{oc.mention} please confirm:"
     else:
-        report_text=f"\u26a1 {i.user.mention} reports: **{winner} {score} {loser}**\n{reporter}({get_rank(my_mmr)}) {su}{delta} | {opp_t['display']}({get_rank(opp_mmr)}) {st}{delta}\n\n{oc.mention} please confirm:"
+        report_text=f"\u26a1 {i.user.mention} reports: **{winner} {display_score} {loser}**\n{reporter}({get_rank(my_mmr)}) {su}{delta} | {opp_t['display']}({get_rank(opp_mmr)}) {st}{delta}\n\n{oc.mention} please confirm:"
     await i.channel.send(report_text,view=v)
     return True
 
