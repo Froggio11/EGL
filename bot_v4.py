@@ -694,67 +694,50 @@ class ResultConfirmView(discord.ui.View):
                 await i.response.send_message("This match has already been recorded.",ephemeral=True);return
 
             finals_type=int(match["is_finals"] or 0)
-            if finals_type in (1,2,3):
+            if finals_type in (1,3):
                 try:
                     sa,sb=[int(x) for x in score.split("-")]
                 except Exception:
-                    expected = "BO7" if finals_type == 2 else "BO5"
-                    await i.response.send_message(f"\u274c {expected} finals results must be a valid score.",ephemeral=True);return
-                target = 4 if finals_type == 2 else 3
-                valid_scores = [(target, other) for other in range(target)] + [(other, target) for other in range(target)]
-                if (sa,sb) not in valid_scores:
-                    if finals_type == 2:
-                        await i.response.send_message("\u274c Grand Final results must be **4-0**, **4-1**, **4-2**, or **4-3** (in either order).",ephemeral=True);return
-                    await i.response.send_message("\u274c Finals results must be **3-0**, **3-1**, or **3-2** (in either order).",ephemeral=True);return
+                    await i.response.send_message("\u274c Finals results must be a BO5 score such as **3-0**, **3-1**, or **3-2**.",ephemeral=True);return
+                if sorted((sa,sb)) not in ([0,3],[1,3],[2,3]):
+                    await i.response.send_message("\u274c Finals results must be **3-0**, **3-1**, or **3-2**.",ephemeral=True);return
                 if winner != (match["team1"] if sa > sb else match["team2"]):
-                    await i.response.send_message(f"\u274c The winner does not match the {'BO7' if finals_type == 2 else 'BO5'} score.",ephemeral=True);return
+                    await i.response.send_message("\u274c The winner does not match the BO5 score.",ephemeral=True);return
 
-            # Atomically claim this exact match before changing team statistics.
-            # A second/stale confirmation must not award MMR or W/L again.
-            cur = await db.execute(
-                "UPDATE matches SET score=?,winner=? WHERE id=? AND winner IS NULL",
-                (score,winner,match["id"])
-            )
-            if cur.rowcount != 1:
-                await db.rollback()
-                await i.response.send_message("This match has already been recorded.",ephemeral=True)
-                return
-
-            if finals_type not in (1,2,3):
+            if finals_type in (1,3):
+                # Finals do not change regular-season MMR or W/L.
+                await db.execute(
+                    "UPDATE matches SET score=?,winner=? WHERE id=? AND winner IS NULL",
+                    (score,winner,match["id"])
+                )
+            else:
                 await db.execute("UPDATE teams SET wins=wins+1,mmr=mmr+? WHERE guild_id=? AND name=?",(delta,gid,w_key))
                 await db.execute("UPDATE teams SET losses=losses+1,mmr=mmr-? WHERE guild_id=? AND name=?",(delta,gid,l_key))
+                await db.execute("UPDATE matches SET score=?,winner=? WHERE id=? AND winner IS NULL",(score,winner,match["id"]))
             await db.commit()
 
         c=self.cfg
         finals_type=int(match["is_finals"] or 0)
-        # Scores are stored in match team1/team2 order; present them winner-first.
-        try:
-            sa,sb=[int(x) for x in score.split("-")]
-        except Exception:
-            sa,sb=0,0
-        display_score = score if winner == match["team1"] else f"{sb}-{sa}"
-        if finals_type in (1,2,3):
+        if finals_type in (1,3):
+            try:
+                sa,sb=[int(x) for x in score.split("-")]
+            except Exception:
+                sa,sb=0,0
             if finals_type==1:
                 wp,lp=sa,sb
                 if winner==match["team2"]:wp,lp=sb,sa
                 msg=(
                     f"\U0001f3c6 **FINALS RESULT** \U0001f3c6\n\n"
-                    f"**{winner} {display_score} {l_disp}**\n\n"
+                    f"**{winner} {score} {l_disp}**\n\n"
                     f"\U0001f4ca Finals Points Earned:\n"
                     f"\u2022 **{winner}: +{wp}**\n"
                     f"\u2022 **{l_disp}: +{lp}**\n\n"
                     f"Round-robin Finals match recorded."
                 )
-            elif finals_type==2:
-                msg=(
-                    f"\U0001f3c6🔥 **GRAND FINAL RESULT** 🔥\n\n"
-                    f"**{winner} {display_score} {l_disp}**\n\n"
-                    f"Grand Final BO7 recorded. No regular-season MMR/W-L or round-robin Finals Points are changed."
-                )
             else:
                 msg=(
                     f"\u2694\ufe0f **FINALS TIEBREAKER RESULT** \u2694\ufe0f\n\n"
-                    f"**{winner} {display_score} {l_disp}**\n\n"
+                    f"**{winner} {score} {l_disp}**\n\n"
                     f"Tiebreaker recorded. No regular-season MMR/W-L or Finals Points are changed."
                 )
             if c and c.get("results_ch"):
@@ -770,7 +753,7 @@ class ResultConfirmView(discord.ui.View):
                     w_before=w_after-delta
                     l_before=l_after+delta
                     await rc.send(
-                        f"\u26a1 **{winner} {display_score} {l_disp}**\n"
+                        f"\u26a1 **{winner} {score} {l_disp}**\n"
                         f"Winner: **{winner}**\n"
                         f"**{w_key}**: **{w_before} \u2192 {w_after} MMR** (**+{delta} MMR**)\n"
                         f"**{l_key}**: **{l_before} \u2192 {l_after} MMR** (**-{delta} MMR**)\n"
@@ -784,8 +767,14 @@ class ResultConfirmView(discord.ui.View):
             if th is None:
                 try:th=await i.guild.fetch_channel(int(self.thread_id))
                 except:th=None
-        # Do not fall back to searching by team names: rematches can share the
-        # same names, and that could delete an older match's thread.
+        if th is None and c and c.get("matches_ch"):
+            mc=i.guild.get_channel(int(c["matches_ch"]))
+            if mc:
+                for t in mc.threads:
+                    if rep_disp.lower() in t.name.lower() and opp_disp.lower() in t.name.lower():th=t;break
+                if th is None:
+                    async for t in mc.archived_threads():
+                        if rep_disp.lower() in t.name.lower() and opp_disp.lower() in t.name.lower():th=t;break
         if th:
             # Match result has already been saved above. Permanently delete the
             # Discord thread so it is no longer visible, while keeping the
@@ -831,7 +820,7 @@ class ResultConfirmView(discord.ui.View):
             await i.response.edit_message(
                 content=(
                     f"\u26a1 **Result confirmed!**\n"
-                    f"**{winner} {display_score} {l_disp}**\n"
+                    f"**{winner} {score} {l_disp}**\n"
                     f"{winner}: **{w_before} \u2192 {w_after} MMR** (**+{delta} MMR**)\n"
                     f"{l_disp}: **{l_before} \u2192 {l_after} MMR** (**-{delta} MMR**)"
                 ),
@@ -916,19 +905,13 @@ async def close_scrim(sid,sess=None):
     # 2) Delete the signup embed in #mixed-scrims as well.
     msg_id=sess.get("msg_id")
     msc=None
-    scrims_category_exists=False
     for cat in g.categories:
         if cat.name=="Scrims":
-            scrims_category_exists=True
             msc=discord.utils.get(cat.text_channels,name="mixed-scrims")
-            break
+            if msc:
+                break
     if msg_id:
-        if not scrims_category_exists:
-            # If the whole Scrims category is gone, its signup message is gone too.
-            log.info("Scrims category no longer exists; signup message is already gone (sid=%s)",sid)
-        elif not msc:
-            # Category exists but expected channel cannot be found. Keep the DB row
-            # so this can be retried/logged rather than silently forgetting the message.
+        if not msc:
             cleanup_ok=False
             log.warning("Mixed scrim signup message channel not found (sid=%s, msg_id=%s)",sid,msg_id)
         else:
@@ -1291,20 +1274,21 @@ async def gen_matches(guild,c,force=False,target_week=None):
 async def guide_cmd(i):
     if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
     embed1=discord.Embed(title="\U0001f4d6 EGL - Elite Goon League",description="Welcome to the EGL, our own 3v3 competitive league for Elements Divided.",color=0x5865F2)
-    embed1.add_field(name="\U0001f3c6 League Format",value="- Teams of **up to 5 players**\n- Season lasts **8 weeks**\n- New weekly fixtures are generated on **Sunday at 10pm GMT**\n- Each eligible team is scheduled for **2 matches per week**\n- The generator prioritizes opponents you have not faced and spreads repeat matchups apart when possible\n- Captains vote on map (coin flip on tie)\n- **Top 4** advance to Finals, then Grand Final!",inline=False)
+    embed1.add_field(name="\U0001f3c6 League Format",value="- Teams of **up to 5 players**\n- Season lasts **8 weeks**\n- Matches every **Sunday 10pm GMT**\n- You play **1 match a week** - sometimes **2** if there are lots of teams, so everyone gets to play everyone\n- Captains vote on map (coin flip on tie)\n- **Top 4** advance to Finals, then Grand Final!",inline=False)
     embed1.add_field(name="\U0001f4ca Ranks",value="\U0001f7e4 Awakened\n\u26aa Adept\n\U0001f7e1 **Elementalist** *(start)*\n\U0001f7e2 Master\n\U0001f535 Ascendant\n\U0001f451 Avatar",inline=True)
     embed1.add_field(name="MMR System",value="**Who you play matters:**\nWin vs a stronger team = **bigger gain**\nWin vs a weaker team = **smaller gain**\nLose vs a stronger team = **smaller loss**\nLose vs a weaker team = **bigger loss**\n\n**How you play matters too:**\nSweep (3-0) = **bigger reward**\nClose game (3-2) = **smaller reward**",inline=True)
     embed1.add_field(name="\u23f1\ufe0f Rules",value="- **24h cooldown** after leaving/disbanding\n- Returning players inherit **old team's MMR**",inline=False)
     await i.response.send_message(embed=embed1)
     flow_embed=discord.Embed(title="\U0001f451 Captain's Role & How a Match Works",color=0xe67e22)
     flow_embed.add_field(name="What is the Captain?",value="The **captain** is the team leader. They:\n- Created the team\n- Invite & kick players\n- Vote on the map\n- Schedule matches\n- Report results\n\n*Only the captain can do these things!*",inline=False)
-    flow_embed.add_field(name="\U0001f504 Match Flow - Step by Step",value="**1.** Weekly fixtures are normally generated on **Sunday at 10pm GMT**\n**2.** A private thread appears in #matches for each match\n**3.** Both captains **vote on the map** in that thread\n**4.** A captain opens `/schedule` to pick a time; the other captain confirms\n**5.** Play the match! (BO5, first to **3 wins**)\n**6.** The winning captain reports with `/match result`; the other captain confirms\n**7.** The result posts to #results and MMR updates\n",inline=False)
+    flow_embed.add_field(name="\U0001f504 Match Flow - Step by Step",value="**1.** Matches are generated every **Sunday 10pm GMT**\n**2.** A private thread appears in #matches for your team\n**3.** Both captains **vote on the map** in that thread\n**4.** Captain picks a time with `/schedule` - other captain confirms\n**5.** Play the match! (BO5, first to **3 wins**)\n**6.** Winning captain reports with `/match result` - other captain confirms\n**7.** Result posts to #results, MMR updates, done!\n",inline=False)
     flow_embed.set_footer(text="If you're ever confused, ask a League Admin!")
     await i.followup.send(embed=flow_embed)
-    embed2=discord.Embed(title="\U0001f4cb Captain Commands",color=0x5865F2)
-    embed2.add_field(name="\u2694\ufe0f Team Management",value="`/team create` - Create a team and become captain\n`/team invite @player` - Invite a player\n`/team kick @player` - Remove a player from your team\n`/team leave` - Leave your team\n`/disband` - Disband your team\n`/captain swap @player` - Transfer captaincy",inline=False)
-    embed2.add_field(name="\U0001f4c5 Match Management *(captains)*",value="`/schedule` - Propose a match time\n`/reschedule` - Request a new time (the other captain approves)\n`/match result` - Report the match result for confirmation",inline=False)
-    embed2.set_footer(text="For general stats or admin help, ask in the server. Good luck, Goons!")
+    embed2=discord.Embed(title="\U0001f4cb Commands",color=0x5865F2)
+    embed2.add_field(name="\u2694\ufe0f Team",value="`/team create` - Start a team (you become captain)\n`/team invite @player` - Invite someone\n`/team kick @player` - Remove someone\n`/team leave` - Leave your team\n`/disband` - Delete your team\n`/captain swap @player` - Transfer captain\n`/teaminfo name:Name` - Look up any team",inline=False)
+    embed2.add_field(name="\U0001f4c5 Match *(captains only, in match thread)*",value="`/schedule 05 Aug 19:00` - Set match time\n`/reschedule 05 Aug 20:00` - Change time (other captain approves)\n`/match result opponent:Name score:2-1` - Report result",inline=False)
+    embed2.add_field(name="\U0001f4ca Stats",value="`/teaminfo name:Name` - Rank, MMR, progress bar\n`/leaderboard` - Full leaderboard (live)\n`/league status` - Season progress + top 4",inline=False)
+    embed2.set_footer(text="Questions? Ask a League Admin. Good luck, Goons!")
     await i.followup.send(embed=embed2)
 
 # ===== /matchrules =====
@@ -1318,8 +1302,11 @@ async def matchrules_cmd(i):
     rules_embed.add_field(name="\U0001f30d Server Region",value="- All matches are played on **EU servers by default**.\n- **US servers are allowed only when every player in the match is from the US.**\n- If there is **even one EU player**, the match must be played on EU servers.",inline=False)
     rules_embed.add_field(name="\U0001f5fa\ufe0f Map",value="Voted on after the match time is set.",inline=False)
     rules_embed.add_field(name="\u26a1 Toggles",value="- Powerups: OFF\n- Ultimates: ON\n- Techniques: ON\n- Blocking: ON\n- Perfect blocking: ON\n- Dashing: ON",inline=False)
-    rules_embed.add_field(name="\u23f0 No-Shows & Forfeits",value="- If some of your team **doesn't show up within 15 minutes**, you either **play down a player** (e.g. 2v3 or 1v3) or **forfeit** (3-0 loss)\n- If a team **can't play** that week, they forfeit the match **3-0**\n- If you **can't agree on a time**, ping the League Admins - they decide based on who tried to schedule\n- Captains are responsible for the rules - a match played with invalid rules **must be replayed**",inline=False)
+    rules_embed.add_field(name="\U0001f465 Match Size",value="- All matches must be scheduled as **3v3**. Teams cannot agree to play 2v2 or any other reduced match format.",inline=False)
+    rules_embed.add_field(name="\u23f0 No-Shows & Forfeits",value="- If some of your team **doesn't show up within 15 minutes**, you can either **play with the players available** (e.g. 2v3 or 1v3) or **forfeit** (3-0 loss).\n- If a team **can't play** that week, they forfeit the match **3-0**.\n- If you **can't agree on a time**, contact the League Admins.\n- Captains are responsible for the rules - a match played with invalid rules **must be replayed**.",inline=False)
+    rules_embed.add_field(name="\u2696\ufe0f Scheduling Disputes",value="- If teams cannot agree on a match time, an **impartial League Admin or assigned neutral person** will review the scheduling chat.\n- They will decide whether either team failed to make a reasonable effort, whether both teams tried their best, and who should forfeit if necessary.\n- Decisions will be based on the chat history and each team's effort to find a suitable time.",inline=False)
     rules_embed.add_field(name="\ud83d\udeab Substitutes",value="- **No subs** - nobody outside your team can join the match\n- You play with your own roster only",inline=False)
+    rules_embed.add_field(name="\U0001f91d Sportsmanship",value="- We trust all players and teams to act with good sportsmanship, respect, and honesty.\n- Treat opponents fairly, respect agreed match arrangements, and avoid toxic behaviour, harassment, or deliberate rule abuse.\n- Disagreements should be handled respectfully. If an issue cannot be resolved between both teams, contact a League Admin.\n- Everyone is expected to play in good faith and help keep the league competitive, fair, and enjoyable for everyone.",inline=False)
     await i.response.send_message(embed=rules_embed)
 
 # ===== /scrimguide =====
@@ -1331,7 +1318,7 @@ async def scrimguide_cmd(i):
     embed.add_field(name="\u23f1\ufe0f Before you sign up",value="Scrims usually last **around an hour**.\nMake sure you have the **time and the charge** before you sign up - don't leave your team short.",inline=False)
     embed.add_field(name="\U0001f6aa If you drop out",value="You **have to get a new player in** to replace you.\nDon't just sign off and leave - the next person in the **Up Next** queue gets pulled in automatically, but it's on you to make sure the spot is filled.",inline=False)
     embed.add_field(name="\U0001f9f5 The scrim thread",value="Every scrim gets its own thread - everyone signed up (and everyone in the queue) is added automatically.\n\nIn the thread you'll see the live list, plus:\n- **Sign Off** - drop out\n- **Ask for Queue** - ping the next player in line to fill a spot",inline=False)
-    embed.add_field(name="\u23f0 Reminder",value="**15 minutes before start**, signed-up players get pinged in the thread. Queued players are not pinged.\nGet a lobby ready and drop the code in the chat!",inline=False)
+    embed.add_field(name="\u23f0 Reminder",value="**5 minutes before start**, everyone in the scrim gets pinged in the thread.\nGet a lobby ready and drop the code in the chat!",inline=False)
     await i.response.send_message(embed=embed)
 
 # ===== /setup /setchannel /league /team /disband /teaminfo /captain /match /stats /fa /mmr /test /schedule /reschedule /backup /restore =====
@@ -1688,12 +1675,10 @@ async def _create_finals_match_thread(guild,c,gid,mid,a,b,label):
         # Private Finals match threads are visible/speakable by both teams and League Admins.
         ids.extend(await _finals_admin_ids(guild))
         await _add_thread_members(th,guild,ids)
-        is_grand_final = "GRAND FINAL" in label.upper()
-        format_line = "BO7 — first team to 4 rounds wins.\n" if is_grand_final else "BO5 — first team to 3 rounds wins.\n"
         await th.send(
-            f"🏆 **{label} — {a} vs {b}**\n\n"
-            + format_line
-            + "When the match is complete, either captain uses `/match result` here. "
+            f"🏆 **FINALS — {a} vs {b}**\n\n"
+            "BO5 — first team to 3 rounds wins.\n"
+            "When the match is complete, either captain uses `/match result` here. "
             "The confirmed result will be posted to #results and this thread will then close."
         )
         async with aiosqlite.connect(DB) as db:
@@ -2683,19 +2668,14 @@ bot.tree.add_command(cap)
 
 mat=app_commands.Group(name="match",description="Match")
 class ResultScoreView(discord.ui.View):
-    def __init__(self,gid,reporter,opp_key,winner,loser,is_grand_final=False,winner_is_team1=True):
+    def __init__(self,gid,reporter,opp_key,winner,loser):
         super().__init__(timeout=600)
         self.gid=gid;self.reporter=reporter;self.opp_key=opp_key;self.winner=winner;self.loser=loser
-        self.is_grand_final=is_grand_final
-        target=4 if is_grand_final else 3
-        options=[
-            discord.SelectOption(
-                label=f"{winner} {target}-{n} {loser}",
-                value=f"{target}-{n}" if winner_is_team1 else f"{n}-{target}"
-            )
-            for n in range(target)
-        ]
-        sel=discord.ui.Select(placeholder=f"Pick the final {'BO7' if is_grand_final else 'BO5'} score",options=options)
+        sel=discord.ui.Select(placeholder="Pick the final score",options=[
+            discord.SelectOption(label=f"{winner} 3-0 {loser}",value="3-0"),
+            discord.SelectOption(label=f"{winner} 3-1 {loser}",value="3-1"),
+            discord.SelectOption(label=f"{winner} 3-2 {loser}",value="3-2"),
+        ])
         sel.callback=self._submit
         self.add_item(sel)
     async def _submit(self,i):
@@ -2704,9 +2684,9 @@ class ResultScoreView(discord.ui.View):
         await finalize_report(i,self.gid,self.reporter,self.opp_key,self.winner,self.loser,score)
 
 class ResultWinnerView(discord.ui.View):
-    def __init__(self,gid,t1,t2,reporter,opp_key,is_grand_final=False):
+    def __init__(self,gid,t1,t2,reporter,opp_key):
         super().__init__(timeout=600)
-        self.gid=gid;self.t1=t1;self.t2=t2;self.reporter=reporter;self.opp_key=opp_key;self.is_grand_final=is_grand_final
+        self.gid=gid;self.t1=t1;self.t2=t2;self.reporter=reporter;self.opp_key=opp_key
         for nm in(t1,t2):
             b=discord.ui.Button(label=nm,style=discord.ButtonStyle.primary)
             b.callback=self._mk(nm)
@@ -2714,27 +2694,13 @@ class ResultWinnerView(discord.ui.View):
     def _mk(self,name):
         async def cb(i):
             loser=self.t2 if name==self.t1 else self.t1
-            v=ResultScoreView(self.gid,self.reporter,self.opp_key,name,loser,self.is_grand_final,name==self.t1)
-            await i.response.edit_message(content=f"**Step 2:** pick the final {'BO7' if self.is_grand_final else 'BO5'} score - {name} vs {loser}",view=v)
+            v=ResultScoreView(self.gid,self.reporter,self.opp_key,name,loser)
+            await i.response.edit_message(content=f"**Step 2:** pick the final score - {name} vs {loser}",view=v)
         return cb
 
 async def finalize_report(i,gid,reporter,opp_key,winner,loser,score):
     my_t=await team_get(gid,reporter);opp_t=await team_get(gid,opp_key)
     if not my_t or not opp_t:return False
-    async with aiosqlite.connect(DB) as db:
-        db.row_factory=aiosqlite.Row
-        async with db.execute("SELECT team1,team2,is_finals FROM matches WHERE guild_id=? AND thread_id=? AND winner IS NULL",(gid,str(i.channel.id))) as cur:
-            match_row=await cur.fetchone()
-    finals_type=int(match_row["is_finals"] or 0) if match_row else 0
-    # The score picker stores scores in match team1/team2 order. Display the
-    # score winner-first in messages, without changing the stored score order.
-    try:
-        score_a,score_b=[int(x) for x in score.split("-")]
-        display_score = score if match_row and winner == match_row["team1"] else f"{score_b}-{score_a}"
-    except Exception:
-        display_score=score
-    is_finals=finals_type in (1,2,3)
-    is_grand_final=finals_type==2
     my_mmr=int(my_t["mmr"]);opp_mmr=int(opp_t["mmr"])
     won=(str(winner).strip().lower()!=str(opp_t["display"]).strip().lower())
     if my_mmr==opp_mmr:expected=0.5
@@ -2749,13 +2715,7 @@ async def finalize_report(i,gid,reporter,opp_key,winner,loser,score):
     if not oc:return False
     su="+"if won else"-";st="-"if won else"+"
     v=ResultConfirmView(opp_t["captain_id"],my_t["name"],my_t["display"],opp_t["name"],opp_t["display"],score,won,winner,delta,gid,c,str(i.channel.id))
-    if is_finals:
-        report_text=f"🏆 {i.user.mention} reports finals result: **{winner} {display_score} {loser}**"
-        report_text += " (BO7 — first to 4)" if is_grand_final else " (BO5 — first to 3)"
-        report_text += f"\n\n{oc.mention} please confirm:"
-    else:
-        report_text=f"\u26a1 {i.user.mention} reports: **{winner} {display_score} {loser}**\n{reporter}({get_rank(my_mmr)}) {su}{delta} | {opp_t['display']}({get_rank(opp_mmr)}) {st}{delta}\n\n{oc.mention} please confirm:"
-    await i.channel.send(report_text,view=v)
+    await i.channel.send(f"\u26a1 {i.user.mention} reports: **{winner} {score} {loser}**\n{reporter}({get_rank(my_mmr)}) {su}{delta} | {opp_t['display']}({get_rank(opp_mmr)}) {st}{delta}\n\n{oc.mention} please confirm:",view=v)
     return True
 
 @mat.command(name="result",description="Report the result of this match (captain)")
@@ -2775,11 +2735,8 @@ async def match_report(i):
     if d not in(t1,t2):
         await i.response.send_message("\u274c You're not in this match.",ephemeral=True);return
     opp=t2 if d==t1 else t1
-    is_grand_final=int(row.get("is_finals") or 0)==2
-    is_finals=int(row.get("is_finals") or 0) in (1,2,3)
-    v=ResultWinnerView(gid,t1,t2,d,opp,is_grand_final)
-    fmt="BO7 (first to 4)" if is_grand_final else "BO5 (first to 3)" if is_finals else "regular match"
-    await i.response.send_message(f"\u26a1 **Report result** - {t1} vs {t2}\nFormat: **{fmt}**\n\n**Step 1:** which team won?",view=v,ephemeral=True)
+    v=ResultWinnerView(gid,t1,t2,d,opp)
+    await i.response.send_message(f"\u26a1 **Report result** - {t1} vs {t2}\n\n**Step 1:** which team won?",view=v,ephemeral=True)
 bot.tree.add_command(mat)
 
 mmr=app_commands.Group(name="mmr",description="MMR (Admin)")
@@ -2810,6 +2767,7 @@ async def recordadjust(i,team:str,wins:int=0,losses:int=0):
     await refresh_leaderboard(i.guild)
     await refresh_rosters(i.guild)
 
+test=app_commands.Group(name="test",description="Test (Admin)")
 generatematch=app_commands.Group(name="generatematch",description="Generate and manage league match fixtures")
 
 @generatematch.command(name="week",description="Generate matches for a specific week without changing the week counter")
@@ -2871,174 +2829,16 @@ async def generate_week_cmd(i,number:app_commands.Range[int,1,SEASON_WEEKS]):
         ephemeral=True
     )
 
-
-
-@generatematch.command(name="reset",description="Remove unfinished match fixtures and their open private threads for a week")
-@app_commands.describe(week="Week number to reset")
-async def reset_week_cmd(i, week:app_commands.Range[int,1,SEASON_WEEKS]):
-    if not await need_admin(i):return
-    gid=str(i.guild_id)
-    c=await cfg_get(gid)
-    if not c:
-        await i.response.send_message("❌ No league.",ephemeral=True)
-        return
-
-    await i.response.defer(ephemeral=True)
-
-    # Refuse to remove results, including forfeits or matches with a winner.
-    async with aiosqlite.connect(DB) as db:
-        db.row_factory=aiosqlite.Row
-        async with db.execute(
-            "SELECT id,team1,team2,score,winner,thread_id FROM matches "
-            "WHERE guild_id=? AND week=? AND COALESCE(is_finals,0)=0",
-            (gid,week)
-        ) as cur:
-            rows=await cur.fetchall()
-
-    if not rows:
-        await i.followup.send(f"ℹ️ Week {week} has no match records to reset.",ephemeral=True)
-        return
-
-    completed=[r for r in rows if r["score"] is not None or r["winner"] is not None]
-    if completed:
-        await i.followup.send(
-            f"❌ Reset cancelled: Week {week} contains {len(completed)} match(es) with a score or winner. "
-            "Completed results and forfeits are protected.",
-            ephemeral=True
-        )
-        return
-
-    matches_ch=guild_channel=None
-    try:
-        matches_ch=i.guild.get_channel(int(c["matches_ch"]))
-    except (KeyError,TypeError,ValueError):
-        matches_ch=None
-
-    # Only delete active/open private threads directly associated with this week's rows.
-    # Archived/closed threads are intentionally left untouched.
-    active_threads={}
-    if matches_ch and isinstance(matches_ch,discord.TextChannel):
-        for th in getattr(matches_ch,"threads",[]):
-            active_threads[str(th.id)]=th
-    for th in getattr(i.guild,"threads",[]):
-        active_threads.setdefault(str(th.id),th)
-
-    thread_errors=[]
-    deleted_threads=0
-    for r in rows:
-        tid=r["thread_id"]
-        if not tid:
-            continue
-        th=active_threads.get(str(tid))
-        if th is None:
-            # A thread absent from active thread collections is treated as closed/archived.
-            continue
-        if not isinstance(th,discord.Thread) or th.type != discord.ChannelType.private_thread:
-            continue
-        try:
-            await th.delete(reason=f"Admin reset of unfinished Week {week} match {r['id']}")
-            deleted_threads+=1
-        except discord.HTTPException as e:
-            thread_errors.append(f"{r['team1']} vs {r['team2']}: {type(e).__name__}")
-
-    if thread_errors:
-        await i.followup.send(
-            f"⚠️ Reset stopped before deleting database records because {len(thread_errors)} open private thread(s) "
-            "could not be deleted. Some threads may already have been removed; check the week before retrying. "
-            "Season counters were not changed.\n" + "\n".join(f"• {x}" for x in thread_errors),
-            ephemeral=True
-        )
-        return
-
-    # Delete only the selected week's non-finals match rows. Season state is untouched.
-    async with aiosqlite.connect(DB) as db:
-        await db.execute(
-            "DELETE FROM matches WHERE guild_id=? AND week=? AND COALESCE(is_finals,0)=0",
-            (gid,week)
-        )
-        await db.commit()
-
-    await i.followup.send(
-        f"✅ Reset Week {week}: removed {len(rows)} unfinished match record(s) and "
-        f"{deleted_threads} open private thread(s). Archived/closed threads were left untouched. "
-        "The season counter and generation-cycle date were not changed.",
-        ephemeral=True
-    )
-
 bot.tree.add_command(generatematch)
 
-@generatematch.command(name="test",description="Generate playable test fixtures for the current week without advancing the week counter")
-async def generate_test_matches_cmd(i):
+@test.command(name="generatematches",description="Force generate")
+async def test_gen(i):
     if not await need_admin(i):return
-    gid=str(i.guild_id)
-    c=await cfg_get(gid)
-    if not c:
-        await i.response.send_message("\u274c No league.",ephemeral=True)
-        return
-
-    await i.response.defer(ephemeral=True)
-
-    # weeks_done is the current week once that week's fixtures have been generated.
-    # If the season has not generated any week yet, use Week 1.
-    async with aiosqlite.connect(DB) as db:
-        db.row_factory=aiosqlite.Row
-        async with db.execute(
-            "SELECT weeks_done FROM season WHERE guild_id=?",
-            (gid,)
-        ) as cur:
-            season=await cur.fetchone()
-
-    if not season:
-        await i.followup.send("\u274c No active season found.",ephemeral=True)
-        return
-
-    current_week=max(1,int(season["weeks_done"] or 0))
-
-    # Do not silently duplicate existing fixtures. Use /generatematch reset week:<week>
-    # first if the current week's unfinished fixtures need to be replaced.
-    async with aiosqlite.connect(DB) as db:
-        async with db.execute(
-            "SELECT COUNT(*) FROM matches WHERE guild_id=? AND week=?",
-            (gid,current_week)
-        ) as cur:
-            existing=(await cur.fetchone())[0]
-
-    if existing:
-        await i.followup.send(
-            f"\u274c Week {current_week} already has {existing} match record(s). "
-            f"No test fixtures were created. If these are all unfinished, use "
-            f"`/generatematch reset week:{current_week}` first.",
-            ephemeral=True
-        )
-        return
-
-    try:
-        # Explicit target_week prevents this test path from changing weeks_done or
-        # last_generation_cycle. These are ordinary match records, so the existing
-        # scheduling, result confirmation, wins/losses, and MMR flow remains available.
-        n=await gen_matches(i.guild,c,force=True,target_week=current_week)
-    except Exception:
-        log.exception("Test match generation failed for Week %s",current_week)
-        await i.followup.send(
-            "\u274c Test match generation failed. Check the bot logs for details.",
-            ephemeral=True
-        )
-        return
-
-    if not n:
-        await i.followup.send(
-            f"\u274c No test matches were generated for Week {current_week}. "
-            "Check that at least two eligible teams have 3+ players.",
-            ephemeral=True
-        )
-        return
-
-    await i.followup.send(
-        f"\u2705 Created {n} playable test match(es) for **Week {current_week}** in "
-        f"<#{c['matches_ch']}>. They use the normal match result flow and can affect "
-        "wins, losses, and MMR. The week counter and generation-cycle date were not changed.",
-        ephemeral=True
-    )
+    gid=str(i.guild_id);c=await cfg_get(gid)
+    if not c:await i.response.send_message("\u274c No league.",ephemeral=True);return
+    await i.response.defer();n=await gen_matches(i.guild,c,force=True)
+    await i.followup.send(f"\u2705 {n or 0} matches in <#{c['matches_ch']}>.")
+bot.tree.add_command(test)
 
 @bot.tree.command(name="schedule",description="Schedule a match")
 async def schedule_cmd(i):
@@ -3319,73 +3119,51 @@ async def bef():await bot.wait_until_ready()
 @tasks.loop(minutes=1)
 async def scrim_check():
     now=datetime.now(timezone.utc)
-    today=now.strftime("%Y-%m-%d")
+    hour=now.hour;minute=now.minute
     for g in bot.guilds:
         gid=str(g.id)
         msc=None
         for cat in g.categories:
             if cat.name=="Scrims":
-                msc=discord.utils.get(cat.text_channels,name="mixed-scrims")
-                break
+                for ch in cat.text_channels:
+                    if ch.name=="mixed-scrims":msc=ch;break
+        if not msc:continue
+        if not has_scrims(g):continue
 
-        # Cleanup must continue even if #mixed-scrims or the Scrims category
-        # was deleted/renamed; otherwise old thread records would never be retried.
-        sessions=await all_scrims(gid)
+        # Every 5 min - refresh embeds for every still-active scrim.
+        # Do not filter by calendar date: a scrim's SID/unix_time is its identity.
+        if minute%5==0:
+            for s in await all_scrims(gid):
+                await update_scrim_embed(s["sid"])
 
-        # Refresh signup embeds only while their channel is available.
-        if msc and now.minute%5==0:
-            for sess in sessions:
-                await update_scrim_embed(sess["sid"])
-
-        # Close each scrim 90 minutes after its scheduled start. Legacy rows with
-        # no unix_time are cleaned once their stored date is older than today.
-        for sess in sessions:
+        # 5-min ping and auto-close, bound to each scrim's unique SID/time.
+        for sess in await all_scrims(gid):
             sid=sess["sid"]
-            unix_time=sess.get("unix_time")
-            if unix_time:
-                diff=(int(unix_time)-int(now.timestamp()))
-                should_close=diff<=-5400
-                should_ping=0<diff<=900
-            else:
-                should_close=bool(sess.get("date") and sess["date"]<today)
-                should_ping=False
-
-            if should_ping and not sess.get("pinged"):
+            if not sess.get("unix_time"):continue
+            dt=datetime.fromtimestamp(sess["unix_time"],tz=timezone.utc)
+            diff=(dt-now).total_seconds()
+            if 0<diff<=300 and not sess.get("pinged"):
                 members=await scrim_signups_active(sid)
-                if not members:
-                    # No active signups to notify; mark this reminder as handled.
-                    async with aiosqlite.connect(DB) as db:
-                        await db.execute("UPDATE scrim_v2 SET pinged=1 WHERE sid=?",(sid,))
-                        await db.commit()
-                else:
-                    pings=" ".join(f"<@{uid}>" for uid in members)
-                    txt=f"🔔 **Scrim starting in 15 minutes!**\n\nGet a lobby ready and drop the code in this chat.\n{pings}"
-                    th=g.get_thread(int(sess["thread_id"])) if sess.get("thread_id") else None
-                    sent=False
+                if members:
+                    pings=" ".join(f"<@{uid}>"for uid in members)
+                    txt=f"\U0001f514 **Scrim starting in 5 minutes!**\n\nGet a lobby ready and drop the code in this chat.\n{pings}"
+                    th=g.get_thread(int(sess["thread_id"]))if sess.get("thread_id")else None
                     if th:
-                        try:
-                            await th.send(txt, allowed_mentions=discord.AllowedMentions(users=True))
-                            sent=True
-                        except discord.NotFound:
-                            log.warning("Mixed scrim reminder thread not found (sid=%s, thread_id=%s)",sid,sess.get("thread_id"))
-                        except Exception as e:
-                            log.warning("Mixed scrim 15-minute ping failed (sid=%s): %s",sid,e)
-                    if not sent and msc:
-                        try:
-                            await msc.send(txt, allowed_mentions=discord.AllowedMentions(users=True))
-                            sent=True
-                        except Exception as e:
-                            log.warning("Mixed scrim 15-minute fallback ping failed (sid=%s): %s",sid,e)
-                    # Only mark sent after a successful Discord message, so transient
-                    # failures are retried on the next loop instead of losing the ping.
-                    if sent:
-                        async with aiosqlite.connect(DB) as db:
-                            await db.execute("UPDATE scrim_v2 SET pinged=1 WHERE sid=?",(sid,))
-                            await db.commit()
-
+                        try:await th.send(txt)
+                        except:pass
+                    else:
+                        await msc.send(txt)
+                async with aiosqlite.connect(DB)as db:
+                    await db.execute("UPDATE scrim_v2 SET pinged=1 WHERE sid=?",(sid,));await db.commit()
             retry_at=sess.get("cleanup_retry_at")
-            if should_close and (not retry_at or int(retry_at)<=int(now.timestamp())):
+            if diff<=-5400 and (not retry_at or int(retry_at)<=int(now.timestamp())):
                 await close_scrim(sid,sess)
+                continue
+        # Midnight cleanup
+        if hour==0 and minute==0:
+            async with aiosqlite.connect(DB)as db:
+                await db.execute("DELETE FROM scrim_signups_v2 WHERE guild_id=? AND sid IN (SELECT sid FROM scrim_v2 WHERE guild_id=? AND date<?)",(gid,gid,today))
+                await db.execute("DELETE FROM scrim_v2 WHERE guild_id=? AND date<?",(gid,today));await db.commit()
 
 @scrim_check.before_loop
 async def scrim_bef():await bot.wait_until_ready()
