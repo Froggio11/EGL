@@ -1945,7 +1945,7 @@ async def team_create(i,name:str,clantag:str):
     if await is_on_cooldown(gid,uid):await i.response.send_message("\u274c 24h cooldown.",ephemeral=True);return
     start_mmr=await get_player_mmr(gid,uid)
     await i.response.defer()
-    async with aiosqlite.connect(DB)as db:await db.execute("INSERT INTO teams VALUES(?,?,?,?,0,0,?,NULL,NULL,?,?)",(gid,name.lower(),name,uid,start_mmr,datetime.now(timezone.utc).isoformat(),clantag));await db.execute("INSERT INTO members VALUES(?,?,?)",(gid,name.lower(),uid));await db.execute("DELETE FROM fa WHERE guild_id=? AND user_id=?",(gid,uid));await db.commit()
+    async with aiosqlite.connect(DB)as db:await db.execute("INSERT INTO teams (guild_id,name,display,captain_id,secondary_captain_id,wins,losses,mmr,thread_id,role_id,created_at,clantag) VALUES (?,?,?,?,NULL,0,0,?,NULL,NULL,?,?)",(gid,name.lower(),name,uid,start_mmr,datetime.now(timezone.utc).isoformat(),clantag));await db.execute("INSERT INTO members VALUES(?,?,?)",(gid,name.lower(),uid));await db.execute("DELETE FROM fa WHERE guild_id=? AND user_id=?",(gid,uid));await db.commit()
     c=await cfg_get(gid);tr=await add_roles(i.guild,i.user,name,captain=True)
     role_id=str(tr.id)if tr else None;thread_id=None
     target_ch=None
