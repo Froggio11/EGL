@@ -10,7 +10,7 @@ logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(messa
 log=logging.getLogger(__name__)
 TOKEN=os.environ.get("DISCORD_BOT_TOKEN","")
 DB="league.db";DEFAULT_MMR=1000;MAX_TEAM=5;SEASON_WEEKS=8
-ADMIN_ROLE="League Admin";TESTER_ROLE="EGL Tester";SPOON_ROLE="Spoon"
+ADMIN_ROLE="League Admin";TESTER_ROLE="EGL Tester";SPOON_ROLE="Spoon";SCRIM_BAN_ROLE="Scrim Banned"
 MAPS=["Chessboard","Portal Mayhem","Construction Site","Parking Lot"]
 SCHED_FMT="%d %b %H:%M";SCHED_HELP="DD Mon HH:MM or 8pm (e.g. 05 Aug 20:00 or 05 Aug 8pm)"
 
@@ -89,6 +89,7 @@ async def init_db():
         CREATE TABLE IF NOT EXISTS scrim_signups(guild_id TEXT,date TEXT,user_id TEXT,position INT,PRIMARY KEY(guild_id,date,user_id));
         CREATE TABLE IF NOT EXISTS scrim_v2(sid TEXT PRIMARY KEY,guild_id TEXT,date TEXT,thread_id TEXT,msg_id TEXT,thread_msg_id TEXT,max_players INT DEFAULT 6,scrim_title TEXT,unix_time INT,pinged INT DEFAULT 0,cleanup_retry_at INT);
         CREATE TABLE IF NOT EXISTS scrim_signups_v2(sid TEXT,guild_id TEXT,user_id TEXT,position INT,PRIMARY KEY(sid,user_id));
+        CREATE TABLE IF NOT EXISTS scrim_bans(guild_id TEXT,user_id TEXT,expires_at INT,PRIMARY KEY(guild_id,user_id));
         """)
         # Migrate: track which Sunday generation cycle has already run.
         try:await db.execute("ALTER TABLE season ADD COLUMN last_generation_cycle TEXT")
@@ -839,6 +840,10 @@ class ScrimSignupView(discord.ui.View):
     @discord.ui.button(label="Sign Up",style=discord.ButtonStyle.green,emoji="\u2795")
     async def signup(self,i,btn):
         gid=self.gid;sid=self.sid;uid=str(i.user.id)
+        ban_role=find_role(i.guild,SCRIM_BAN_ROLE)
+        if ban_role and ban_role in i.user.roles:
+            await i.response.send_message("\u274c You are currently banned from signing up for scrims.",ephemeral=True)
+            return
         async with aiosqlite.connect(DB)as db:
             async with db.execute("SELECT 1 FROM scrim_signups_v2 WHERE sid=? AND user_id=?",(sid,uid))as c:
                 if await c.fetchone():await i.response.send_message("\u274c You're already signed up! Sign off first if you want to leave.",ephemeral=True);return
@@ -2084,6 +2089,56 @@ async def resetteams(i):
         await db.execute("DELETE FROM matches WHERE guild_id=?",(gid,))
         await db.commit()
     await i.followup.send("✅ Teams reset to 1000 MMR, 0W/0L, and match history was cleared.")
+@bot.tree.command(name="scrimban",description="Toggle a player's scrim signup ban (League Admin only)")
+@app_commands.describe(name="Player to ban or unban",duration="How long the ban lasts")
+@app_commands.choices(duration=[
+    app_commands.Choice(name="1 day",value="1d"),
+    app_commands.Choice(name="3 days",value="3d"),
+    app_commands.Choice(name="1 week",value="1w"),
+    app_commands.Choice(name="Permanent",value="perm"),
+])
+async def scrimban_cmd(i:discord.Interaction,name:discord.Member,duration:app_commands.Choice[str]=None):
+    if not is_admin(i.user):
+        await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True)
+        return
+    if name.bot:
+        await i.response.send_message("\u274c Bots cannot be scrim-banned.",ephemeral=True)
+        return
+    role=find_role(i.guild,SCRIM_BAN_ROLE)
+    if not role:
+        try:
+            role=await i.guild.create_role(name=SCRIM_BAN_ROLE,color=discord.Color.red(),reason="Scrim signup restriction role")
+        except Exception as e:
+            await i.response.send_message(f"\u274c Couldn't create the scrim-ban role: {e}",ephemeral=True)
+            return
+    gid=str(i.guild_id);uid=str(name.id)
+    if role in name.roles:
+        try:
+            await name.remove_roles(role,reason=f"Scrim ban toggled off by {i.user}")
+            async with aiosqlite.connect(DB) as db:
+                await db.execute("DELETE FROM scrim_bans WHERE guild_id=? AND user_id=?",(gid,uid))
+                await db.commit()
+            await i.response.send_message(f"\u2705 Removed the scrim ban from {name.mention}. They can sign up for scrims again.")
+        except Exception as e:
+            await i.response.send_message(f"\u274c Couldn't remove the scrim ban: {e}",ephemeral=True)
+        return
+
+    choice=duration.value if duration else "perm"
+    now=int(datetime.now(timezone.utc).timestamp())
+    expires_at={"1d":now+86400,"3d":now+3*86400,"1w":now+7*86400}.get(choice)
+    label={"1d":"1 day","3d":"3 days","1w":"1 week","perm":"permanently"}[choice]
+    try:
+        await name.add_roles(role,reason=f"Scrim ban applied by {i.user} ({label})")
+        async with aiosqlite.connect(DB) as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO scrim_bans(guild_id,user_id,expires_at) VALUES(?,?,?)",
+                (gid,uid,expires_at)
+            )
+            await db.commit()
+        await i.response.send_message(f"\u2705 {name.mention} is banned from signing up for scrims {label}. Use `/scrimban` on them again to remove the ban early.")
+    except Exception as e:
+        await i.response.send_message(f"\u274c Couldn't apply the scrim ban: {e}",ephemeral=True)
+
 @bot.tree.command(name="spoon",description="Get the Spoon role - anyone can ping you")
 async def spoon_cmd(i):
     await i.response.defer()
@@ -3122,6 +3177,26 @@ async def scrim_check():
     hour=now.hour;minute=now.minute
     for g in bot.guilds:
         gid=str(g.id)
+        # Expire timed scrim bans even when the guild currently has no Scrims category.
+        async with aiosqlite.connect(DB) as db:
+            async with db.execute(
+                "SELECT user_id FROM scrim_bans WHERE guild_id=? AND expires_at IS NOT NULL AND expires_at<=?",
+                (gid,int(now.timestamp()))
+            ) as cur:
+                expired=[row[0] for row in await cur.fetchall()]
+        if expired:
+            ban_role=find_role(g,SCRIM_BAN_ROLE)
+            for expired_uid in expired:
+                member=g.get_member(int(expired_uid))
+                if member and ban_role and ban_role in member.roles:
+                    try:
+                        await member.remove_roles(ban_role,reason="Timed scrim ban expired")
+                    except Exception as e:
+                        log.warning("Could not expire scrim ban for %s in %s: %s",expired_uid,gid,e)
+                        continue
+                async with aiosqlite.connect(DB) as db:
+                    await db.execute("DELETE FROM scrim_bans WHERE guild_id=? AND user_id=?",(gid,expired_uid))
+                    await db.commit()
         msc=None
         for cat in g.categories:
             if cat.name=="Scrims":
@@ -3259,6 +3334,7 @@ async def on_guild_join(guild):
         ("Player",discord.Color.green()),
         ("TeamScrims",discord.Color.orange()),
         (TESTER_ROLE,discord.Color.from_rgb(255,105,180)),
+        (SCRIM_BAN_ROLE,discord.Color.red()),
     ]
     for role_name,color in required:
         if not find_role(guild,role_name):
