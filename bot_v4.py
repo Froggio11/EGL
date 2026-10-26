@@ -1727,7 +1727,9 @@ async def league_finals(i):
                 await i.response.send_message("❌ Finals matches already exist for this league.",ephemeral=True);return
         for a,b in pairs:
             await db.execute(
-                "INSERT INTO matches VALUES(?,?,?,?,?,NULL,NULL,NULL,?,NULL,1,NULL,NULL,NULL,NULL)",
+                "INSERT INTO matches "
+                "(id,guild_id,week,team1,team2,score,winner,reporter,created_at,thread_id,is_finals,map,scheduled,reschedule_by,reschedule_to) "
+                "VALUES(?,?,?,?,?,NULL,NULL,NULL,?,NULL,1,NULL,NULL,NULL,NULL)",
                 (str(uuid.uuid4())[:8],gid,0,a,b,datetime.now(timezone.utc).isoformat())
             )
         await db.execute("UPDATE season SET finals_generated=1 WHERE guild_id=?",(gid,))
