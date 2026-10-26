@@ -1740,7 +1740,7 @@ async def league_finals(i):
     stage=None
     if category:
         try:stage=await i.guild.create_stage_channel(
-            name="🎙️ STAGE MATCHES",category=category,topic="EGL Finals — streamed by League Admins"
+            name="🎙️ STAGE MATCHES",category=category
         )
         except Exception as e:log.warning("Finals Stage creation: %s",e)
 
@@ -1785,7 +1785,7 @@ async def league_finals(i):
                 "SELECT id FROM matches WHERE guild_id=? AND is_finals=1 AND team1=? AND team2=? AND winner IS NULL ORDER BY created_at DESC LIMIT 1",
                 (gid,a,b)
             ) as cur:mr=await cur.fetchone()
-        if mr:await _create_finals_match_thread(i.guild,c,gid,mr["id"],a,b,f"Match {n}")
+        if mr:await _create_finals_match_thread(i.guild,c,gid,mr[0],a,b,f"Match {n}")
 
     await update_finals_bracket(i.guild,gid)
     seed_txt="\n".join(f"{n+1}. **{nm}**" for n,nm in enumerate(names))
