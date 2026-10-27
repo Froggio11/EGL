@@ -700,10 +700,12 @@ class ResultConfirmView(discord.ui.View):
                     sa,sb=[int(x) for x in score.split("-")]
                 except Exception:
                     await i.response.send_message("\u274c Finals results must be a BO5 score such as **3-0**, **3-1**, or **3-2**.",ephemeral=True);return
-                if sorted((sa,sb)) not in ([0,3],[1,3],[2,3]):
-                    await i.response.send_message("\u274c Finals results must be **3-0**, **3-1**, or **3-2**.",ephemeral=True);return
-                if winner != (match["team1"] if sa > sb else match["team2"]):
-                    await i.response.send_message("\u274c The winner does not match the BO5 score.",ephemeral=True);return
+                # Finals scores are selected from the winner's perspective:
+                # e.g. "The unrivalled 3-1 Goofy Bears", regardless of DB team order.
+                if sa != 3 or sb not in (0, 1, 2):
+                    await i.response.send_message("\\u274c Finals results must be **3-0**, **3-1**, or **3-2** (winner's score first).",ephemeral=True);return
+                if winner not in (match["team1"], match["team2"]):
+                    await i.response.send_message("\\u274c The selected winner is not one of the teams in this match.",ephemeral=True);return
 
             if finals_type in (1,3):
                 # Finals do not change regular-season MMR or W/L.
@@ -725,8 +727,8 @@ class ResultConfirmView(discord.ui.View):
             except Exception:
                 sa,sb=0,0
             if finals_type==1:
+                # score is always winner-first (3-0, 3-1, or 3-2).
                 wp,lp=sa,sb
-                if winner==match["team2"]:wp,lp=sb,sa
                 msg=(
                     f"\U0001f3c6 **FINALS RESULT** \U0001f3c6\n\n"
                     f"**{winner} {score} {l_disp}**\n\n"
