@@ -700,12 +700,10 @@ class ResultConfirmView(discord.ui.View):
                     sa,sb=[int(x) for x in score.split("-")]
                 except Exception:
                     await i.response.send_message("\u274c Finals results must be a BO5 score such as **3-0**, **3-1**, or **3-2**.",ephemeral=True);return
-                # Finals scores are selected from the winner's perspective:
-                # e.g. "The unrivalled 3-1 Goofy Bears", regardless of DB team order.
-                if sa != 3 or sb not in (0, 1, 2):
-                    await i.response.send_message("\\u274c Finals results must be **3-0**, **3-1**, or **3-2** (winner's score first).",ephemeral=True);return
-                if winner not in (match["team1"], match["team2"]):
-                    await i.response.send_message("\\u274c The selected winner is not one of the teams in this match.",ephemeral=True);return
+                if sorted((sa,sb)) not in ([0,3],[1,3],[2,3]):
+                    await i.response.send_message("\u274c Finals results must be **3-0**, **3-1**, or **3-2**.",ephemeral=True);return
+                if winner != (match["team1"] if sa > sb else match["team2"]):
+                    await i.response.send_message("\u274c The winner does not match the BO5 score.",ephemeral=True);return
 
             if finals_type in (1,3):
                 # Finals do not change regular-season MMR or W/L.
@@ -727,8 +725,8 @@ class ResultConfirmView(discord.ui.View):
             except Exception:
                 sa,sb=0,0
             if finals_type==1:
-                # score is always winner-first (3-0, 3-1, or 3-2).
                 wp,lp=sa,sb
+                if winner==match["team2"]:wp,lp=sb,sa
                 msg=(
                     f"\U0001f3c6 **FINALS RESULT** \U0001f3c6\n\n"
                     f"**{winner} {score} {l_disp}**\n\n"
@@ -1729,9 +1727,7 @@ async def league_finals(i):
                 await i.response.send_message("❌ Finals matches already exist for this league.",ephemeral=True);return
         for a,b in pairs:
             await db.execute(
-                "INSERT INTO matches "
-                "(id,guild_id,week,team1,team2,score,winner,reporter,created_at,thread_id,is_finals,map,scheduled,reschedule_by,reschedule_to) "
-                "VALUES(?,?,?,?,?,NULL,NULL,NULL,?,NULL,1,NULL,NULL,NULL,NULL)",
+                "INSERT INTO matches VALUES(?,?,?,?,?,NULL,NULL,NULL,?,NULL,1,NULL,NULL,NULL,NULL)",
                 (str(uuid.uuid4())[:8],gid,0,a,b,datetime.now(timezone.utc).isoformat())
             )
         await db.execute("UPDATE season SET finals_generated=1 WHERE guild_id=?",(gid,))
@@ -1742,7 +1738,7 @@ async def league_finals(i):
     stage=None
     if category:
         try:stage=await i.guild.create_stage_channel(
-            name="🎙️ STAGE MATCHES",category=category
+            name="🎙️ STAGE MATCHES",category=category,topic="EGL Finals — streamed by League Admins"
         )
         except Exception as e:log.warning("Finals Stage creation: %s",e)
 
@@ -1787,7 +1783,7 @@ async def league_finals(i):
                 "SELECT id FROM matches WHERE guild_id=? AND is_finals=1 AND team1=? AND team2=? AND winner IS NULL ORDER BY created_at DESC LIMIT 1",
                 (gid,a,b)
             ) as cur:mr=await cur.fetchone()
-        if mr:await _create_finals_match_thread(i.guild,c,gid,mr[0],a,b,f"Match {n}")
+        if mr:await _create_finals_match_thread(i.guild,c,gid,mr["id"],a,b,f"Match {n}")
 
     await update_finals_bracket(i.guild,gid)
     seed_txt="\n".join(f"{n+1}. **{nm}**" for n,nm in enumerate(names))
@@ -1883,8 +1879,10 @@ async def league_grandfinal(i):
         mid=str(uuid.uuid4())[:8]
         t1,t2=ranked[0],ranked[1]
         await db.execute(
-            "INSERT INTO matches VALUES(?,?,?,?,?,NULL,NULL,NULL,?,NULL,2,NULL,NULL,NULL,NULL)",
-            (mid,gid,0,t1,t2,datetime.now(timezone.utc).isoformat())
+            """INSERT INTO matches
+               (id, guild_id, week, team1, team2, created_at, is_finals)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (mid, gid, 0, t1, t2, datetime.now(timezone.utc).isoformat(), 2)
         )
         await db.commit()
     th=await _create_finals_match_thread(i.guild,c,gid,mid,t1,t2,"GRAND FINAL")
