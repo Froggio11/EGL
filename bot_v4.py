@@ -2078,6 +2078,141 @@ async def deleteteam(i,name:str):
     await refresh_leaderboard(i.guild)
     await refresh_rosters(i.guild)
 
+
+class ResetAllTeamsView(discord.ui.View):
+    def __init__(self, guild_id, admin_id):
+        super().__init__(timeout=120)
+        self.guild_id=str(guild_id)
+        self.admin_id=str(admin_id)
+        self.finished=False
+
+    async def interaction_check(self, i):
+        if str(i.user.id)!=self.admin_id or not is_admin(i.user):
+            await i.response.send_message("Only the League Admin who started this reset can use these buttons.",ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Confirm Reset",style=discord.ButtonStyle.danger,emoji="🗑️")
+    async def confirm_reset(self,i,button):
+        if self.finished:
+            await i.response.send_message("This reset has already been handled.",ephemeral=True)
+            return
+        self.finished=True
+        for child in self.children: child.disabled=True
+        await i.response.edit_message(content="⏳ Resetting teams, memberships, roles and team threads…",view=self)
+        guild=i.guild
+        gid=self.guild_id
+        async with aiosqlite.connect(DB) as db:
+            db.row_factory=aiosqlite.Row
+            async with db.execute("SELECT * FROM teams WHERE guild_id=?",(gid,)) as cur:
+                teams=[dict(r) for r in await cur.fetchall()]
+            async with db.execute("SELECT team_name,user_id FROM members WHERE guild_id=?",(gid,)) as cur:
+                memberships=await cur.fetchall()
+
+        player_ids={str(r["user_id"]) for r in memberships}
+        captain_ids=set()
+        for t in teams:
+            captain_ids.update(str(x) for x in (t.get("captain_id"),t.get("secondary_captain_id")) if x)
+
+        removed_roles=0
+        failed=[]
+        player_role=find_role(guild,"Player")
+        captain_role=find_role(guild,"Captain")
+        for uid in player_ids | captain_ids:
+            member=guild.get_member(int(uid))
+            if member is None: continue
+            roles=[]
+            if player_role and player_role in member.roles: roles.append(player_role)
+            if captain_role and uid in captain_ids and captain_role in member.roles: roles.append(captain_role)
+            if roles:
+                try:
+                    await member.remove_roles(*roles,reason="EGL /resetallteams")
+                    removed_roles+=len(roles)
+                except Exception as e:
+                    failed.append(f"Could not remove roles from {member}: {e}")
+
+        deleted_threads=0
+        deleted_team_roles=0
+        for t in teams:
+            tid=t.get("thread_id")
+            if tid:
+                try:
+                    thread=guild.get_thread(int(tid))
+                    if thread is None: thread=await guild.fetch_channel(int(tid))
+                    await thread.delete(reason="EGL /resetallteams — team reset")
+                    deleted_threads+=1
+                except discord.NotFound:
+                    pass
+                except Exception as e:
+                    failed.append(f"Could not delete team thread for {t.get('display')}: {e}")
+            rid=t.get("role_id")
+            if rid:
+                role=guild.get_role(int(rid))
+                if role:
+                    try:
+                        await role.delete(reason="EGL /resetallteams — team reset")
+                        deleted_team_roles+=1
+                    except Exception as e:
+                        failed.append(f"Could not delete team role for {t.get('display')}: {e}")
+
+        async with aiosqlite.connect(DB) as db:
+            await db.execute("DELETE FROM members WHERE guild_id=?",(gid,))
+            await db.execute("DELETE FROM teams WHERE guild_id=?",(gid,))
+            await db.commit()
+
+        try:
+            await refresh_leaderboard(guild)
+            await refresh_rosters(guild)
+        except Exception as e:
+            failed.append(f"Could not refresh leaderboard/rosters: {e}")
+
+        summary=("✅ **Team reset completed.**\n"
+                 f"• Removed team memberships: **{len(memberships)}**\n"
+                 f"• Removed Player/Captain roles: **{removed_roles}**\n"
+                 f"• Deleted team roles: **{deleted_team_roles}**\n"
+                 f"• Deleted team threads: **{deleted_threads}**\n"
+                 "• Refreshed leaderboard and roster displays.\n\n"
+                 "**Preserved:** league configuration, channels, match history, player history/cooldowns, and unrelated Discord roles.")
+        if failed:
+            summary+="\n\n⚠️ **Some Discord cleanup actions failed:**\n"+"\n".join(f"• {x}" for x in failed[:10])
+        await i.edit_original_response(content=summary,view=None)
+
+    @discord.ui.button(label="Cancel",style=discord.ButtonStyle.secondary,emoji="✖️")
+    async def cancel_reset(self,i,button):
+        if self.finished:
+            await i.response.send_message("This reset has already been handled.",ephemeral=True)
+            return
+        self.finished=True
+        for child in self.children: child.disabled=True
+        await i.response.edit_message(content="❎ Team reset cancelled. No changes were made.",view=self)
+
+
+@bot.tree.command(name="resetallteams",description="Remove all teams, memberships, team roles and threads (League Admin only)")
+async def resetallteams_cmd(i):
+    if not is_admin(i.user):
+        await i.response.send_message(f"❌ Need **{ADMIN_ROLE}**.",ephemeral=True)
+        return
+    async with aiosqlite.connect(DB) as db:
+        async with db.execute("SELECT COUNT(*) FROM teams WHERE guild_id=?",(str(i.guild_id),)) as cur:
+            count=(await cur.fetchone())[0]
+    if count==0:
+        await i.response.send_message("There are no registered teams to reset.",ephemeral=True)
+        await refresh_leaderboard(i.guild)
+        await refresh_rosters(i.guild)
+        return
+    view=ResetAllTeamsView(i.guild_id,i.user.id)
+    await i.response.send_message(
+        "⚠️ **ARE YOU SURE YOU WANT TO RESET ALL TEAMS?**\n\n"
+        f"This will affect **{count} team(s)** and will:\n"
+        "1. Remove every registered player from their team and remove their **Player** role.\n"
+        "2. Clear primary/secondary captain assignments and remove the **Captain** role from those captains.\n"
+        "3. Delete every team record, each team's dedicated Discord role, and each team's associated team thread.\n"
+        "4. Refresh the leaderboard and roster displays so they show no registered teams.\n\n"
+        "**This will NOT delete** league channels/configuration, match history, player history/cooldowns, or unrelated Discord roles.\n\n"
+        "Press **Confirm Reset** to proceed, or **Cancel** to leave everything unchanged.",
+        view=view,ephemeral=True
+    )
+
 @bot.tree.command(name="resetteams",description="Reset all teams' MMR + record + match history (League Admin only)")
 async def resetteams(i):
     if not is_admin(i.user):await i.response.send_message(f"❌ Need **{ADMIN_ROLE}**.",ephemeral=True);return
@@ -2974,12 +3109,12 @@ async def refresh_leaderboard(guild):
     ch=guild.get_channel(int(r[0]))
     if not ch:return
     ts=sorted(await teams_all(gid),key=lambda x:x["mmr"],reverse=True)
-    if not ts:return
     medals=["\U0001f947","\U0001f948","\U0001f949"]
     rows=[]
     for n,t in enumerate(ts[:25]):
         pos=medals[n]if n<3 else f"`{n+1}.`"
         rows.append(f"{pos} **{t['display']}** \u00b7 {t['wins']}W {t['losses']}L \u00b7 `{t['mmr']}`")
+    if not ts: rows=["*No teams are currently registered.*"]
     if len(ts)>25:rows.append(f"*...and {len(ts)-25} more teams*")
     c=await cfg_get(gid)
     season_name=c["name"]if c else "EGL"
@@ -3043,7 +3178,6 @@ async def refresh_rosters(guild):
     ch=guild.get_channel(int(r[0]))
     if not ch:return
     ts=sorted(await teams_all(gid),key=lambda x:x["mmr"],reverse=True)
-    if not ts:return
     lines=[]
     for t in ts[:25]:
         cap_id=t["captain_id"]
@@ -3054,6 +3188,7 @@ async def refresh_rosters(guild):
             nm=m.display_name if m else f"<@{uid}>"
             lines.append(f"\U0001f451 {nm}"if uid==cap_id else f"\u00b7 {nm}")
         lines.append("")
+    if not ts: lines=["*No teams are currently registered.*"]
     c=await cfg_get(gid)
     season_name=c["name"]if c else "EGL"
     embed=discord.Embed(title=f"\U0001f4cb {season_name} Rosters",description="\n".join(lines),color=0x57F287)
