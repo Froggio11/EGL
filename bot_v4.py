@@ -4023,7 +4023,7 @@ class GConfirmAdminView(discord.ui.View):
 @app_commands.describe(match_number='The Gounament match number')
 async def tournament_closematch(i,match_number:int):
     if not await g_admin(i):return
-    m=await g_db('SELECT * FROM gounament_matches WHERE guild_id=? AND match_no=?',(str(i.guild_id),match_number),True)
+    m=await g_db('SELECT * FROM gounament_matches WHERE guild_id=? AND CAST(match_no AS INTEGER)=?',(str(i.guild_id),int(match_number)),True)
     if not m or m['status']=='confirmed':return await i.response.send_message('Match not found or already confirmed.',ephemeral=True)
     if not m['p1'] or not m['p2']:return await i.response.send_message('This match does not have two players assigned yet.',ephemeral=True)
     labels=await g_player_labels(i.guild,m)
@@ -4037,26 +4037,28 @@ class GAdminResolveView(discord.ui.View):
             self.add_item(GAdminScoreButton(self,score))
 
 class GAdminWinnerSelect(discord.ui.Select):
-    def __init__(self,parent,labels):
-        self.parent=parent
-        super().__init__(placeholder='Choose the winner',options=[discord.SelectOption(label=labels[0][:100],value=parent.m['p1']),discord.SelectOption(label=labels[1][:100],value=parent.m['p2'])])
+    def __init__(self,owner_view,labels):
+        # discord.ui.Item already defines a read-only `parent` property.
+        # Keep our owning View under a separate attribute.
+        self.owner_view=owner_view
+        super().__init__(placeholder='Choose the winner',options=[discord.SelectOption(label=labels[0][:100],value=owner_view.m['p1']),discord.SelectOption(label=labels[1][:100],value=owner_view.m['p2'])])
     async def callback(self,i):
         if not is_admin(i.user):return await i.response.send_message('League Admin only.',ephemeral=True)
-        self.parent.winner=self.values[0]
-        self.parent.remove_item(self)
-        await i.response.edit_message(content='Winner selected. Choose the winner’s score below.',view=self.parent)
+        self.owner_view.winner=self.values[0]
+        self.owner_view.remove_item(self)
+        await i.response.edit_message(content='Winner selected. Choose the winner’s score below.',view=self.owner_view)
 
 class GAdminScoreButton(discord.ui.Button):
-    def __init__(self,parent,score):
-        self.parent=parent;self.score=score
+    def __init__(self,owner_view,score):
+        self.owner_view=owner_view;self.score=score
         super().__init__(label=score,style=discord.ButtonStyle.primary)
     async def callback(self,i):
         if not is_admin(i.user):return await i.response.send_message('League Admin only.',ephemeral=True)
-        if not self.parent.winner:return await i.response.send_message('Choose a winner first.',ephemeral=True)
-        m=await g_db('SELECT * FROM gounament_matches WHERE guild_id=? AND match_no=?',(str(i.guild_id),self.parent.m['match_no']),True)
+        if not self.owner_view.winner:return await i.response.send_message('Choose a winner first.',ephemeral=True)
+        m=await g_db('SELECT * FROM gounament_matches WHERE guild_id=? AND match_no=?',(str(i.guild_id),self.owner_view.m['match_no']),True)
         if not m or m['status']=='confirmed':return await i.response.edit_message(content='This match has already been resolved.',view=None)
         await i.response.send_message('Gounament match resolved. Winner advanced and bracket updated.',ephemeral=True)
-        await g_advance(i.guild,m,self.parent.winner,self.score)
+        await g_advance(i.guild,m,self.owner_view.winner,self.score)
 
 onevone=app_commands.Group(name='1v1',description='Gounament 1v1 match commands')
 @onevone.command(name='result',description='Report a result in a Gounament match thread')
