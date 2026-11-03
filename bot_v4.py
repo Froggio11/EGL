@@ -3667,7 +3667,7 @@ class GSetupModal(discord.ui.Modal,title='Set up a Gounament'):
         if admin:base[admin]=discord.PermissionOverwrite(view_channel=True,send_messages=True,manage_messages=True)
         cat=await i.guild.create_category('Gounament',overwrites=base)
         def perms(kind):
-            d=dict(base);d[role]=discord.PermissionOverwrite(view_channel=True,send_messages=kind=='chat')
+            d=dict(base);d[role]=discord.PermissionOverwrite(view_channel=True,read_message_history=True,send_messages=kind=='chat')
             if goon:
                 if kind=='registration':
                     d[goon]=discord.PermissionOverwrite(view_channel=True,send_messages=False,read_message_history=True)
