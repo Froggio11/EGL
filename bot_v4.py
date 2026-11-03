@@ -3781,7 +3781,20 @@ async def g_make_thread(guild,m):
         if member:
             try:await add_thread_member_safely(th,member)
             except Exception:pass
-    await th.send(f'**Gounament Match #{m["match_no"]:02d}**\n{a.mention} vs {b.mention}\n\nUse `/1v1 result` to report the BO5 result. League Admins can use `/tournament closematch`.')
+    rules=discord.Embed(
+        title=f'Gounament Match #{m["match_no"]:02d}',
+        color=0x5865F2,
+        description=(
+            f'{a.mention} vs {b.mention}\n\n'
+            '**Match rules**\n'
+            '• Map: Chessboard\n'
+            '• Format: BO5 — first to 3 rounds wins\n'
+            '• Capture Point Zone: OFF\n'
+            '• Powerups: OFF\n\n'
+            'Use `/1v1 result` to report the result. League Admins can use `/tournament closematch`.'
+        )
+    )
+    await th.send(embed=rules)
     await g_db('UPDATE gounament_matches SET thread_id=? WHERE guild_id=? AND match_no=?',(str(th.id),str(guild.id),m['match_no']))
 
 async def g_advance(guild,m,winner,score):
@@ -3805,30 +3818,42 @@ async def g_advance(guild,m,winner,score):
             try:await th.delete()
             except Exception as e:log.warning('Gounament thread cleanup: %s',e)
 
+async def g_player_labels(guild, match):
+    labels=[]
+    for uid in (match['p1'],match['p2']):
+        member=guild.get_member(int(uid))
+        if member is None:
+            try: member=await guild.fetch_member(int(uid))
+            except Exception: member=None
+        labels.append(member.display_name if member else f'User {uid}')
+    return labels
+
 class GWinnerSelect(discord.ui.Select):
-    def __init__(self,match):
+    def __init__(self,match,labels):
         self.match=match
-        super().__init__(placeholder='Choose the winner',options=[discord.SelectOption(label='Player 1',value=match['p1']),discord.SelectOption(label='Player 2',value=match['p2'])])
+        super().__init__(placeholder='Choose the winner',options=[discord.SelectOption(label=labels[0][:100],value=match['p1']),discord.SelectOption(label=labels[1][:100],value=match['p2'])])
     async def callback(self,i):
         if str(i.user.id) not in (self.match['p1'],self.match['p2']):return await i.response.send_message('Only match participants can report.',ephemeral=True)
-        self.view.winner=self.values[0]
-        await i.response.send_message('Select the BO5 score.',view=GScoreSelectView(self.match,self.view.winner),ephemeral=True)
+        winner=self.values[0]
+        await i.response.edit_message(content='Winner selected. Now choose the score (winner first).',view=GScoreSelectView(self.match,winner))
 class GScoreSelect(discord.ui.Select):
     def __init__(self,match,winner):
         self.match=match;self.winner=winner
-        super().__init__(placeholder='Choose the score (Player 1 first)',options=[discord.SelectOption(label=x,value=x) for x in ['3-0','3-1','3-2','0-3','1-3','2-3']])
+        super().__init__(placeholder='Choose the score (winner first)',options=[discord.SelectOption(label=x,value=x) for x in ['3-0','3-1','3-2']])
     async def callback(self,i):
-        x,y=map(int,self.values[0].split('-'))
-        correct=(self.winner==self.match['p1'] and x>y) or (self.winner==self.match['p2'] and y>x)
-        if not correct:return await i.response.send_message('The selected winner does not match this score.',ephemeral=True)
-        other=self.match['p2'] if str(i.user.id)==self.match['p1'] else self.match['p1']
-        await g_db("UPDATE gounament_matches SET reporter=?,score=?,winner=?,status='awaiting_confirmation' WHERE guild_id=? AND match_no=? AND status='pending'",(str(i.user.id),self.values[0],self.winner,str(i.guild_id),self.match['match_no']))
-        member=i.guild.get_member(int(other));view=GConfirmResultView(self.match['match_no'],self.winner,self.values[0],str(i.user.id))
-        await i.response.send_message(f'{member.mention if member else "Opponent"}: confirm or dispute this result.',view=view,ephemeral=False)
+        score=self.values[0]
+        other=self.match['p2'] if self.winner==self.match['p1'] else self.match['p1']
+        cur=await g_db('SELECT status FROM gounament_matches WHERE guild_id=? AND match_no=?',(str(i.guild_id),self.match['match_no']),True)
+        if not cur or cur['status']!='pending':
+            return await i.response.edit_message(content='This match is no longer accepting a result.',view=None)
+        await g_db("UPDATE gounament_matches SET reporter=?,score=?,winner=?,status='awaiting_confirmation' WHERE guild_id=? AND match_no=? AND status='pending'",(str(i.user.id),score,self.winner,str(i.guild_id),self.match['match_no']))
+        member=i.guild.get_member(int(other));view=GConfirmResultView(self.match['match_no'],self.winner,score,str(i.user.id))
+        await i.response.edit_message(content='Result submitted. The opponent has been asked to confirm or dispute it.',view=None)
+        await i.followup.send(f'{member.mention if member else "Opponent"}: confirm or dispute this result.',view=view,ephemeral=False)
 class GScoreSelectView(discord.ui.View):
     def __init__(self,m,w):super().__init__(timeout=300);self.add_item(GScoreSelect(m,w))
 class GResultView(discord.ui.View):
-    def __init__(self,m):super().__init__(timeout=300);self.add_item(GWinnerSelect(m))
+    def __init__(self,m,labels):super().__init__(timeout=300);self.add_item(GWinnerSelect(m,labels))
 class GConfirmResultView(discord.ui.View):
     def __init__(self,no,w,score,reporter):
         super().__init__(timeout=None);self.no=no;self.w=w;self.score=score;self.reporter=reporter
@@ -3858,8 +3883,10 @@ class GDisputeModal(discord.ui.Modal,title='Dispute result'):
         if not m or m['status']!='awaiting_confirmation':return await i.response.send_message('This result cannot be disputed now.',ephemeral=True)
         await g_db("UPDATE gounament_matches SET status='disputed',dispute_reason=? WHERE guild_id=? AND match_no=?",(str(self.reason),str(i.guild_id),self.no))
         th=i.guild.get_thread(int(m['thread_id'])) if m['thread_id'] else None
-        pings=' '.join(x.mention for x in i.guild.members if is_admin(x))
-        if th:await th.send(f'⚠️ **Result disputed by {i.user.mention}.**\nReason: {self.reason}\n{pings}')
+        admin_role=find_role(i.guild,ADMIN_ROLE)
+        pings=admin_role.mention if admin_role else '**League Admin role not found.**'
+        allowed=discord.AllowedMentions(roles=True,users=False,everyone=False)
+        if th:await th.send(f'⚠️ **Result disputed by {i.user.mention}.**\nReason: {self.reason}\n{pings}',allowed_mentions=allowed)
         await i.response.send_message('The result is disputed. League Admins have been notified.',ephemeral=True)
 
 # Subcommands are grouped so they appear as /tournament ...
@@ -3956,35 +3983,39 @@ class GConfirmAdminView(discord.ui.View):
         if not is_admin(i.user):return await i.response.send_message('League Admin only.',ephemeral=True)
         s=await g_state(i.guild_id)
         if not s:return await i.response.send_message('No Gounament data found.',ephemeral=True)
+        # Acknowledge while the interaction's channel still exists. Reset deletes
+        # that channel/category, so no response/edit may be attempted afterwards.
+        if self.action=='end':
+            await i.response.send_message('Ending Gounament and removing Gourny roles...',ephemeral=True)
+        else:
+            await i.response.send_message('Resetting Gounament and deleting its channels, role and data...',ephemeral=True)
         players=await g_db('SELECT user_id FROM gounament_players WHERE guild_id=?',(str(i.guild_id),),True,True)
         role=i.guild.get_role(int(s['role_id'])) if s.get('role_id') else None
         for p in players:
             m=i.guild.get_member(int(p['user_id']))
             if m and role:
                 try:await m.remove_roles(role,reason='Gounament ended/reset')
-                except Exception:pass
+                except Exception as e:log.warning('Could not remove Gourny role from %s: %s',p['user_id'],e)
         if self.action=='end':
             await g_db("UPDATE gounament_state SET status='ended' WHERE guild_id=?",(str(i.guild_id),))
             for m in await g_db('SELECT thread_id FROM gounament_matches WHERE guild_id=?',(str(i.guild_id),),True,True):
                 th=i.guild.get_thread(int(m['thread_id'])) if m['thread_id'] else None
                 if th:
                     try:await th.delete()
-                    except Exception:pass
-            await i.response.edit_message(content='Gounament ended. Gourny roles removed; channels and history retained.',view=None)
+                    except Exception as e:log.warning('Could not delete Gounament match thread: %s',e)
         else:
             cat=i.guild.get_channel(int(s['category_id'])) if s.get('category_id') else None
             if cat:
                 for ch in list(cat.channels):
                     try:await ch.delete(reason='Gounament reset')
-                    except Exception:pass
+                    except Exception as e:log.warning('Could not delete Gounament channel %s: %s',ch.id,e)
                 try:await cat.delete(reason='Gounament reset')
-                except Exception:pass
+                except Exception as e:log.warning('Could not delete Gounament category: %s',e)
             if role:
                 try:await role.delete(reason='Gounament reset')
-                except Exception:pass
+                except Exception as e:log.warning('Could not delete Gourny role: %s',e)
             for table in ['gounament_players','gounament_matches','gounament_slots','gounament_state']:
                 await g_db(f'DELETE FROM {table} WHERE guild_id=?',(str(i.guild_id),))
-            await i.response.edit_message(content='Gounament data, category, channels and Gourny role permanently deleted. Regular Goon and EGL league data untouched.',view=None)
     @discord.ui.button(label='Cancel',style=discord.ButtonStyle.secondary)
     async def cancel(self,i,b):await i.response.edit_message(content='Cancelled.',view=None)
 
@@ -3995,35 +4026,37 @@ async def tournament_closematch(i,match_number:int):
     m=await g_db('SELECT * FROM gounament_matches WHERE guild_id=? AND match_no=?',(str(i.guild_id),match_number),True)
     if not m or m['status']=='confirmed':return await i.response.send_message('Match not found or already confirmed.',ephemeral=True)
     if not m['p1'] or not m['p2']:return await i.response.send_message('This match does not have two players assigned yet.',ephemeral=True)
-    await i.response.send_message('Choose winner and score in this admin-only resolution panel.',view=GAdminResolveView(m),ephemeral=True)
+    labels=await g_player_labels(i.guild,m)
+    await i.response.send_message('Choose the winner and score (winner first) in this admin-only resolution panel.',view=GAdminResolveView(m,labels),ephemeral=True)
 
 class GAdminResolveView(discord.ui.View):
-    def __init__(self,m):super().__init__(timeout=300);self.m=m;self.winner=None
-        
-    @discord.ui.select(placeholder='Winner',options=[discord.SelectOption(label='Player 1',value='p1'),discord.SelectOption(label='Player 2',value='p2')])
-    async def winner_select(self,i,select):
-        self.winner=self.m['p1'] if select.values[0]=='p1' else self.m['p2']
-        await i.response.send_message('Winner selected. Use score buttons below.',view=self,ephemeral=True)
-    @discord.ui.button(label='3-0',style=discord.ButtonStyle.primary)
-    async def s30(self,i,b):await self.resolve(i,'3-0')
-    @discord.ui.button(label='3-1',style=discord.ButtonStyle.primary)
-    async def s31(self,i,b):await self.resolve(i,'3-1')
-    @discord.ui.button(label='3-2',style=discord.ButtonStyle.primary)
-    async def s32(self,i,b):await self.resolve(i,'3-2')
-    @discord.ui.button(label='0-3',style=discord.ButtonStyle.primary)
-    async def s03(self,i,b):await self.resolve(i,'0-3')
-    @discord.ui.button(label='1-3',style=discord.ButtonStyle.primary)
-    async def s13(self,i,b):await self.resolve(i,'1-3')
-    @discord.ui.button(label='2-3',style=discord.ButtonStyle.primary)
-    async def s23(self,i,b):await self.resolve(i,'2-3')
-    async def resolve(self,i,score):
+    def __init__(self,m,labels):
+        super().__init__(timeout=300);self.m=m;self.winner=None
+        self.add_item(GAdminWinnerSelect(self,labels))
+        for score in ('3-0','3-1','3-2'):
+            self.add_item(GAdminScoreButton(self,score))
+
+class GAdminWinnerSelect(discord.ui.Select):
+    def __init__(self,parent,labels):
+        self.parent=parent
+        super().__init__(placeholder='Choose the winner',options=[discord.SelectOption(label=labels[0][:100],value=parent.m['p1']),discord.SelectOption(label=labels[1][:100],value=parent.m['p2'])])
+    async def callback(self,i):
         if not is_admin(i.user):return await i.response.send_message('League Admin only.',ephemeral=True)
-        if not self.winner:return await i.response.send_message('Choose a winner first.',ephemeral=True)
-        a,b=map(int,score.split('-'))
-        if (self.winner==self.m['p1'] and a<b) or (self.winner==self.m['p2'] and b<a):return await i.response.send_message('Score does not match selected winner.',ephemeral=True)
-        await i.response.defer(ephemeral=True)
-        await g_advance(i.guild,self.m,self.winner,score)
-        await i.followup.send('Gounament match resolved. Winner advanced and bracket updated.',ephemeral=True)
+        self.parent.winner=self.values[0]
+        self.parent.remove_item(self)
+        await i.response.edit_message(content='Winner selected. Choose the winner’s score below.',view=self.parent)
+
+class GAdminScoreButton(discord.ui.Button):
+    def __init__(self,parent,score):
+        self.parent=parent;self.score=score
+        super().__init__(label=score,style=discord.ButtonStyle.primary)
+    async def callback(self,i):
+        if not is_admin(i.user):return await i.response.send_message('League Admin only.',ephemeral=True)
+        if not self.parent.winner:return await i.response.send_message('Choose a winner first.',ephemeral=True)
+        m=await g_db('SELECT * FROM gounament_matches WHERE guild_id=? AND match_no=?',(str(i.guild_id),self.parent.m['match_no']),True)
+        if not m or m['status']=='confirmed':return await i.response.edit_message(content='This match has already been resolved.',view=None)
+        await i.response.send_message('Gounament match resolved. Winner advanced and bracket updated.',ephemeral=True)
+        await g_advance(i.guild,m,self.parent.winner,self.score)
 
 onevone=app_commands.Group(name='1v1',description='Gounament 1v1 match commands')
 @onevone.command(name='result',description='Report a result in a Gounament match thread')
@@ -4033,7 +4066,8 @@ async def g_1v1_result(i):
     m=await g_db('SELECT * FROM gounament_matches WHERE guild_id=? AND thread_id=?',(str(i.guild_id),str(i.channel_id)),True)
     if not m or str(i.user.id) not in (m['p1'],m['p2']):return await i.response.send_message('This command is only available to participants in their Gounament match thread.',ephemeral=True)
     if m['status']!='pending':return await i.response.send_message('This match is not accepting a new result.',ephemeral=True)
-    await i.response.send_message('Select the winner and BO5 score.',view=GResultView(m),ephemeral=True)
+    labels=await g_player_labels(i.guild,m)
+    await i.response.send_message('Select the winner and BO5 score.',view=GResultView(m,labels),ephemeral=True)
 
 bot.tree.add_command(onevone)
 
