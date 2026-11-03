@@ -3547,7 +3547,14 @@ except ImportError:
     Image = ImageDraw = ImageFont = None
     log.warning("Pillow is not installed; Gounament brackets will use a text-only layout.")
 
+# Gounament tables are initialized once per process. The lazy check in g_db
+# also protects against startup-order differences and older deployments.
+_g_db_initialized=False
+_g_db_init_lock=asyncio.Lock()
+
 async def g_db(sql, args=(), fetch=False, many=False):
+    if not _g_db_initialized:
+        await g_init_db()
     async with aiosqlite.connect(DB) as db:
         db.row_factory=aiosqlite.Row
         cur=await db.execute(sql,args)
@@ -3556,14 +3563,21 @@ async def g_db(sql, args=(), fetch=False, many=False):
         return [dict(x) for x in rows] if many and fetch else (dict(rows[0]) if fetch and rows and rows[0] else None)
 
 async def g_init_db():
-    async with aiosqlite.connect(DB) as db:
-        await db.executescript("""
-        CREATE TABLE IF NOT EXISTS gounament_state(guild_id TEXT PRIMARY KEY,name TEXT,prize1 TEXT,prize2 TEXT,prize3 TEXT,info TEXT,status TEXT,category_id TEXT,role_id TEXT,registration_ch TEXT,host_ch TEXT,chat_ch TEXT,bracket_ch TEXT,players_ch TEXT,results_ch TEXT,registration_msg TEXT,bracket_msg TEXT,current_round INTEGER DEFAULT 0,created_at TEXT);
-        CREATE TABLE IF NOT EXISTS gounament_players(guild_id TEXT,user_id TEXT,signup_msg TEXT,seed INTEGER,PRIMARY KEY(guild_id,user_id));
-        CREATE TABLE IF NOT EXISTS gounament_matches(guild_id TEXT,match_no INTEGER,round_no INTEGER,p1 TEXT,p2 TEXT,winner TEXT,score TEXT,status TEXT DEFAULT 'pending',thread_id TEXT,reporter TEXT,dispute_reason TEXT,PRIMARY KEY(guild_id,match_no));
-        CREATE TABLE IF NOT EXISTS gounament_slots(guild_id TEXT,round_no INTEGER,slot_no INTEGER,user_id TEXT,PRIMARY KEY(guild_id,round_no,slot_no));
-        """)
-        await db.commit()
+    global _g_db_initialized
+    if _g_db_initialized:
+        return
+    async with _g_db_init_lock:
+        if _g_db_initialized:
+            return
+        async with aiosqlite.connect(DB) as db:
+            await db.executescript("""
+            CREATE TABLE IF NOT EXISTS gounament_state(guild_id TEXT PRIMARY KEY,name TEXT,prize1 TEXT,prize2 TEXT,prize3 TEXT,info TEXT,status TEXT,category_id TEXT,role_id TEXT,registration_ch TEXT,host_ch TEXT,chat_ch TEXT,bracket_ch TEXT,players_ch TEXT,results_ch TEXT,registration_msg TEXT,bracket_msg TEXT,current_round INTEGER DEFAULT 0,created_at TEXT);
+            CREATE TABLE IF NOT EXISTS gounament_players(guild_id TEXT,user_id TEXT,signup_msg TEXT,seed INTEGER,PRIMARY KEY(guild_id,user_id));
+            CREATE TABLE IF NOT EXISTS gounament_matches(guild_id TEXT,match_no INTEGER,round_no INTEGER,p1 TEXT,p2 TEXT,winner TEXT,score TEXT,status TEXT DEFAULT 'pending',thread_id TEXT,reporter TEXT,dispute_reason TEXT,PRIMARY KEY(guild_id,match_no));
+            CREATE TABLE IF NOT EXISTS gounament_slots(guild_id TEXT,round_no INTEGER,slot_no INTEGER,user_id TEXT,PRIMARY KEY(guild_id,round_no,slot_no));
+            """)
+            await db.commit()
+        _g_db_initialized=True
 
 async def g_state(gid): return await g_db("SELECT * FROM gounament_state WHERE guild_id=?",(str(gid),),True)
 async def g_admin(i):
