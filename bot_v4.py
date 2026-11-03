@@ -3706,18 +3706,42 @@ async def g_publish_bracket(guild):
     ch=guild.get_channel(int(s['bracket_ch']))
     if not ch:return
 
+    byround={}
+    for r in rows:byround.setdefault(r['round_no'],[]).append(r)
+
+    def bracket_names(rn, match_index, m):
+        p1=guild.get_member(int(m['p1'])) if m['p1'] else None
+        p2=guild.get_member(int(m['p2'])) if m['p2'] else None
+        previous=byround.get(rn-1, [])
+        # Round 2 is a special case: first-round matches are paired one-to-one
+        # with the bye recipients. Later rounds combine two prior matches.
+        if rn == 2:
+            source_indexes=(match_index, match_index)
+        else:
+            source_indexes=(match_index*2, match_index*2+1)
+        def incoming_name(player, source_index):
+            if player:
+                return player.display_name
+            if rn > 1 and previous:
+                source=previous[min(source_index, len(previous)-1)]
+                return f"Winner of match #{int(source['match_no']):02d}"
+            return "TBD"
+        a=incoming_name(p1, source_indexes[0])
+        b=incoming_name(p2, source_indexes[1])
+        loser=None
+        if m['winner']:
+            loser=m['p2'] if str(m['winner'])==str(m['p1']) else m['p1']
+        if loser and str(loser)==str(m['p1']): a=f"~~{a}~~"
+        elif loser and str(loser)==str(m['p2']): b=f"~~{b}~~"
+        return a,b
+
     # Keep the bot operational on hosts that do not have Pillow installed.
     if Image is None:
-        byround={}
-        for r in rows:byround.setdefault(r['round_no'],[]).append(r)
         lines=[]
         for rn, matches in sorted(byround.items()):
             lines.append(f"**Round {rn}**")
-            for m in matches:
-                p1=guild.get_member(int(m['p1'])) if m['p1'] else None
-                p2=guild.get_member(int(m['p2'])) if m['p2'] else None
-                a=p1.display_name if p1 else ('BYE' if m['p1'] is None else f"Player {m['p1']}")
-                b=p2.display_name if p2 else ('BYE' if m['p2'] is None else f"Player {m['p2']}")
+            for ix,m in enumerate(matches):
+                a,b=bracket_names(rn,ix,m)
                 winner=guild.get_member(int(m['winner'])) if m['winner'] else None
                 status=f" — **{winner.display_name} wins ({m['score']})**" if winner else (" — **DISPUTED**" if m['status']=='disputed' else " — Pending")
                 lines.append(f"`#{m['match_no']:02d}` {a} vs {b}{status}")
@@ -3744,15 +3768,26 @@ async def g_publish_bracket(guild):
     for rn,ms in byround.items():
         x=60+(rn-1)*300;d.text((x,20),f'Round {rn}',font=font,fill=(255,255,255))
         step=height/(len(ms)+1)
-        for ix,m in enumerate(ms,1):
-            y=int(step*ix);p1=guild.get_member(int(m['p1'])) if m['p1'] else None;p2=guild.get_member(int(m['p2'])) if m['p2'] else None
-            a=p1.display_name if p1 else ('BYE' if m['p1'] is None else m['p1']);b=p2.display_name if p2 else ('BYE' if m['p2'] is None else m['p2'])
-            winner=guild.get_member(int(m['winner'])) if m['winner'] else None
-            label=f"#{m['match_no']:02d}  {a}  vs  {b}"
-            if winner:label+=f"  |  Winner: {winner.display_name} ({m['score']})"
-            elif m['status']=='disputed':label+='  |  DISPUTED'
+        for ix,m in enumerate(ms):
+            y=int(step*(ix+1));a,b=bracket_names(rn,ix,m)
+            # Strip Markdown strike markers for the image and draw a line through the losing name.
+            loser=m['p2'] if m['winner'] and str(m['winner'])==str(m['p1']) else (m['p1'] if m['winner'] else None)
+            a_txt=a.replace('~~','');b_txt=b.replace('~~','')
+            prefix=f"#{m['match_no']:02d}  "
+            left=prefix+a_txt+"  vs  ";right=b_txt
             d.rounded_rectangle((x,y-14,x+260,y+28),radius=6,outline=(100,110,130),width=2)
-            d.text((x+8,y-7),label[:38],font=font,fill=(255,255,255))
+            tx=x+8;ty=y-7
+            d.text((tx,ty),left,font=font,fill=(255,255,255))
+            lx=d.textbbox((tx,ty),left,font=font)[2]
+            d.text((lx,ty),right,font=font,fill=(255,255,255))
+            if loser and str(loser)==str(m['p1']):
+                start=d.textbbox((tx,ty),prefix,font=font)[2]
+                end=d.textbbox((tx,ty),prefix+a_txt,font=font)[2]
+                d.line((start,ty+8,end,ty+8),fill=(255,110,110),width=2)
+            elif loser and str(loser)==str(m['p2']):
+                end=d.textbbox((lx,ty),right,font=font)[2]
+                d.line((lx,ty+8,end,ty+8),fill=(255,110,110),width=2)
+            if m['status']=='disputed':d.text((x+8,y+12),'DISPUTED',font=font,fill=(255,180,80))
     import io
     buf=io.BytesIO();im.save(buf,format='PNG');buf.seek(0)
     file=discord.File(buf,filename='gounament-bracket.png')
@@ -3842,14 +3877,40 @@ class GScoreSelect(discord.ui.Select):
         super().__init__(placeholder='Choose the score (winner first)',options=[discord.SelectOption(label=x,value=x) for x in ['3-0','3-1','3-2']])
     async def callback(self,i):
         score=self.values[0]
-        other=self.match['p2'] if self.winner==self.match['p1'] else self.match['p1']
+        # The confirmer is ALWAYS the participant who did not submit /1v1 result.
+        # Do not derive this from the selected winner: the reporter may report either player as winner.
+        reporter=str(i.user.id)
+        p1,p2=str(self.match['p1']),str(self.match['p2'])
+        if reporter == p1:
+            other=p2
+        elif reporter == p2:
+            other=p1
+        else:
+            return await i.response.send_message('Only match participants can submit a result.',ephemeral=True)
         cur=await g_db('SELECT status FROM gounament_matches WHERE guild_id=? AND match_no=?',(str(i.guild_id),self.match['match_no']),True)
         if not cur or cur['status']!='pending':
             return await i.response.edit_message(content='This match is no longer accepting a result.',view=None)
-        await g_db("UPDATE gounament_matches SET reporter=?,score=?,winner=?,status='awaiting_confirmation' WHERE guild_id=? AND match_no=? AND status='pending'",(str(i.user.id),score,self.winner,str(i.guild_id),self.match['match_no']))
-        member=i.guild.get_member(int(other));view=GConfirmResultView(self.match['match_no'],self.winner,score,str(i.user.id))
-        await i.response.edit_message(content='Result submitted. The opponent has been asked to confirm or dispute it.',view=None)
-        await i.followup.send(f'{member.mention if member else "Opponent"}: confirm or dispute this result.',view=view,ephemeral=False)
+        await g_db("UPDATE gounament_matches SET reporter=?,score=?,winner=?,status='awaiting_confirmation' WHERE guild_id=? AND match_no=? AND status='pending'",(reporter,score,self.winner,str(i.guild_id),self.match['match_no']))
+        winner_member=i.guild.get_member(int(self.winner))
+        if winner_member is None:
+            try: winner_member=await i.guild.fetch_member(int(self.winner))
+            except Exception: winner_member=None
+        loser_id=p2 if self.winner==p1 else p1
+        loser_member=i.guild.get_member(int(loser_id))
+        if loser_member is None:
+            try: loser_member=await i.guild.fetch_member(int(loser_id))
+            except Exception: loser_member=None
+        other_member=i.guild.get_member(int(other))
+        if other_member is None:
+            try: other_member=await i.guild.fetch_member(int(other))
+            except Exception: other_member=None
+        winner_label=winner_member.display_name if winner_member else f'User {self.winner}'
+        loser_label=loser_member.display_name if loser_member else f'User {loser_id}'
+        view=GConfirmResultView(self.match['match_no'],self.winner,score,reporter)
+        await i.response.edit_message(content='Result submitted. The other player has been asked to confirm or dispute it.',view=None)
+        # Show the exact proposed score before the opponent confirms. Score is winner-first.
+        mention=other_member.mention if other_member else f'<@{other}>'
+        await i.followup.send(f'**Proposed result – Match #{int(self.match["match_no"]):02d}**\n**{winner_label}** defeated **{loser_label}** ({score}, winner first).\n{mention}: please confirm or dispute this result.',view=view,ephemeral=False,allowed_mentions=discord.AllowedMentions(users=True,roles=False,everyone=False))
 class GScoreSelectView(discord.ui.View):
     def __init__(self,m,w):super().__init__(timeout=300);self.add_item(GScoreSelect(m,w))
 class GResultView(discord.ui.View):
