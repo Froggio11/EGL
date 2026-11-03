@@ -3661,11 +3661,18 @@ class GSetupModal(discord.ui.Modal,title='Set up a Gounament'):
         role=await i.guild.create_role(name='Gourny',reason='Gounament participant role')
         everyone=i.guild.default_role; admin=discord.utils.get(i.guild.roles,name=ADMIN_ROLE); goon=find_role(i.guild,'Regular Goon'); me=i.guild.me
         base={everyone:discord.PermissionOverwrite(view_channel=False),me:discord.PermissionOverwrite(view_channel=True,send_messages=True,manage_channels=True,manage_messages=True)}
+        # Regular Goon must be explicitly denied: a previous explicit allow
+        # on this role overrides the @everyone denial and exposes the channels.
+        if goon:base[goon]=discord.PermissionOverwrite(view_channel=False,send_messages=False,read_message_history=False)
         if admin:base[admin]=discord.PermissionOverwrite(view_channel=True,send_messages=True,manage_messages=True)
         cat=await i.guild.create_category('Gounament',overwrites=base)
         def perms(kind):
             d=dict(base);d[role]=discord.PermissionOverwrite(view_channel=True,send_messages=kind=='chat')
-            if goon:d[goon]=discord.PermissionOverwrite(view_channel=True,send_messages=False)
+            if goon:
+                if kind=='registration':
+                    d[goon]=discord.PermissionOverwrite(view_channel=True,send_messages=False,read_message_history=True)
+                else:
+                    d[goon]=discord.PermissionOverwrite(view_channel=False,send_messages=False,read_message_history=False)
             if kind in ('registration','host') and admin:d[admin]=discord.PermissionOverwrite(view_channel=True,send_messages=True)
             return d
         channels={}
