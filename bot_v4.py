@@ -3540,7 +3540,12 @@ async def on_ready():
 # ========================= GOUNAMENT (1v1 TOURNAMENT) =========================
 # Isolated tournament data: never touches teams, MMR, season or regular matches.
 import math
-from PIL import Image, ImageDraw, ImageFont
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except ImportError:
+    # Pillow is optional. The Gounament bracket falls back to a text embed.
+    Image = ImageDraw = ImageFont = None
+    log.warning("Pillow is not installed; Gounament brackets will use a text-only layout.")
 
 async def g_db(sql, args=(), fetch=False, many=False):
     async with aiosqlite.connect(DB) as db:
@@ -3677,6 +3682,38 @@ async def g_publish_bracket(guild):
     rows=await g_db('SELECT * FROM gounament_matches WHERE guild_id=? ORDER BY round_no,match_no',(str(guild.id),),True,True)
     if not rows:return
     rounds=max(r['round_no'] for r in rows)
+    ch=guild.get_channel(int(s['bracket_ch']))
+    if not ch:return
+
+    # Keep the bot operational on hosts that do not have Pillow installed.
+    if Image is None:
+        byround={}
+        for r in rows:byround.setdefault(r['round_no'],[]).append(r)
+        lines=[]
+        for rn, matches in sorted(byround.items()):
+            lines.append(f"**Round {rn}**")
+            for m in matches:
+                p1=guild.get_member(int(m['p1'])) if m['p1'] else None
+                p2=guild.get_member(int(m['p2'])) if m['p2'] else None
+                a=p1.display_name if p1 else ('BYE' if m['p1'] is None else f"Player {m['p1']}")
+                b=p2.display_name if p2 else ('BYE' if m['p2'] is None else f"Player {m['p2']}")
+                winner=guild.get_member(int(m['winner'])) if m['winner'] else None
+                status=f" — **{winner.display_name} wins ({m['score']})**" if winner else (" — **DISPUTED**" if m['status']=='disputed' else " — Pending")
+                lines.append(f"`#{m['match_no']:02d}` {a} vs {b}{status}")
+            lines.append("")
+        embed=discord.Embed(title="🏆 Gounament Bracket",description="\n".join(lines)[:4000],color=0x5865F2)
+        try:
+            if s['bracket_msg']:
+                msg=await ch.fetch_message(int(s['bracket_msg']))
+                await msg.edit(content=None,embed=embed,attachments=[])
+            else:
+                msg=await ch.send(embed=embed)
+                await g_db('UPDATE gounament_state SET bracket_msg=? WHERE guild_id=?',(str(msg.id),str(guild.id)))
+        except discord.NotFound:
+            msg=await ch.send(embed=embed)
+            await g_db('UPDATE gounament_state SET bracket_msg=? WHERE guild_id=?',(str(msg.id),str(guild.id)))
+        return
+
     width=max(1000,rounds*300+100);height=max(500,((2**rounds)*42)+100)
     im=Image.new('RGB',(width,height),(25,27,33));d=ImageDraw.Draw(im)
     try:font=ImageFont.truetype('DejaVuSans.ttf',15)
@@ -3697,8 +3734,6 @@ async def g_publish_bracket(guild):
             d.text((x+8,y-7),label[:38],font=font,fill=(255,255,255))
     import io
     buf=io.BytesIO();im.save(buf,format='PNG');buf.seek(0)
-    ch=guild.get_channel(int(s['bracket_ch']))
-    if not ch:return
     file=discord.File(buf,filename='gounament-bracket.png')
     try:
         if s['bracket_msg']:
