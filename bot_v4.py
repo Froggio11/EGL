@@ -1,7 +1,7 @@
 # Elements Divided League Bot v5 — Elite Goon League
 # pip install discord.py aiosqlite
 # 3v3 league, max 4 players/team, rank-based system
-import asyncio,logging,os,uuid,random
+import asyncio,logging,os,uuid,random,unicodedata
 from datetime import datetime,timezone,timedelta
 import aiosqlite,discord
 from discord import app_commands
@@ -3715,6 +3715,21 @@ class GSetupModal(discord.ui.Modal,title='Set up a Gounament'):
 
 # Persistent tournament UI is restored after restart.
 
+def g_bracket_name(value):
+    """Normalize decorative Unicode names and remove invisible formatting controls."""
+    value=unicodedata.normalize('NFKC',str(value or ''))
+    cleaned=[]
+    for char in value:
+        category=unicodedata.category(char)
+        # Strip zero-width joiners, bidi controls, variation selectors and other
+        # invisible format characters that can render as tofu or affect layout.
+        if category in ('Cf','Cc') or 0xFE00 <= ord(char) <= 0xFE0F or 0xE0100 <= ord(char) <= 0xE01EF:
+            continue
+        cleaned.append(char)
+    value=''.join(cleaned).strip()
+    return value or 'Unknown player'
+
+
 async def g_publish_bracket(guild):
     s=await g_state(guild.id)
     if not s:return
@@ -3731,23 +3746,21 @@ async def g_publish_bracket(guild):
         p1=guild.get_member(int(m['p1'])) if m['p1'] else None
         p2=guild.get_member(int(m['p2'])) if m['p2'] else None
         previous=byround.get(rn-1, [])
-        # Round 2 is a special case: first-round matches are paired one-to-one
-        # with the bye recipients. Later rounds combine two prior matches.
-        if rn == 2:
-            # Each bye player is paired with the winner of the first-round
-            # match at the same bracket index.
-            source_indexes=(match_index, match_index)
-        else:
-            source_indexes=(match_index*2, match_index*2+1)
-        def incoming_name(player, source_index):
-            if player:
-                return player.display_name
-            if rn > 1 and previous:
-                source=previous[min(source_index, len(previous)-1)]
+        # Every match is fed by the winners of two adjacent matches in the
+        # previous round. Bye advances occupy their original feeder position.
+        source_indexes=(match_index*2, match_index*2+1)
+        def incoming_name(player_id, source_index):
+            if player_id:
+                member=guild.get_member(int(player_id))
+                return g_bracket_name(member.display_name if member else f"Player {player_id}")
+            if rn > 1 and source_index < len(previous):
+                source=previous[source_index]
                 return f"Winner of match #{int(source['match_no']):02d}"
+            if rn == 1 and m['winner'] and m['score']=='BYE':
+                return 'Advances (bye)'
             return "TBD"
-        a=incoming_name(p1, source_indexes[0])
-        b=incoming_name(p2, source_indexes[1])
+        a=incoming_name(m['p1'], source_indexes[0])
+        b=incoming_name(m['p2'], source_indexes[1])
         loser=None
         if m['winner']:
             loser=m['p2'] if str(m['winner'])==str(m['p1']) else m['p1']
@@ -3779,32 +3792,50 @@ async def g_publish_bracket(guild):
             await g_db('UPDATE gounament_state SET bracket_msg=? WHERE guild_id=?',(str(msg.id),str(guild.id)))
         return
 
-    # High-readability bracket using a clean sans-serif font and accurate strike-throughs.
-    # Noto Sans has broad Unicode coverage for player names; use DejaVu as fallback.
+    # Larger, heavier typography so player names remain readable in Discord previews.
+    # DejaVu Sans Bold is the primary font because it is commonly available on Linux hosts.
     try:
-        font=ImageFont.truetype('/usr/share/fonts/truetype/noto/NotoSans-SemiBold.ttf',19)
-        small_font=ImageFont.truetype('/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf',15)
-        header_font=ImageFont.truetype('/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf',19)
+        font=ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',26)
+        small_font=ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',18)
+        header_font=ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',23)
     except Exception:
         try:
-            font=ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',19)
-            small_font=ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',15)
-            header_font=ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',19)
+            font=ImageFont.truetype('/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf',26)
+            small_font=ImageFont.truetype('/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf',18)
+            header_font=ImageFont.truetype('/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf',23)
         except Exception:
             font=small_font=header_font=ImageFont.load_default()
 
-    card_w=390
+    # Detect missing glyphs in the selected font. Unsupported symbols are
+    # transliterated where possible, otherwise replaced with a visible '?'
+    # instead of Discord previews showing unreadable tofu squares.
+    missing_glyph=bytes(font.getmask(chr(0x10FFFF)))
+    def renderable_name(value):
+        value=g_bracket_name(value)
+        output=[]
+        for char in value:
+            if bytes(font.getmask(char)) != missing_glyph:
+                output.append(char)
+                continue
+            decomposed=unicodedata.normalize('NFKD',char)
+            replacement=''.join(c for c in decomposed
+                                if not unicodedata.combining(c)
+                                and bytes(font.getmask(c)) != missing_glyph)
+            output.append(replacement or '?')
+        return ''.join(output)
+
+    card_w=450
     col_gap=105
     width=max(980, 90 + rounds*(card_w+col_gap))
     max_matches=max(len(v) for v in byround.values())
-    card_h=88
+    card_h=116
     vertical_gap=34
     height=max(460, 105 + max_matches*(card_h+vertical_gap))
     im=Image.new('RGB',(width,height),(25,27,33))
     d=ImageDraw.Draw(im)
 
     def fit_to_width(value, available, active_font):
-        value=str(value)
+        value=renderable_name(value)
         if d.textlength(value,font=active_font)<=available:
             return value
         ellipsis='…'
@@ -3815,14 +3846,14 @@ async def g_publish_bracket(guild):
     def draw_player_line(x0,y0,text_value,uid,match,slot):
         is_loser=bool(match['winner']) and uid is not None and str(uid)!=str(match['winner'])
         color=(155,160,172) if is_loser else (244,246,250)
-        available=card_w-88
+        available=card_w-105
         shown=fit_to_width(text_value,available,font)
-        d.text((x0,y0),shown,font=font,fill=color,stroke_width=0)
+        d.text((x0,y0),shown,font=font,fill=color,stroke_width=1,stroke_fill=color)
         if is_loser:
             # Strike through the visual center of the rendered glyphs, not a fixed y offset.
             bbox=d.textbbox((x0,y0),shown,font=font)
             strike_y=(bbox[1]+bbox[3])//2
-            d.line((bbox[0],strike_y,bbox[2],strike_y),fill=(239,105,105),width=3)
+            d.line((bbox[0],strike_y,bbox[2],strike_y),fill=(239,105,105),width=4)
 
     for rn,ms in sorted(byround.items()):
         x=45+(rn-1)*(card_w+col_gap)
@@ -3835,13 +3866,13 @@ async def g_publish_bracket(guild):
             uid_a=m['p1']
             uid_b=m['p2']
             d.rounded_rectangle((x,y,x+card_w,y+card_h),radius=9,outline=(112,126,153),width=2,fill=(34,37,46))
-            d.text((x+13,y+10),f"#{int(m['match_no']):02d}",font=small_font,fill=(166,181,210))
-            draw_player_line(x+68,y+10,a,uid_a,m,'p1')
-            draw_player_line(x+68,y+49,b,uid_b,m,'p2')
+            d.text((x+13,y+17),f"#{int(m['match_no']):02d}",font=small_font,fill=(166,181,210))
+            draw_player_line(x+82,y+14,a,uid_a,m,'p1')
+            draw_player_line(x+82,y+66,b,uid_b,m,'p2')
             if m['status']=='disputed':
                 tag='DISPUTED'
                 tag_w=d.textlength(tag,font=small_font)
-                d.text((x+card_w-tag_w-12,y+10),tag,font=small_font,fill=(255,184,92))
+                d.text((x+card_w-tag_w-12,y+17),tag,font=small_font,fill=(255,184,92))
     import io
     buf=io.BytesIO();im.save(buf,format='PNG');buf.seek(0)
     file=discord.File(buf,filename='gounament-bracket.png')
@@ -3955,12 +3986,9 @@ async def g_advance(guild,m,winner,score):
             target_index=source_index//2
             if target_index < len(next_rows):
                 target=next_rows[target_index]
+                # Preserve the exact bracket side: even feeder -> left slot,
+                # odd feeder -> right slot. Bye advances use the same mapping.
                 slot='p1' if source_index % 2 == 0 else 'p2'
-                # Round-one winners enter the second slot because the first
-                # slot is reserved for the bye player. Later rounds use the
-                # normal left/right feeder order.
-                if m['round_no']==1:
-                    slot='p2'
                 await g_db(f'UPDATE gounament_matches SET {slot}=? WHERE guild_id=? AND match_no=?',(str(winner),gid,target['match_no']))
     rch=await g_channel(guild,'results_ch')
     if rch:
@@ -3971,33 +3999,29 @@ async def g_advance(guild,m,winner,score):
         await g_publish_final_standings(guild,m,winner)
         await g_db("UPDATE gounament_state SET status='ended' WHERE guild_id=?",(gid,))
     if m['thread_id']:
-        th=None
-        try:
-            th=guild.get_thread(int(m['thread_id']))
-            if th is None:
-                # Private match threads are not always present in the guild cache.
-                th=await guild.fetch_channel(int(m['thread_id']))
-        except discord.NotFound:
-            th=None  # Already gone; cleanup is complete.
-        except Exception as e:
-            log.warning('Could not fetch completed Gounament thread %s: %s',m['thread_id'],e)
+        # Delete the private match thread after a result is finalized.
+        # Both /1v1 result confirmation and /tournament closematch call g_advance,
+        # so this cleanup applies to both paths.
+        thread_id = int(m['thread_id'])
+        th = bot.get_channel(thread_id) or guild.get_thread(thread_id)
+        if th is None:
+            try:
+                th = await bot.fetch_channel(thread_id)
+            except discord.NotFound:
+                th = None  # Already deleted.
+            except discord.Forbidden as e:
+                log.error('No access to completed Gounament thread %s: %s', thread_id, e)
+            except Exception as e:
+                log.exception('Could not fetch completed Gounament thread %s: %s', thread_id, e)
         if th is not None:
             try:
-                await th.delete(reason=f'Gounament match #{m["match_no"]:02d} completed')
+                await th.delete(reason=f'Gounament match #{int(m["match_no"]):02d} result finalized')
             except discord.NotFound:
                 pass
             except discord.Forbidden as e:
-                log.warning('Missing permission to delete completed Gounament thread %s: %s',m['thread_id'],e)
-                try:
-                    await th.edit(locked=True,archived=True,reason='Gounament match completed')
-                except Exception as archive_error:
-                    log.warning('Could not archive completed Gounament thread %s: %s',m['thread_id'],archive_error)
+                log.error('Cannot delete Gounament thread %s; grant the bot Manage Threads permission: %s', thread_id, e)
             except Exception as e:
-                log.warning('Gounament thread deletion failed for %s: %s',m['thread_id'],e)
-                try:
-                    await th.edit(locked=True,archived=True,reason='Gounament match completed')
-                except Exception as archive_error:
-                    log.warning('Could not archive completed Gounament thread %s: %s',m['thread_id'],archive_error)
+                log.exception('Failed to delete completed Gounament thread %s: %s', thread_id, e)
 
 async def g_player_labels(guild, match):
     labels=[]
@@ -4122,36 +4146,53 @@ async def tournament_start(i):
     ids=[p['user_id'] for p in players]
     if len(ids)<2:return await i.followup.send('At least two participants are required.',ephemeral=True)
     random.shuffle(ids);size=1<<(len(ids)-1).bit_length();byes=size-len(ids)
-    # Randomly allocate byes; remaining entrants are paired.
-    bye_ids=set(random.sample(ids,byes)) if byes else set();round1=[x for x in ids if x not in bye_ids]
-    next_round=2;match_count=size//2;total_matches=0
+    match_count=size//2;total_matches=0
+    # Keep every first-round bracket position, including automatic byes. If
+    # bye rows are omitted, later winners lose their original feeder indexes
+    # and can overwrite the wrong player in round two.
+    bye_match_indexes=set(random.sample(range(match_count),byes)) if byes else set()
+    first_round=[]
+    remaining=list(ids)
+    for index in range(match_count):
+        if index in bye_match_indexes:
+            first_round.append((remaining.pop(),None,True))
+        else:
+            first_round.append((remaining.pop(),remaining.pop(),False))
+    # Pre-fill the exact round-two side fed by each bye match.
+    bye_feeders={}
+    for index,(p1,p2,is_bye) in enumerate(first_round):
+        if is_bye:
+            target_index=index//2
+            slot='p1' if index%2==0 else 'p2'
+            bye_feeders[(target_index,slot)]=p1
     async with aiosqlite.connect(DB) as db:
         await db.execute('DELETE FROM gounament_matches WHERE guild_id=?',(str(i.guild_id),));await db.execute('DELETE FROM gounament_slots WHERE guild_id=?',(str(i.guild_id),))
         for n,p in enumerate(ids,1):await db.execute('INSERT INTO gounament_players(guild_id,user_id,seed) VALUES(?,?,?) ON CONFLICT(guild_id,user_id) DO UPDATE SET seed=excluded.seed',(str(i.guild_id),p,n))
-        # Round 1 slots are bracket positions; byes get prefilled into round 2 slots.
-        pairs=list(zip(round1[::2],round1[1::2]))
-        for a,b in pairs:
+        # Insert all first-round bracket positions. Bye rows are already
+        # confirmed and have their winner recorded, but get no private thread.
+        for index,(a,b,is_bye) in enumerate(first_round):
             total_matches+=1
-            await db.execute("INSERT INTO gounament_matches(guild_id,match_no,round_no,p1,p2,status) VALUES(?,?,1,?,?,'pending')",(str(i.guild_id),total_matches,a,b))
-        for r in range(2,int(math.log2(size))+1):
-            for slot in range(1,size//(2**(r-1))+1):
-                await db.execute('INSERT INTO gounament_slots(guild_id,round_no,slot_no,user_id) VALUES(?,?,?,NULL)',(str(i.guild_id),r,slot))
-        # Create later-round matches and prefill round-two slots for bye recipients.
-        bye_list=list(bye_ids)
+            if is_bye:
+                await db.execute("INSERT INTO gounament_matches(guild_id,match_no,round_no,p1,p2,winner,score,status) VALUES(?,?,1,?,NULL,?,'BYE','confirmed')",(str(i.guild_id),total_matches,a,a))
+            else:
+                await db.execute("INSERT INTO gounament_matches(guild_id,match_no,round_no,p1,p2,status) VALUES(?,?,1,?,?,'pending')",(str(i.guild_id),total_matches,a,b))
+        # Create all later rounds and prefill round-two bye advances in their
+        # correct left/right feeder positions. Later rounds start empty.
         for r in range(2,int(math.log2(size))+1):
             count=size//(2**r)
-            for slot in range(1,count+1):
+            for slot_no in range(count):
                 total_matches+=1
-                p1=bye_list.pop(0) if r==2 and bye_list else None
-                await db.execute("INSERT INTO gounament_matches(guild_id,match_no,round_no,p1,p2,status) VALUES(?,?,?,?,?,'pending')",(str(i.guild_id),total_matches,r,p1,None))
+                p1=bye_feeders.get((slot_no,'p1')) if r==2 else None
+                p2=bye_feeders.get((slot_no,'p2')) if r==2 else None
+                await db.execute("INSERT INTO gounament_matches(guild_id,match_no,round_no,p1,p2,status) VALUES(?,?,?,?,?,'pending')",(str(i.guild_id),total_matches,r,p1,p2))
         await db.execute("UPDATE gounament_state SET status='running',current_round=1 WHERE guild_id=?",(str(i.guild_id),))
         await db.commit()
     # Make sure bye entrants are represented in the next round slots; initial matches remain separate.
     await g_publish_bracket(i.guild)
-    ms=await g_db('SELECT * FROM gounament_matches WHERE guild_id=? AND round_no=1',(str(i.guild_id),),True,True)
+    ms=await g_db("SELECT * FROM gounament_matches WHERE guild_id=? AND round_no=1 AND p1 IS NOT NULL AND p2 IS NOT NULL",(str(i.guild_id),),True,True)
     for m in ms:await g_make_thread(i.guild,m)
-    await g_host_announce(i.guild, f'🏁 **The Gounament has started!** Round 1 is now underway with **{len(ids)} players**, **{byes} bye(s)** and **{len(pairs)} match(es)**.')
-    await i.followup.send(f'Gounament started: **{len(ids)} players**, **{byes} byes**, **{len(pairs)} first-round matches**. First-round threads created.',ephemeral=False)
+    await g_host_announce(i.guild, f'🏁 **The Gounament has started!** Round 1 is now underway with **{len(ids)} players**, **{byes} bye(s)** and **{len(ms)} match(es)**.')
+    await i.followup.send(f'Gounament started: **{len(ids)} players**, **{byes} byes**, **{len(ms)} first-round matches**. First-round threads created.',ephemeral=False)
 
 @tournament.command(name='nextround',description='Open matches for the next Gounament round')
 async def tournament_nextround(i):
@@ -4221,11 +4262,26 @@ class GConfirmAdminView(discord.ui.View):
                 except Exception as e:
                     log.warning('Could not delete Gounament registration message %s: %s', reg_message_id, e)
             await g_db("UPDATE gounament_state SET status='ended', registration_msg=NULL WHERE guild_id=?",(str(i.guild_id),))
-            for m in await g_db('SELECT thread_id FROM gounament_matches WHERE guild_id=?',(str(i.guild_id),),True,True):
-                th=i.guild.get_thread(int(m['thread_id'])) if m['thread_id'] else None
+            for match in await g_db('SELECT thread_id FROM gounament_matches WHERE guild_id=?',(str(i.guild_id),),True,True):
+                th=i.guild.get_thread(int(match['thread_id'])) if match['thread_id'] else None
+                if th is None and match['thread_id']:
+                    try:
+                        th=await i.guild.fetch_channel(int(match['thread_id']))
+                    except discord.NotFound:
+                        th=None
+                    except Exception as e:
+                        log.warning('Could not fetch Gounament match thread %s: %s',match['thread_id'],e)
                 if th:
-                    try:await th.delete()
+                    try:await th.delete(reason='Gounament ended')
+                    except discord.NotFound:pass
                     except Exception as e:log.warning('Could not delete Gounament match thread: %s',e)
+            # Announce the completed tournament in #host and update the
+            # confirmation response so the interaction does not appear stuck.
+            await g_host_announce(i.guild, f'🏁 **{s.get("name") or "The Gounament"} has ended.** All Gourny roles have been removed. Tournament channels and history remain.')
+            try:
+                await i.edit_original_response(content=f'**{s.get("name") or "Gounament"}** has ended. Gourny roles removed, registration message and match threads deleted. A completion announcement was sent to #host.',view=None)
+            except Exception as e:
+                log.warning('Could not update Gounament end confirmation response: %s',e)
         else:
             cat=i.guild.get_channel(int(s['category_id'])) if s.get('category_id') else None
             if cat:
