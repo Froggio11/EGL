@@ -4058,7 +4058,19 @@ class GConfirmAdminView(discord.ui.View):
                 try:await m.remove_roles(role,reason='Gounament ended/reset')
                 except Exception as e:log.warning('Could not remove Gourny role from %s: %s',p['user_id'],e)
         if self.action=='end':
-            await g_db("UPDATE gounament_state SET status='ended' WHERE guild_id=?",(str(i.guild_id),))
+            # Remove the public registration embed/buttons when the tournament ends,
+            # while keeping the registration channel and the rest of its history.
+            reg_ch=i.guild.get_channel(int(s['registration_ch'])) if s.get('registration_ch') else None
+            reg_msg_id=s.get('registration_msg')
+            if reg_ch and reg_msg_id:
+                try:
+                    reg_msg=await reg_ch.fetch_message(int(reg_msg_id))
+                    await reg_msg.delete()
+                except discord.NotFound:
+                    pass
+                except Exception as e:
+                    log.warning('Could not delete Gounament registration message: %s',e)
+            await g_db("UPDATE gounament_state SET status='ended', registration_msg=NULL WHERE guild_id=?",(str(i.guild_id),))
             for m in await g_db('SELECT thread_id FROM gounament_matches WHERE guild_id=?',(str(i.guild_id),),True,True):
                 th=i.guild.get_thread(int(m['thread_id'])) if m['thread_id'] else None
                 if th:
