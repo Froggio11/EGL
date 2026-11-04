@@ -3906,7 +3906,8 @@ async def g_make_thread(guild,m):
     if not ch:return
     a=guild.get_member(int(m['p1']));b=guild.get_member(int(m['p2']))
     if not a or not b:return
-    th=await ch.create_thread(name=f"Match {m['match_no']:02d} - {a.display_name} vs {b.display_name}",type=discord.ChannelType.private_thread,auto_archive_duration=10080)
+    stage = await g_round_label(guild.id, m['round_no'])
+    th=await ch.create_thread(name=f"{stage} - Match {m['match_no']:02d} - {a.display_name} vs {b.display_name}",type=discord.ChannelType.private_thread,auto_archive_duration=10080)
     admin_ids=[x.id for x in guild.members if is_admin(x)]
     for uid in [a.id,b.id]+admin_ids:
         member=guild.get_member(uid)
@@ -3914,7 +3915,7 @@ async def g_make_thread(guild,m):
             try:await add_thread_member_safely(th,member)
             except Exception:pass
     rules=discord.Embed(
-        title=f'Gounament Match #{m["match_no"]:02d}',
+        title=f'{stage} — Gounament Match #{m["match_no"]:02d}',
         color=0x5865F2,
         description=(
             f'{a.mention} vs {b.mention}\n\n'
@@ -3929,108 +3930,199 @@ async def g_make_thread(guild,m):
     await th.send(embed=rules)
     await g_db('UPDATE gounament_matches SET thread_id=? WHERE guild_id=? AND match_no=?',(str(th.id),str(guild.id),m['match_no']))
 
+async def g_round_label(guild_id, round_no):
+    """Return a player-friendly stage name based on the number of matches."""
+    row = await g_db(
+        "SELECT COUNT(*) AS n FROM gounament_matches WHERE guild_id=? AND round_no=? AND p1 IS NOT NULL AND p2 IS NOT NULL",
+        (str(guild_id), int(round_no)), True
+    )
+    count = int(row['n'] or 0) if row else 0
+    if count == 1:
+        return 'Final'
+    if count == 2:
+        return 'Semi-Finals'
+    return f'Round {round_no}'
+
+async def g_delete_match_thread(guild, match):
+    """Permanently delete a completed Gounament match thread."""
+    raw_id = match.get('thread_id')
+    if not raw_id:
+        log.warning('Gounament match #%s has no saved thread_id; cannot delete its thread.', match.get('match_no'))
+        return False
+    thread_id = int(raw_id)
+    thread = bot.get_channel(thread_id) or guild.get_thread(thread_id)
+    if thread is None:
+        try:
+            thread = await bot.fetch_channel(thread_id)
+        except discord.NotFound:
+            return True  # Already deleted.
+        except discord.Forbidden as e:
+            log.error('Missing access to fetch completed Gounament thread %s: %s', thread_id, e)
+            return False
+        except Exception:
+            log.exception('Could not fetch completed Gounament thread %s', thread_id)
+            return False
+    try:
+        await thread.delete(reason=f'Gounament match #{int(match["match_no"]):02d} result finalized')
+        log.info('Deleted completed Gounament match thread %s (match #%s).', thread_id, match.get('match_no'))
+        return True
+    except discord.NotFound:
+        return True
+    except discord.Forbidden as e:
+        log.error('Cannot delete Gounament thread %s. Give the bot Manage Threads permission: %s', thread_id, e)
+        return False
+    except Exception:
+        log.exception('Failed to delete completed Gounament thread %s', thread_id)
+        return False
+
 async def g_publish_final_standings(guild, final_match, champion_id):
-    """Post champion, runner-up and up to top 10, ranking by elimination round."""
-    s=await g_state(guild.id)
+    """Publish a clean top-10 leaderboard and announce the podium/prizes in #host."""
+    s = await g_state(guild.id)
     if not s:
         return
-    gid=str(guild.id)
-    matches=await g_db("SELECT * FROM gounament_matches WHERE guild_id=? AND p1 IS NOT NULL AND p2 IS NOT NULL AND winner IS NOT NULL ORDER BY round_no DESC, match_no",(gid,),True,True)
+    gid = str(guild.id)
+    matches = await g_db(
+        "SELECT * FROM gounament_matches WHERE guild_id=? AND p1 IS NOT NULL AND p2 IS NOT NULL AND winner IS NOT NULL ORDER BY round_no DESC, match_no",
+        (gid,), True, True
+    )
     if not matches:
         return
-    final_loser = final_match['p2'] if str(champion_id)==str(final_match['p1']) else final_match['p1']
-    placements=[(int(champion_id), 1), (int(final_loser), 2)]
-    # Earlier elimination rounds fill the remaining positions. Players eliminated
-    # in the same round share a placement band; stable match order breaks ties.
-    seen={int(champion_id),int(final_loser)}
-    rank=3
-    for rnd in sorted({m['round_no'] for m in matches}, reverse=True):
-        eliminated=[]
-        for match in matches:
-            if match['round_no'] != rnd:
-                continue
-            loser=match['p2'] if str(match['winner'])==str(match['p1']) else match['p1']
-            if loser and int(loser) not in seen:
-                seen.add(int(loser))
-                eliminated.append(int(loser))
-        for uid in eliminated:
-            if len(placements)>=10:
-                break
-            placements.append((uid,rank))
-            rank+=1
-        if len(placements)>=10:
-            break
-    lines=[]
-    medals={1:"🥇",2:"🥈",3:"🥉"}
-    for uid,pos in placements:
-        member=guild.get_member(uid)
-        if member is None:
-            try: member=await guild.fetch_member(uid)
-            except Exception: member=None
-        label=member.mention if member else f"<@{uid}>"
-        lines.append(f"{medals.get(pos, f'{pos}.')} **{pos}.** {label}")
-    embed=discord.Embed(title=f"🏆 {s['name']} — Final Standings",description="\\n".join(lines),color=0xF1C40F)
-    embed.add_field(name="Champion",value=f"<@{champion_id}>",inline=False)
-    dest=await g_channel(guild,'results_ch') or await g_channel(guild,'host_ch')
-    if dest:
-        await dest.send(embed=embed, allowed_mentions=discord.AllowedMentions(users=True,roles=False,everyone=False))
 
-async def g_advance(guild,m,winner,score):
-    gid=str(guild.id);loser=m['p2'] if winner==m['p1'] else m['p1']
-    await g_db("UPDATE gounament_matches SET winner=?,score=?,status='confirmed' WHERE guild_id=? AND match_no=? AND status!='confirmed'",(str(winner),score,gid,m['match_no']))
-    # Announce only when every actual match in this round has been confirmed.
-    round_state=await g_db("SELECT COUNT(*) AS total, SUM(CASE WHEN status='confirmed' THEN 1 ELSE 0 END) AS done FROM gounament_matches WHERE guild_id=? AND round_no=? AND p1 IS NOT NULL AND p2 IS NOT NULL",(gid,m['round_no']),True)
-    if round_state and round_state['total'] and round_state['total']==(round_state['done'] or 0):
-        next_state=await g_db('SELECT COUNT(*) AS n FROM gounament_matches WHERE guild_id=? AND round_no=?',(gid,m['round_no']+1),True)
+    champion_id = int(champion_id)
+    final_loser = int(final_match['p2'] if str(champion_id) == str(final_match['p1']) else final_match['p1'])
+    placements = [(champion_id, 1), (final_loser, 2)]
+    seen = {champion_id, final_loser}
+    rank = 3
+    # Players eliminated in the same last non-final round share third place.
+    elimination_rounds = sorted({int(m['round_no']) for m in matches if int(m['round_no']) < int(final_match['round_no'])}, reverse=True)
+    for rnd in elimination_rounds:
+        eliminated = []
+        for match in matches:
+            if int(match['round_no']) != rnd:
+                continue
+            loser_id = int(match['p2'] if str(match['winner']) == str(match['p1']) else match['p1'])
+            if loser_id not in seen:
+                seen.add(loser_id)
+                eliminated.append(loser_id)
+        if not eliminated:
+            continue
+        for uid in eliminated:
+            if len(placements) >= 10:
+                break
+            placements.append((uid, rank))
+        rank += len(eliminated)
+        if len(placements) >= 10:
+            break
+
+    async def player_name(uid):
+        member = guild.get_member(int(uid))
+        if member is None:
+            try:
+                member = await guild.fetch_member(int(uid))
+            except Exception:
+                member = None
+        return member.display_name if member else f'Unknown player ({uid})'
+
+    names = {uid: await player_name(uid) for uid, _ in placements}
+    medal = {1: '🥇', 2: '🥈', 3: '🥉'}
+    leaderboard_lines = []
+    for uid, position in placements:
+        prefix = medal.get(position, f'**{position}.**')
+        leaderboard_lines.append(f'{prefix} **{discord.utils.escape_markdown(names[uid])}**')
+
+    embed = discord.Embed(
+        title=f'🏆 {s["name"]} — Final Standings',
+        description='\n'.join(leaderboard_lines),
+        color=0xF1C40F
+    )
+    results_ch = await g_channel(guild, 'results_ch')
+    if results_ch:
+        await results_ch.send(embed=embed)
+
+    # Announce the actual podium and configured prizes in the public host channel.
+    third_place_ids = [uid for uid, pos in placements if pos == 3]
+    first_name = discord.utils.escape_markdown(names.get(champion_id, await player_name(champion_id)))
+    second_name = discord.utils.escape_markdown(names.get(final_loser, await player_name(final_loser)))
+    third_names = [discord.utils.escape_markdown(names.get(uid, await player_name(uid))) for uid in third_place_ids]
+    third_label = ', '.join(f'**{name}**' for name in third_names) if third_names else '—'
+    host_message = (
+        f'🏆 **{discord.utils.escape_markdown(s["name"])} — Tournament Results**\n\n'
+        f'🥇 **1st place:** {first_name} — **{s.get("prize1") or "No prize listed"}**\n'
+        f'🥈 **2nd place:** {second_name} — **{s.get("prize2") or "No prize listed"}**\n'
+        f'🥉 **3rd place:** {third_label} — **{s.get("prize3") or "No prize listed"}**'
+    )
+    host_ch = await g_channel(guild, 'host_ch')
+    if host_ch:
+        await host_ch.send(host_message, allowed_mentions=discord.AllowedMentions.none())
+
+async def g_advance(guild, m, winner, score):
+    gid = str(guild.id)
+    winner = str(winner)
+    loser = m['p2'] if winner == str(m['p1']) else m['p1']
+    if winner not in (str(m['p1']), str(m['p2'])):
+        raise ValueError('Winner must be one of the two players in this match.')
+
+    # Resolve once only. Both /1v1 result confirmation and /tournament closematch
+    # use this function, so thread cleanup is shared by both result paths.
+    await g_db(
+        "UPDATE gounament_matches SET winner=?,score=?,status='confirmed' WHERE guild_id=? AND match_no=? AND status!='confirmed'",
+        (winner, score, gid, m['match_no'])
+    )
+    resolved = await g_db(
+        'SELECT * FROM gounament_matches WHERE guild_id=? AND match_no=?',
+        (gid, m['match_no']), True
+    )
+    if not resolved or resolved['status'] != 'confirmed':
+        raise RuntimeError(f'Could not confirm Gounament match #{m["match_no"]}.')
+
+    # Delete before publishing anything else. A failed bracket/announcement edit
+    # must never prevent the completed private thread from being removed.
+    await g_delete_match_thread(guild, resolved)
+
+    round_state = await g_db(
+        "SELECT COUNT(*) AS total, SUM(CASE WHEN status='confirmed' THEN 1 ELSE 0 END) AS done FROM gounament_matches WHERE guild_id=? AND round_no=? AND p1 IS NOT NULL AND p2 IS NOT NULL",
+        (gid, m['round_no']), True
+    )
+    next_state = await g_db(
+        'SELECT COUNT(*) AS n FROM gounament_matches WHERE guild_id=? AND round_no=?',
+        (gid, int(m['round_no']) + 1), True
+    )
+    if round_state and round_state['total'] and round_state['total'] == (round_state['done'] or 0):
         if next_state and next_state['n']:
-            await g_host_announce(guild, f'✅ **Round {m["round_no"]} is finished.** All matches are confirmed. Waiting for a League Admin to start the next round with `/tournament nextround`.')
+            await g_host_announce(guild, f'✅ **{await g_round_label(guild.id, m["round_no"])} completed.** All matches are confirmed. Waiting for a League Admin to start the next round with `/tournament nextround`.')
         else:
-            await g_host_announce(guild, f'🏆 **The Gounament is finished!** The final round has been completed.')
-    nxt=m['round_no']+1
-    next_rows=await g_db('SELECT match_no,p1,p2,bracket_pos FROM gounament_matches WHERE guild_id=? AND round_no=? ORDER BY bracket_pos',(gid,nxt),True,True)
+            await g_host_announce(guild, '🏆 **The final match is complete!** Final tournament placements and prizes are being announced below.')
+
+    next_round = int(m['round_no']) + 1
+    next_rows = await g_db(
+        'SELECT match_no,p1,p2,bracket_pos FROM gounament_matches WHERE guild_id=? AND round_no=? ORDER BY bracket_pos',
+        (gid, next_round), True, True
+    )
     if next_rows:
-        # A match always feeds its fixed bracket slot. Do not use the first
-        # empty slot: results can arrive in any order, which otherwise scrambles
-        # bye pairings and makes the bracket show the wrong opponents.
-        source_index=int(m['bracket_pos'] if m['bracket_pos'] is not None else 0)
-        target_index=source_index//2
-        target=next((row for row in next_rows if int(row['bracket_pos'] if row['bracket_pos'] is not None else -1)==target_index),None)
+        source_index = int(m['bracket_pos'] if m['bracket_pos'] is not None else 0)
+        target_index = source_index // 2
+        target = next((row for row in next_rows if int(row['bracket_pos'] if row['bracket_pos'] is not None else -1) == target_index), None)
         if target:
-            # Fixed feeder side: even bracket position -> left, odd -> right.
-            slot='p1' if source_index % 2 == 0 else 'p2'
-            await g_db(f'UPDATE gounament_matches SET {slot}=? WHERE guild_id=? AND match_no=?',(str(winner),gid,target['match_no']))
-    rch=await g_channel(guild,'results_ch')
-    if rch:
-        a=guild.get_member(int(m['p1']));b=guild.get_member(int(m['p2']));w=guild.get_member(int(winner))
-        await rch.send(f"**Match #{m['match_no']:02d} – Round {m['round_no']}**\n{w.mention if w else winner} defeated {(b if str(winner)==m['p1'] else a).mention if (b if str(winner)==m['p1'] else a) else loser} ({score})")
+            slot = 'p1' if source_index % 2 == 0 else 'p2'
+            await g_db(f'UPDATE gounament_matches SET {slot}=? WHERE guild_id=? AND match_no=?', (winner, gid, target['match_no']))
+
+    results_ch = await g_channel(guild, 'results_ch')
+    if results_ch:
+        player_a = guild.get_member(int(m['p1']))
+        player_b = guild.get_member(int(m['p2']))
+        winner_member = guild.get_member(int(winner))
+        loser_member = guild.get_member(int(loser))
+        round_label = await g_round_label(guild.id, m['round_no'])
+        await results_ch.send(
+            f'**Match #{int(m["match_no"]):02d} — {round_label}**\n'
+            f'{winner_member.mention if winner_member else winner} defeated '
+            f'{loser_member.mention if loser_member else loser} ({score})'
+        )
+
     await g_publish_bracket(guild)
     if not (next_state and next_state['n']):
-        await g_publish_final_standings(guild,m,winner)
-        await g_db("UPDATE gounament_state SET status='ended' WHERE guild_id=?",(gid,))
-    if m['thread_id']:
-        # Delete the private match thread after a result is finalized.
-        # Both /1v1 result confirmation and /tournament closematch call g_advance,
-        # so this cleanup applies to both paths.
-        thread_id = int(m['thread_id'])
-        th = bot.get_channel(thread_id) or guild.get_thread(thread_id)
-        if th is None:
-            try:
-                th = await bot.fetch_channel(thread_id)
-            except discord.NotFound:
-                th = None  # Already deleted.
-            except discord.Forbidden as e:
-                log.error('No access to completed Gounament thread %s: %s', thread_id, e)
-            except Exception as e:
-                log.exception('Could not fetch completed Gounament thread %s: %s', thread_id, e)
-        if th is not None:
-            try:
-                await th.delete(reason=f'Gounament match #{int(m["match_no"]):02d} result finalized')
-            except discord.NotFound:
-                pass
-            except discord.Forbidden as e:
-                log.error('Cannot delete Gounament thread %s; grant the bot Manage Threads permission: %s', thread_id, e)
-            except Exception as e:
-                log.exception('Failed to delete completed Gounament thread %s: %s', thread_id, e)
+        await g_publish_final_standings(guild, resolved, winner)
+        await g_db("UPDATE gounament_state SET status='ended' WHERE guild_id=?", (gid,))
 
 async def g_player_labels(guild, match):
     labels=[]
@@ -4286,8 +4378,9 @@ async def tournament_nextround(i):
     if any(not m['p1'] or not m['p2'] for m in ms):return await i.followup.send('Some next-round slots are not filled yet. Resolve the current round first.',ephemeral=True)
     await g_db('UPDATE gounament_state SET current_round=? WHERE guild_id=?',(current+1,str(i.guild_id)))
     for m in ms:await g_make_thread(i.guild,m)
-    await g_host_announce(i.guild, f'▶️ **Round {current+1} has started!** {len(ms)} match thread(s) have been created.')
-    await i.followup.send(f'Round {current+1} opened. {len(ms)} match thread(s) created.',ephemeral=False)
+    stage = await g_round_label(i.guild_id, current+1)
+    await g_host_announce(i.guild, f'▶️ **{stage} have started!** {len(ms)} match thread(s) have been created. Players can now play their matches.')
+    await i.followup.send(f'{stage} opened. {len(ms)} match thread(s) created.',ephemeral=False)
 
 @tournament.command(name='end',description='End the active Gounament and remove Gourny roles')
 async def tournament_end(i):
