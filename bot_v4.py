@@ -3734,6 +3734,8 @@ async def g_publish_bracket(guild):
         # Round 2 is a special case: first-round matches are paired one-to-one
         # with the bye recipients. Later rounds combine two prior matches.
         if rn == 2:
+            # Each bye player is paired with the winner of the first-round
+            # match at the same bracket index.
             source_indexes=(match_index, match_index)
         else:
             source_indexes=(match_index*2, match_index*2+1)
@@ -3777,47 +3779,69 @@ async def g_publish_bracket(guild):
             await g_db('UPDATE gounament_state SET bracket_msg=? WHERE guild_id=?',(str(msg.id),str(guild.id)))
         return
 
-    # Readable bracket: each match is a two-line card with names fitted to the card.
+    # High-readability bracket using a clean sans-serif font and accurate strike-throughs.
+    # Noto Sans has broad Unicode coverage for player names; use DejaVu as fallback.
     try:
-        font=ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',16)
-        small_font=ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',13)
+        font=ImageFont.truetype('/usr/share/fonts/truetype/noto/NotoSans-SemiBold.ttf',19)
+        small_font=ImageFont.truetype('/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf',15)
+        header_font=ImageFont.truetype('/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf',19)
     except Exception:
-        font=ImageFont.load_default()
-        small_font=font
-    card_w=340
-    col_gap=90
-    width=max(900, 80 + rounds*(card_w+col_gap))
+        try:
+            font=ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',19)
+            small_font=ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',15)
+            header_font=ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',19)
+        except Exception:
+            font=small_font=header_font=ImageFont.load_default()
+
+    card_w=390
+    col_gap=105
+    width=max(980, 90 + rounds*(card_w+col_gap))
     max_matches=max(len(v) for v in byround.values())
-    height=max(420, 100 + max_matches*105)
+    card_h=88
+    vertical_gap=34
+    height=max(460, 105 + max_matches*(card_h+vertical_gap))
     im=Image.new('RGB',(width,height),(25,27,33))
     d=ImageDraw.Draw(im)
+
+    def fit_to_width(value, available, active_font):
+        value=str(value)
+        if d.textlength(value,font=active_font)<=available:
+            return value
+        ellipsis='…'
+        while value and d.textlength(value+ellipsis,font=active_font)>available:
+            value=value[:-1]
+        return value.rstrip()+ellipsis
+
+    def draw_player_line(x0,y0,text_value,uid,match,slot):
+        is_loser=bool(match['winner']) and uid is not None and str(uid)!=str(match['winner'])
+        color=(155,160,172) if is_loser else (244,246,250)
+        available=card_w-88
+        shown=fit_to_width(text_value,available,font)
+        d.text((x0,y0),shown,font=font,fill=color,stroke_width=0)
+        if is_loser:
+            # Strike through the visual center of the rendered glyphs, not a fixed y offset.
+            bbox=d.textbbox((x0,y0),shown,font=font)
+            strike_y=(bbox[1]+bbox[3])//2
+            d.line((bbox[0],strike_y,bbox[2],strike_y),fill=(239,105,105),width=3)
+
     for rn,ms in sorted(byround.items()):
         x=45+(rn-1)*(card_w+col_gap)
-        d.text((x,22),f'ROUND {rn}',font=font,fill=(235,238,245))
-        step=(height-100)/(len(ms)+1)
+        d.text((x,22),f'ROUND {rn}',font=header_font,fill=(239,242,248))
+        step=(height-115)/(len(ms)+1)
         for ix,m in enumerate(ms):
             y=int(55+step*(ix+1))
             a,b=bracket_names(rn,ix,m)
-            loser=m['p2'] if m['winner'] and str(m['winner'])==str(m['p1']) else (m['p1'] if m['winner'] else None)
-            a_txt=a.replace('~~','')
-            b_txt=b.replace('~~','')
-            def fit_name(value, max_chars=31):
-                value=str(value)
-                return value if len(value)<=max_chars else value[:max_chars-1]+'…'
-            a_show=fit_name(a_txt)
-            b_show=fit_name(b_txt)
-            d.rounded_rectangle((x,y,x+card_w,y+76),radius=8,outline=(105,118,145),width=2,fill=(31,34,42))
-            d.text((x+12,y+8),f"#{int(m['match_no']):02d}",font=small_font,fill=(160,174,200))
-            d.text((x+62,y+7),a_show,font=font,fill=(245,245,248))
-            d.text((x+62,y+39),b_show,font=font,fill=(245,245,248))
-            if loser and str(loser)==str(m['p1']):
-                bb=d.textbbox((x+62,y+7),a_show,font=font)
-                d.line((bb[0],y+21,bb[2],y+21),fill=(240,105,105),width=2)
-            elif loser and str(loser)==str(m['p2']):
-                bb=d.textbbox((x+62,y+39),b_show,font=font)
-                d.line((bb[0],y+53,bb[2],y+53),fill=(240,105,105),width=2)
+            # Resolve IDs independently so a bye placeholder is never crossed out.
+            uid_a=m['p1']
+            uid_b=m['p2']
+            d.rounded_rectangle((x,y,x+card_w,y+card_h),radius=9,outline=(112,126,153),width=2,fill=(34,37,46))
+            d.text((x+13,y+10),f"#{int(m['match_no']):02d}",font=small_font,fill=(166,181,210))
+            draw_player_line(x+68,y+10,a,uid_a,m,'p1')
+            draw_player_line(x+68,y+49,b,uid_b,m,'p2')
             if m['status']=='disputed':
-                d.text((x+card_w-95,y+8),'DISPUTED',font=small_font,fill=(255,180,80))
+                tag='DISPUTED'
+                tag_w=d.textlength(tag,font=small_font)
+                d.text((x+card_w-tag_w-12,y+10),tag,font=small_font,fill=(255,184,92))
     import io
     buf=io.BytesIO();im.save(buf,format='PNG');buf.seek(0)
     file=discord.File(buf,filename='gounament-bracket.png')
@@ -3920,12 +3944,24 @@ async def g_advance(guild,m,winner,score):
         else:
             await g_host_announce(guild, f'🏆 **The Gounament is finished!** The final round has been completed.')
     nxt=m['round_no']+1
-    allr=await g_db('SELECT COUNT(*) AS n FROM gounament_matches WHERE guild_id=? AND round_no=?',(gid,nxt),True)
-    if allr:
-        target=await g_db('SELECT match_no,p1,p2 FROM gounament_matches WHERE guild_id=? AND round_no=? AND (p1 IS NULL OR p2 IS NULL) ORDER BY match_no LIMIT 1',(gid,nxt),True)
-        if target:
-            slot='p1' if target['p1'] is None else 'p2'
-            await g_db(f'UPDATE gounament_matches SET {slot}=? WHERE guild_id=? AND match_no=?',(str(winner),gid,target['match_no']))
+    next_rows=await g_db('SELECT match_no,p1,p2 FROM gounament_matches WHERE guild_id=? AND round_no=? ORDER BY match_no',(gid,nxt),True,True)
+    if next_rows:
+        # A match always feeds its fixed bracket slot. Do not use the first
+        # empty slot: results can arrive in any order, which otherwise scrambles
+        # bye pairings and makes the bracket show the wrong opponents.
+        current_rows=await g_db('SELECT match_no FROM gounament_matches WHERE guild_id=? AND round_no=? ORDER BY match_no',(gid,m['round_no']),True,True)
+        source_index=next((idx for idx,row in enumerate(current_rows) if int(row['match_no'])==int(m['match_no'])),None)
+        if source_index is not None:
+            target_index=source_index//2
+            if target_index < len(next_rows):
+                target=next_rows[target_index]
+                slot='p1' if source_index % 2 == 0 else 'p2'
+                # Round-one winners enter the second slot because the first
+                # slot is reserved for the bye player. Later rounds use the
+                # normal left/right feeder order.
+                if m['round_no']==1:
+                    slot='p2'
+                await g_db(f'UPDATE gounament_matches SET {slot}=? WHERE guild_id=? AND match_no=?',(str(winner),gid,target['match_no']))
     rch=await g_channel(guild,'results_ch')
     if rch:
         a=guild.get_member(int(m['p1']));b=guild.get_member(int(m['p2']));w=guild.get_member(int(winner))
@@ -3935,10 +3971,33 @@ async def g_advance(guild,m,winner,score):
         await g_publish_final_standings(guild,m,winner)
         await g_db("UPDATE gounament_state SET status='ended' WHERE guild_id=?",(gid,))
     if m['thread_id']:
-        th=guild.get_thread(int(m['thread_id']))
-        if th:
-            try:await th.delete()
-            except Exception as e:log.warning('Gounament thread cleanup: %s',e)
+        th=None
+        try:
+            th=guild.get_thread(int(m['thread_id']))
+            if th is None:
+                # Private match threads are not always present in the guild cache.
+                th=await guild.fetch_channel(int(m['thread_id']))
+        except discord.NotFound:
+            th=None  # Already gone; cleanup is complete.
+        except Exception as e:
+            log.warning('Could not fetch completed Gounament thread %s: %s',m['thread_id'],e)
+        if th is not None:
+            try:
+                await th.delete(reason=f'Gounament match #{m["match_no"]:02d} completed')
+            except discord.NotFound:
+                pass
+            except discord.Forbidden as e:
+                log.warning('Missing permission to delete completed Gounament thread %s: %s',m['thread_id'],e)
+                try:
+                    await th.edit(locked=True,archived=True,reason='Gounament match completed')
+                except Exception as archive_error:
+                    log.warning('Could not archive completed Gounament thread %s: %s',m['thread_id'],archive_error)
+            except Exception as e:
+                log.warning('Gounament thread deletion failed for %s: %s',m['thread_id'],e)
+                try:
+                    await th.edit(locked=True,archived=True,reason='Gounament match completed')
+                except Exception as archive_error:
+                    log.warning('Could not archive completed Gounament thread %s: %s',m['thread_id'],archive_error)
 
 async def g_player_labels(guild, match):
     labels=[]
