@@ -3561,9 +3561,12 @@ async def g_db(sql, args=(), fetch=False, many=False):
         await db.executescript("""
         CREATE TABLE IF NOT EXISTS gounament_state(guild_id TEXT PRIMARY KEY,name TEXT,prize1 TEXT,prize2 TEXT,prize3 TEXT,info TEXT,status TEXT,category_id TEXT,role_id TEXT,registration_ch TEXT,host_ch TEXT,chat_ch TEXT,bracket_ch TEXT,players_ch TEXT,results_ch TEXT,registration_msg TEXT,bracket_msg TEXT,current_round INTEGER DEFAULT 0,created_at TEXT);
         CREATE TABLE IF NOT EXISTS gounament_players(guild_id TEXT,user_id TEXT,signup_msg TEXT,seed INTEGER,PRIMARY KEY(guild_id,user_id));
-        CREATE TABLE IF NOT EXISTS gounament_matches(guild_id TEXT,match_no INTEGER,round_no INTEGER,p1 TEXT,p2 TEXT,winner TEXT,score TEXT,status TEXT DEFAULT 'pending',thread_id TEXT,reporter TEXT,dispute_reason TEXT,PRIMARY KEY(guild_id,match_no));
+        CREATE TABLE IF NOT EXISTS gounament_matches(guild_id TEXT,match_no INTEGER,round_no INTEGER,p1 TEXT,p2 TEXT,winner TEXT,score TEXT,status TEXT DEFAULT 'pending',thread_id TEXT,reporter TEXT,dispute_reason TEXT,bracket_pos INTEGER,PRIMARY KEY(guild_id,match_no));
         CREATE TABLE IF NOT EXISTS gounament_slots(guild_id TEXT,round_no INTEGER,slot_no INTEGER,user_id TEXT,PRIMARY KEY(guild_id,round_no,slot_no));
         """)
+        match_columns = await (await db.execute("PRAGMA table_info(gounament_matches)")).fetchall()
+        if not any(row[1] == 'bracket_pos' for row in match_columns):
+            await db.execute("ALTER TABLE gounament_matches ADD COLUMN bracket_pos INTEGER")
         cur=await db.execute(sql,args)
         rows=await cur.fetchall() if fetch and many else ([await cur.fetchone()] if fetch else None)
         await db.commit()
@@ -3580,9 +3583,12 @@ async def g_init_db():
             await db.executescript("""
             CREATE TABLE IF NOT EXISTS gounament_state(guild_id TEXT PRIMARY KEY,name TEXT,prize1 TEXT,prize2 TEXT,prize3 TEXT,info TEXT,status TEXT,category_id TEXT,role_id TEXT,registration_ch TEXT,host_ch TEXT,chat_ch TEXT,bracket_ch TEXT,players_ch TEXT,results_ch TEXT,registration_msg TEXT,bracket_msg TEXT,current_round INTEGER DEFAULT 0,created_at TEXT);
             CREATE TABLE IF NOT EXISTS gounament_players(guild_id TEXT,user_id TEXT,signup_msg TEXT,seed INTEGER,PRIMARY KEY(guild_id,user_id));
-            CREATE TABLE IF NOT EXISTS gounament_matches(guild_id TEXT,match_no INTEGER,round_no INTEGER,p1 TEXT,p2 TEXT,winner TEXT,score TEXT,status TEXT DEFAULT 'pending',thread_id TEXT,reporter TEXT,dispute_reason TEXT,PRIMARY KEY(guild_id,match_no));
+            CREATE TABLE IF NOT EXISTS gounament_matches(guild_id TEXT,match_no INTEGER,round_no INTEGER,p1 TEXT,p2 TEXT,winner TEXT,score TEXT,status TEXT DEFAULT 'pending',thread_id TEXT,reporter TEXT,dispute_reason TEXT,bracket_pos INTEGER,PRIMARY KEY(guild_id,match_no));
             CREATE TABLE IF NOT EXISTS gounament_slots(guild_id TEXT,round_no INTEGER,slot_no INTEGER,user_id TEXT,PRIMARY KEY(guild_id,round_no,slot_no));
             """)
+            match_columns = await (await db.execute("PRAGMA table_info(gounament_matches)")).fetchall()
+            if not any(row[1] == 'bracket_pos' for row in match_columns):
+                await db.execute("ALTER TABLE gounament_matches ADD COLUMN bracket_pos INTEGER")
             await db.commit()
         _g_db_initialized=True
 
@@ -3741,6 +3747,8 @@ async def g_publish_bracket(guild):
 
     byround={}
     for r in rows:byround.setdefault(r['round_no'],[]).append(r)
+    for rn in byround:
+        byround[rn].sort(key=lambda row: (row['bracket_pos'] if row['bracket_pos'] is not None else row['match_no']))
 
     def bracket_names(rn, match_index, m):
         p1=guild.get_member(int(m['p1'])) if m['p1'] else None
@@ -3753,11 +3761,10 @@ async def g_publish_bracket(guild):
             if player_id:
                 member=guild.get_member(int(player_id))
                 return g_bracket_name(member.display_name if member else f"Player {player_id}")
-            if rn > 1 and source_index < len(previous):
-                source=previous[source_index]
-                return f"Winner of match #{int(source['match_no']):02d}"
-            if rn == 1 and m['winner'] and m['score']=='BYE':
-                return 'Advances (bye)'
+            if rn > 1:
+                source=next((row for row in previous if int(row['bracket_pos'] or 0)==source_index),None)
+                if source:
+                    return f"Winner of match #{int(source['match_no']):02d}"
             return "TBD"
         a=incoming_name(m['p1'], source_indexes[0])
         b=incoming_name(m['p2'], source_indexes[1])
@@ -3795,14 +3802,14 @@ async def g_publish_bracket(guild):
     # Larger, heavier typography so player names remain readable in Discord previews.
     # DejaVu Sans Bold is the primary font because it is commonly available on Linux hosts.
     try:
-        font=ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',26)
-        small_font=ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',18)
-        header_font=ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',23)
+        font=ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',30)
+        small_font=ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',17)
+        header_font=ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',22)
     except Exception:
         try:
-            font=ImageFont.truetype('/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf',26)
-            small_font=ImageFont.truetype('/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf',18)
-            header_font=ImageFont.truetype('/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf',23)
+            font=ImageFont.truetype('/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf',30)
+            small_font=ImageFont.truetype('/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf',17)
+            header_font=ImageFont.truetype('/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf',22)
         except Exception:
             font=small_font=header_font=ImageFont.load_default()
 
@@ -3824,12 +3831,12 @@ async def g_publish_bracket(guild):
             output.append(replacement or '?')
         return ''.join(output)
 
-    card_w=450
-    col_gap=105
+    card_w=390
+    col_gap=65
     width=max(980, 90 + rounds*(card_w+col_gap))
     max_matches=max(len(v) for v in byround.values())
-    card_h=116
-    vertical_gap=34
+    card_h=98
+    vertical_gap=24
     height=max(460, 105 + max_matches*(card_h+vertical_gap))
     im=Image.new('RGB',(width,height),(25,27,33))
     d=ImageDraw.Draw(im)
@@ -3846,7 +3853,7 @@ async def g_publish_bracket(guild):
     def draw_player_line(x0,y0,text_value,uid,match,slot):
         is_loser=bool(match['winner']) and uid is not None and str(uid)!=str(match['winner'])
         color=(155,160,172) if is_loser else (244,246,250)
-        available=card_w-105
+        available=card_w-92
         shown=fit_to_width(text_value,available,font)
         d.text((x0,y0),shown,font=font,fill=color,stroke_width=1,stroke_fill=color)
         if is_loser:
@@ -3866,9 +3873,9 @@ async def g_publish_bracket(guild):
             uid_a=m['p1']
             uid_b=m['p2']
             d.rounded_rectangle((x,y,x+card_w,y+card_h),radius=9,outline=(112,126,153),width=2,fill=(34,37,46))
-            d.text((x+13,y+17),f"#{int(m['match_no']):02d}",font=small_font,fill=(166,181,210))
-            draw_player_line(x+82,y+14,a,uid_a,m,'p1')
-            draw_player_line(x+82,y+66,b,uid_b,m,'p2')
+            d.text((x+12,y+14),f"#{int(m['match_no']):02d}",font=small_font,fill=(166,181,210))
+            draw_player_line(x+76,y+10,a,uid_a,m,'p1')
+            draw_player_line(x+76,y+55,b,uid_b,m,'p2')
             if m['status']=='disputed':
                 tag='DISPUTED'
                 tag_w=d.textlength(tag,font=small_font)
@@ -3975,21 +3982,18 @@ async def g_advance(guild,m,winner,score):
         else:
             await g_host_announce(guild, f'🏆 **The Gounament is finished!** The final round has been completed.')
     nxt=m['round_no']+1
-    next_rows=await g_db('SELECT match_no,p1,p2 FROM gounament_matches WHERE guild_id=? AND round_no=? ORDER BY match_no',(gid,nxt),True,True)
+    next_rows=await g_db('SELECT match_no,p1,p2,bracket_pos FROM gounament_matches WHERE guild_id=? AND round_no=? ORDER BY bracket_pos',(gid,nxt),True,True)
     if next_rows:
         # A match always feeds its fixed bracket slot. Do not use the first
         # empty slot: results can arrive in any order, which otherwise scrambles
         # bye pairings and makes the bracket show the wrong opponents.
-        current_rows=await g_db('SELECT match_no FROM gounament_matches WHERE guild_id=? AND round_no=? ORDER BY match_no',(gid,m['round_no']),True,True)
-        source_index=next((idx for idx,row in enumerate(current_rows) if int(row['match_no'])==int(m['match_no'])),None)
-        if source_index is not None:
-            target_index=source_index//2
-            if target_index < len(next_rows):
-                target=next_rows[target_index]
-                # Preserve the exact bracket side: even feeder -> left slot,
-                # odd feeder -> right slot. Bye advances use the same mapping.
-                slot='p1' if source_index % 2 == 0 else 'p2'
-                await g_db(f'UPDATE gounament_matches SET {slot}=? WHERE guild_id=? AND match_no=?',(str(winner),gid,target['match_no']))
+        source_index=int(m['bracket_pos'] if m['bracket_pos'] is not None else 0)
+        target_index=source_index//2
+        target=next((row for row in next_rows if int(row['bracket_pos'] if row['bracket_pos'] is not None else -1)==target_index),None)
+        if target:
+            # Fixed feeder side: even bracket position -> left, odd -> right.
+            slot='p1' if source_index % 2 == 0 else 'p2'
+            await g_db(f'UPDATE gounament_matches SET {slot}=? WHERE guild_id=? AND match_no=?',(str(winner),gid,target['match_no']))
     rch=await g_channel(guild,'results_ch')
     if rch:
         a=guild.get_member(int(m['p1']));b=guild.get_member(int(m['p2']));w=guild.get_member(int(winner))
@@ -4145,54 +4149,87 @@ async def tournament_start(i):
     players=await g_db('SELECT user_id FROM gounament_players WHERE guild_id=? ORDER BY user_id',(str(i.guild_id),),True,True)
     ids=[p['user_id'] for p in players]
     if len(ids)<2:return await i.followup.send('At least two participants are required.',ephemeral=True)
-    random.shuffle(ids);size=1<<(len(ids)-1).bit_length();byes=size-len(ids)
-    match_count=size//2;total_matches=0
-    # Keep every first-round bracket position, including automatic byes. If
-    # bye rows are omitted, later winners lose their original feeder indexes
-    # and can overwrite the wrong player in round two.
-    bye_match_indexes=set(random.sample(range(match_count),byes)) if byes else set()
-    first_round=[]
-    remaining=list(ids)
-    for index in range(match_count):
-        if index in bye_match_indexes:
-            first_round.append((remaining.pop(),None,True))
-        else:
-            first_round.append((remaining.pop(),remaining.pop(),False))
-    # Pre-fill the exact round-two side fed by each bye match.
-    bye_feeders={}
-    for index,(p1,p2,is_bye) in enumerate(first_round):
-        if is_bye:
-            target_index=index//2
-            slot='p1' if index%2==0 else 'p2'
-            bye_feeders[(target_index,slot)]=p1
+
+    random.shuffle(ids)
+    size=1<<(len(ids)-1).bit_length()
+    bye_count=size-len(ids)
+    first_round_positions=size//2
+    rounds=int(math.log2(size))
+
+    # Select bye positions, then make actual Round 1 pairings only from the
+    # remaining entrants. No synthetic BYE matches are stored or displayed.
+    # Assign at most one bye to each first-round pairing. This guarantees
+    # every empty first-round slot has exactly one player advancing from it.
+    bye_pair_positions=set(random.sample(range(first_round_positions),bye_count)) if bye_count else set()
+    bye_positions=set()
+    for pair_pos in bye_pair_positions:
+        bye_positions.add(pair_pos*2 + random.randrange(2))
+    bracket_slots=[None]*size
+    entrant_iter=iter(ids)
+    for position in range(size):
+        if position not in bye_positions:
+            bracket_slots[position]=next(entrant_iter)
+
+    # Each pair of bracket slots either becomes a real Round 1 match or
+    # advances its sole entrant directly into the matching Round 2 side.
+    round1_pairs=[]
+    bye_advances={}
+    for match_pos in range(first_round_positions):
+        left=bracket_slots[match_pos*2]
+        right=bracket_slots[match_pos*2+1]
+        if left is not None and right is not None:
+            round1_pairs.append((match_pos,left,right))
+        elif left is not None or right is not None:
+            target_index=match_pos//2
+            target_slot='p1' if match_pos%2==0 else 'p2'
+            bye_advances[(target_index,target_slot)]=left or right
+
+    # The number of real first-round matches is exactly half the non-bye entrants.
+    real_matches=[]
+    for match_pos,a,b in round1_pairs:
+        real_matches.append((match_pos,a,b))
+
     async with aiosqlite.connect(DB) as db:
-        await db.execute('DELETE FROM gounament_matches WHERE guild_id=?',(str(i.guild_id),));await db.execute('DELETE FROM gounament_slots WHERE guild_id=?',(str(i.guild_id),))
-        for n,p in enumerate(ids,1):await db.execute('INSERT INTO gounament_players(guild_id,user_id,seed) VALUES(?,?,?) ON CONFLICT(guild_id,user_id) DO UPDATE SET seed=excluded.seed',(str(i.guild_id),p,n))
-        # Insert all first-round bracket positions. Bye rows are already
-        # confirmed and have their winner recorded, but get no private thread.
-        for index,(a,b,is_bye) in enumerate(first_round):
-            total_matches+=1
-            if is_bye:
-                await db.execute("INSERT INTO gounament_matches(guild_id,match_no,round_no,p1,p2,winner,score,status) VALUES(?,?,1,?,NULL,?,'BYE','confirmed')",(str(i.guild_id),total_matches,a,a))
-            else:
-                await db.execute("INSERT INTO gounament_matches(guild_id,match_no,round_no,p1,p2,status) VALUES(?,?,1,?,?,'pending')",(str(i.guild_id),total_matches,a,b))
-        # Create all later rounds and prefill round-two bye advances in their
-        # correct left/right feeder positions. Later rounds start empty.
-        for r in range(2,int(math.log2(size))+1):
+        await db.execute('DELETE FROM gounament_matches WHERE guild_id=?',(str(i.guild_id),))
+        await db.execute('DELETE FROM gounament_slots WHERE guild_id=?',(str(i.guild_id),))
+        for n,uid in enumerate(ids,1):
+            await db.execute(
+                'INSERT INTO gounament_players(guild_id,user_id,seed) VALUES(?,?,?) ON CONFLICT(guild_id,user_id) DO UPDATE SET seed=excluded.seed',
+                (str(i.guild_id),uid,n)
+            )
+
+        next_match_no=1
+        for bracket_pos,a,b in real_matches:
+            await db.execute(
+                "INSERT INTO gounament_matches(guild_id,match_no,round_no,p1,p2,status,bracket_pos) VALUES(?,?,1,?,?,'pending',?)",
+                (str(i.guild_id),next_match_no,a,b,bracket_pos)
+            )
+            next_match_no+=1
+
+        # Create later-round match cards. Round 2 receives bye players directly;
+        # all other positions are populated only when their feeder match wins.
+        for r in range(2,rounds+1):
             count=size//(2**r)
             for slot_no in range(count):
-                total_matches+=1
-                p1=bye_feeders.get((slot_no,'p1')) if r==2 else None
-                p2=bye_feeders.get((slot_no,'p2')) if r==2 else None
-                await db.execute("INSERT INTO gounament_matches(guild_id,match_no,round_no,p1,p2,status) VALUES(?,?,?,?,?,'pending')",(str(i.guild_id),total_matches,r,p1,p2))
+                p1=p2=None
+                if r==2:
+                    p1=bye_advances.get((slot_no,'p1'))
+                    p2=bye_advances.get((slot_no,'p2'))
+                await db.execute(
+                    "INSERT INTO gounament_matches(guild_id,match_no,round_no,p1,p2,status,bracket_pos) VALUES(?,?,?,?,?,'pending',?)",
+                    (str(i.guild_id),next_match_no,r,p1,p2,slot_no)
+                )
+                next_match_no+=1
+
         await db.execute("UPDATE gounament_state SET status='running',current_round=1 WHERE guild_id=?",(str(i.guild_id),))
         await db.commit()
-    # Make sure bye entrants are represented in the next round slots; initial matches remain separate.
+
     await g_publish_bracket(i.guild)
-    ms=await g_db("SELECT * FROM gounament_matches WHERE guild_id=? AND round_no=1 AND p1 IS NOT NULL AND p2 IS NOT NULL",(str(i.guild_id),),True,True)
-    for m in ms:await g_make_thread(i.guild,m)
-    await g_host_announce(i.guild, f'🏁 **The Gounament has started!** Round 1 is now underway with **{len(ids)} players**, **{byes} bye(s)** and **{len(ms)} match(es)**.')
-    await i.followup.send(f'Gounament started: **{len(ids)} players**, **{byes} byes**, **{len(ms)} first-round matches**. First-round threads created.',ephemeral=False)
+    ms=await g_db("SELECT * FROM gounament_matches WHERE guild_id=? AND round_no=1 ORDER BY bracket_pos",(str(i.guild_id),),True,True)
+    for match in ms:
+        await g_make_thread(i.guild,match)
+    await g_host_announce(i.guild, f'🏁 **The Gounament has started!** Round 1 is underway with **{len(ids)} players**, **{bye_count} bye(s)** and **{len(ms)} actual match(es)**. Bye players enter directly in Round 2.')
+    await i.followup.send(f'Gounament started: **{len(ids)} players**, **{bye_count} bye(s)** and **{len(ms)} Round 1 matches**. Bye players are placed directly into Round 2.',ephemeral=False)
 
 @tournament.command(name='nextround',description='Open matches for the next Gounament round')
 async def tournament_nextround(i):
