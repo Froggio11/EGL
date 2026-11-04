@@ -3594,6 +3594,15 @@ async def g_admin(i):
 async def g_channel(guild, field):
     s=await g_state(guild.id)
     return guild.get_channel(int(s[field])) if s and s.get(field) else None
+async def g_host_announce(guild, message):
+    """Post tournament lifecycle updates in the configured #host channel."""
+    ch = await g_channel(guild, 'host_ch')
+    if ch:
+        try:
+            await ch.send(message, allowed_mentions=discord.AllowedMentions.none())
+        except Exception as e:
+            log.warning('Could not post Gounament host announcement: %s', e)
+
 async def g_update_registration(guild):
     s=await g_state(guild.id)
     if not s:return
@@ -3667,20 +3676,22 @@ class GSetupModal(discord.ui.Modal,title='Set up a Gounament'):
         if role: await role.delete(reason='Replacing previous Gounament role')
         role=await i.guild.create_role(name='Gourny',reason='Gounament participant role')
         everyone=i.guild.default_role; admin=discord.utils.get(i.guild.roles,name=ADMIN_ROLE); goon=find_role(i.guild,'Regular Goon'); me=i.guild.me
-        base={everyone:discord.PermissionOverwrite(view_channel=False),me:discord.PermissionOverwrite(view_channel=True,send_messages=True,manage_channels=True,manage_messages=True)}
+        base={everyone:discord.PermissionOverwrite(view_channel=False,create_public_threads=False,create_private_threads=False),me:discord.PermissionOverwrite(view_channel=True,send_messages=True,manage_channels=True,manage_messages=True,create_private_threads=True,create_public_threads=True)}
         # Regular Goon must be explicitly denied: a previous explicit allow
         # on this role overrides the @everyone denial and exposes the channels.
-        if goon:base[goon]=discord.PermissionOverwrite(view_channel=False,send_messages=False,read_message_history=False)
-        if admin:base[admin]=discord.PermissionOverwrite(view_channel=True,send_messages=True,manage_messages=True)
+        if goon:base[goon]=discord.PermissionOverwrite(view_channel=False,send_messages=False,read_message_history=False,create_public_threads=False,create_private_threads=False)
+        if admin:base[admin]=discord.PermissionOverwrite(view_channel=True,send_messages=True,manage_messages=True,create_public_threads=True,create_private_threads=True)
         cat=await i.guild.create_category('Gounament',overwrites=base)
         def perms(kind):
-            d=dict(base);d[role]=discord.PermissionOverwrite(view_channel=True,read_message_history=True,send_messages=kind=='chat')
+            d=dict(base);d[role]=discord.PermissionOverwrite(view_channel=True,read_message_history=True,send_messages=kind=='chat',send_messages_in_threads=True,create_public_threads=False,create_private_threads=False)
             if goon:
-                if kind=='registration':
-                    d[goon]=discord.PermissionOverwrite(view_channel=True,send_messages=False,read_message_history=True)
+                if kind in ('registration','host'):
+                    # Regular Goons can read registration and host history,
+                    # but cannot post or create threads there.
+                    d[goon]=discord.PermissionOverwrite(view_channel=True,send_messages=False,read_message_history=True,create_public_threads=False,create_private_threads=False)
                 else:
-                    d[goon]=discord.PermissionOverwrite(view_channel=False,send_messages=False,read_message_history=False)
-            if kind in ('registration','host') and admin:d[admin]=discord.PermissionOverwrite(view_channel=True,send_messages=True)
+                    d[goon]=discord.PermissionOverwrite(view_channel=False,send_messages=False,read_message_history=False,create_public_threads=False,create_private_threads=False)
+            if admin:d[admin]=discord.PermissionOverwrite(view_channel=True,send_messages=True,manage_messages=True,create_public_threads=True,create_private_threads=True)
             return d
         channels={}
         for nm,kind in [('registration','registration'),('host','host'),('chat','chat'),('bracket','readonly'),('players','readonly'),('results','readonly')]:
@@ -3766,35 +3777,47 @@ async def g_publish_bracket(guild):
             await g_db('UPDATE gounament_state SET bracket_msg=? WHERE guild_id=?',(str(msg.id),str(guild.id)))
         return
 
-    width=max(1000,rounds*300+100);height=max(500,((2**rounds)*42)+100)
-    im=Image.new('RGB',(width,height),(25,27,33));d=ImageDraw.Draw(im)
-    try:font=ImageFont.truetype('DejaVuSans.ttf',15)
-    except Exception:font=ImageFont.load_default()
-    byround={}
-    for r in rows:byround.setdefault(r['round_no'],[]).append(r)
-    for rn,ms in byround.items():
-        x=60+(rn-1)*300;d.text((x,20),f'Round {rn}',font=font,fill=(255,255,255))
-        step=height/(len(ms)+1)
+    # Readable bracket: each match is a two-line card with names fitted to the card.
+    try:
+        font=ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',16)
+        small_font=ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',13)
+    except Exception:
+        font=ImageFont.load_default()
+        small_font=font
+    card_w=340
+    col_gap=90
+    width=max(900, 80 + rounds*(card_w+col_gap))
+    max_matches=max(len(v) for v in byround.values())
+    height=max(420, 100 + max_matches*105)
+    im=Image.new('RGB',(width,height),(25,27,33))
+    d=ImageDraw.Draw(im)
+    for rn,ms in sorted(byround.items()):
+        x=45+(rn-1)*(card_w+col_gap)
+        d.text((x,22),f'ROUND {rn}',font=font,fill=(235,238,245))
+        step=(height-100)/(len(ms)+1)
         for ix,m in enumerate(ms):
-            y=int(step*(ix+1));a,b=bracket_names(rn,ix,m)
-            # Strip Markdown strike markers for the image and draw a line through the losing name.
+            y=int(55+step*(ix+1))
+            a,b=bracket_names(rn,ix,m)
             loser=m['p2'] if m['winner'] and str(m['winner'])==str(m['p1']) else (m['p1'] if m['winner'] else None)
-            a_txt=a.replace('~~','');b_txt=b.replace('~~','')
-            prefix=f"#{m['match_no']:02d}  "
-            left=prefix+a_txt+"  vs  ";right=b_txt
-            d.rounded_rectangle((x,y-14,x+260,y+28),radius=6,outline=(100,110,130),width=2)
-            tx=x+8;ty=y-7
-            d.text((tx,ty),left,font=font,fill=(255,255,255))
-            lx=d.textbbox((tx,ty),left,font=font)[2]
-            d.text((lx,ty),right,font=font,fill=(255,255,255))
+            a_txt=a.replace('~~','')
+            b_txt=b.replace('~~','')
+            def fit_name(value, max_chars=31):
+                value=str(value)
+                return value if len(value)<=max_chars else value[:max_chars-1]+'…'
+            a_show=fit_name(a_txt)
+            b_show=fit_name(b_txt)
+            d.rounded_rectangle((x,y,x+card_w,y+76),radius=8,outline=(105,118,145),width=2,fill=(31,34,42))
+            d.text((x+12,y+8),f"#{int(m['match_no']):02d}",font=small_font,fill=(160,174,200))
+            d.text((x+62,y+7),a_show,font=font,fill=(245,245,248))
+            d.text((x+62,y+39),b_show,font=font,fill=(245,245,248))
             if loser and str(loser)==str(m['p1']):
-                start=d.textbbox((tx,ty),prefix,font=font)[2]
-                end=d.textbbox((tx,ty),prefix+a_txt,font=font)[2]
-                d.line((start,ty+8,end,ty+8),fill=(255,110,110),width=2)
+                bb=d.textbbox((x+62,y+7),a_show,font=font)
+                d.line((bb[0],y+21,bb[2],y+21),fill=(240,105,105),width=2)
             elif loser and str(loser)==str(m['p2']):
-                end=d.textbbox((lx,ty),right,font=font)[2]
-                d.line((lx,ty+8,end,ty+8),fill=(255,110,110),width=2)
-            if m['status']=='disputed':d.text((x+8,y+12),'DISPUTED',font=font,fill=(255,180,80))
+                bb=d.textbbox((x+62,y+39),b_show,font=font)
+                d.line((bb[0],y+53,bb[2],y+53),fill=(240,105,105),width=2)
+            if m['status']=='disputed':
+                d.text((x+card_w-95,y+8),'DISPUTED',font=small_font,fill=(255,180,80))
     import io
     buf=io.BytesIO();im.save(buf,format='PNG');buf.seek(0)
     file=discord.File(buf,filename='gounament-bracket.png')
@@ -3839,9 +3862,63 @@ async def g_make_thread(guild,m):
     await th.send(embed=rules)
     await g_db('UPDATE gounament_matches SET thread_id=? WHERE guild_id=? AND match_no=?',(str(th.id),str(guild.id),m['match_no']))
 
+async def g_publish_final_standings(guild, final_match, champion_id):
+    """Post champion, runner-up and up to top 10, ranking by elimination round."""
+    s=await g_state(guild.id)
+    if not s:
+        return
+    gid=str(guild.id)
+    matches=await g_db("SELECT * FROM gounament_matches WHERE guild_id=? AND p1 IS NOT NULL AND p2 IS NOT NULL AND winner IS NOT NULL ORDER BY round_no DESC, match_no",(gid,),True,True)
+    if not matches:
+        return
+    final_loser = final_match['p2'] if str(champion_id)==str(final_match['p1']) else final_match['p1']
+    placements=[(int(champion_id), 1), (int(final_loser), 2)]
+    # Earlier elimination rounds fill the remaining positions. Players eliminated
+    # in the same round share a placement band; stable match order breaks ties.
+    seen={int(champion_id),int(final_loser)}
+    rank=3
+    for rnd in sorted({m['round_no'] for m in matches}, reverse=True):
+        eliminated=[]
+        for match in matches:
+            if match['round_no'] != rnd:
+                continue
+            loser=match['p2'] if str(match['winner'])==str(match['p1']) else match['p1']
+            if loser and int(loser) not in seen:
+                seen.add(int(loser))
+                eliminated.append(int(loser))
+        for uid in eliminated:
+            if len(placements)>=10:
+                break
+            placements.append((uid,rank))
+            rank+=1
+        if len(placements)>=10:
+            break
+    lines=[]
+    medals={1:"🥇",2:"🥈",3:"🥉"}
+    for uid,pos in placements:
+        member=guild.get_member(uid)
+        if member is None:
+            try: member=await guild.fetch_member(uid)
+            except Exception: member=None
+        label=member.mention if member else f"<@{uid}>"
+        lines.append(f"{medals.get(pos, f'{pos}.')} **{pos}.** {label}")
+    embed=discord.Embed(title=f"🏆 {s['name']} — Final Standings",description="\\n".join(lines),color=0xF1C40F)
+    embed.add_field(name="Champion",value=f"<@{champion_id}>",inline=False)
+    dest=await g_channel(guild,'results_ch') or await g_channel(guild,'host_ch')
+    if dest:
+        await dest.send(embed=embed, allowed_mentions=discord.AllowedMentions(users=True,roles=False,everyone=False))
+
 async def g_advance(guild,m,winner,score):
     gid=str(guild.id);loser=m['p2'] if winner==m['p1'] else m['p1']
     await g_db("UPDATE gounament_matches SET winner=?,score=?,status='confirmed' WHERE guild_id=? AND match_no=? AND status!='confirmed'",(str(winner),score,gid,m['match_no']))
+    # Announce only when every actual match in this round has been confirmed.
+    round_state=await g_db("SELECT COUNT(*) AS total, SUM(CASE WHEN status='confirmed' THEN 1 ELSE 0 END) AS done FROM gounament_matches WHERE guild_id=? AND round_no=? AND p1 IS NOT NULL AND p2 IS NOT NULL",(gid,m['round_no']),True)
+    if round_state and round_state['total'] and round_state['total']==(round_state['done'] or 0):
+        next_state=await g_db('SELECT COUNT(*) AS n FROM gounament_matches WHERE guild_id=? AND round_no=?',(gid,m['round_no']+1),True)
+        if next_state and next_state['n']:
+            await g_host_announce(guild, f'✅ **Round {m["round_no"]} is finished.** All matches are confirmed. Waiting for a League Admin to start the next round with `/tournament nextround`.')
+        else:
+            await g_host_announce(guild, f'🏆 **The Gounament is finished!** The final round has been completed.')
     nxt=m['round_no']+1
     allr=await g_db('SELECT COUNT(*) AS n FROM gounament_matches WHERE guild_id=? AND round_no=?',(gid,nxt),True)
     if allr:
@@ -3854,6 +3931,9 @@ async def g_advance(guild,m,winner,score):
         a=guild.get_member(int(m['p1']));b=guild.get_member(int(m['p2']));w=guild.get_member(int(winner))
         await rch.send(f"**Match #{m['match_no']:02d} – Round {m['round_no']}**\n{w.mention if w else winner} defeated {(b if str(winner)==m['p1'] else a).mention if (b if str(winner)==m['p1'] else a) else loser} ({score})")
     await g_publish_bracket(guild)
+    if not (next_state and next_state['n']):
+        await g_publish_final_standings(guild,m,winner)
+        await g_db("UPDATE gounament_state SET status='ended' WHERE guild_id=?",(gid,))
     if m['thread_id']:
         th=guild.get_thread(int(m['thread_id']))
         if th:
@@ -3897,8 +3977,24 @@ class GScoreSelect(discord.ui.Select):
             try: member=await i.guild.fetch_member(int(other))
             except Exception: member=None
         view=GConfirmResultView(self.match['match_no'],self.winner,score,str(i.user.id))
+        # Resolve readable names for the proposed result so the opponent knows
+        # exactly what they are confirming. The score is always winner-first.
+        winner_member=i.guild.get_member(int(self.winner))
+        if winner_member is None:
+            try: winner_member=await i.guild.fetch_member(int(self.winner))
+            except Exception: winner_member=None
+        loser_id=self.match['p1'] if str(self.winner)==str(self.match['p2']) else self.match['p2']
+        loser_member=i.guild.get_member(int(loser_id))
+        if loser_member is None:
+            try: loser_member=await i.guild.fetch_member(int(loser_id))
+            except Exception: loser_member=None
+        winner_name=winner_member.display_name if winner_member else f'User {self.winner}'
+        loser_name=loser_member.display_name if loser_member else f'User {loser_id}'
+        proposed=(f'**Proposed result — Match #{int(self.match["match_no"]):02d}**\n'
+                  f'**{winner_name}** defeated **{loser_name}** ({score}, winner first).\n\n'
+                  f'{member.mention if member else f"<@{other}>"}: please confirm or dispute this result.')
         await i.response.edit_message(content='Result submitted. The other player has been asked to confirm or dispute it.',view=None)
-        await i.followup.send(f'{member.mention if member else f"<@{other}>"}: confirm or dispute this result.',view=view,ephemeral=False,allowed_mentions=discord.AllowedMentions(users=True,roles=False,everyone=False))
+        await i.followup.send(proposed,view=view,ephemeral=False,allowed_mentions=discord.AllowedMentions(users=True,roles=False,everyone=False))
 class GScoreSelectView(discord.ui.View):
     def __init__(self,m,w):super().__init__(timeout=300);self.add_item(GScoreSelect(m,w))
 class GResultView(discord.ui.View):
@@ -3954,16 +4050,18 @@ async def tournament_close_reg(i):
     if not s or s['status']!='registration':return await i.response.send_message('Registration is not open.',ephemeral=True)
     await g_db("UPDATE gounament_state SET status='closed' WHERE guild_id=?",(str(i.guild_id),))
     await g_update_registration(i.guild)
+    await g_host_announce(i.guild, '🔒 **Registration is closed.** The player list is locked. Waiting for a League Admin to start the tournament.')
     await i.response.send_message('Gounament registration is closed. Use `/tournament start` when ready.',ephemeral=True)
 
 @tournament.command(name='start',description='Generate the Gounament bracket and first-round matches')
 async def tournament_start(i):
     if not await g_admin(i):return
+    await i.response.defer(ephemeral=False, thinking=True)
     s=await g_state(i.guild_id)
-    if not s or s['status']!='closed':return await i.response.send_message('Close registration first.',ephemeral=True)
+    if not s or s['status']!='closed':return await i.followup.send('Close registration first.',ephemeral=True)
     players=await g_db('SELECT user_id FROM gounament_players WHERE guild_id=? ORDER BY user_id',(str(i.guild_id),),True,True)
     ids=[p['user_id'] for p in players]
-    if len(ids)<2:return await i.response.send_message('At least two participants are required.',ephemeral=True)
+    if len(ids)<2:return await i.followup.send('At least two participants are required.',ephemeral=True)
     random.shuffle(ids);size=1<<(len(ids)-1).bit_length();byes=size-len(ids)
     # Randomly allocate byes; remaining entrants are paired.
     bye_ids=set(random.sample(ids,byes)) if byes else set();round1=[x for x in ids if x not in bye_ids]
@@ -3993,24 +4091,27 @@ async def tournament_start(i):
     await g_publish_bracket(i.guild)
     ms=await g_db('SELECT * FROM gounament_matches WHERE guild_id=? AND round_no=1',(str(i.guild_id),),True,True)
     for m in ms:await g_make_thread(i.guild,m)
-    await i.response.send_message(f'Gounament started: **{len(ids)} players**, **{byes} byes**, **{len(pairs)} first-round matches**. First-round threads created.',ephemeral=False)
+    await g_host_announce(i.guild, f'🏁 **The Gounament has started!** Round 1 is now underway with **{len(ids)} players**, **{byes} bye(s)** and **{len(pairs)} match(es)**.')
+    await i.followup.send(f'Gounament started: **{len(ids)} players**, **{byes} byes**, **{len(pairs)} first-round matches**. First-round threads created.',ephemeral=False)
 
 @tournament.command(name='nextround',description='Open matches for the next Gounament round')
 async def tournament_nextround(i):
     if not await g_admin(i):return
+    await i.response.defer(ephemeral=False, thinking=True)
     s=await g_state(i.guild_id)
-    if not s or s['status']!='running':return await i.response.send_message('No running Gounament.',ephemeral=True)
+    if not s or s['status']!='running':return await i.followup.send('No running Gounament.',ephemeral=True)
     current=s['current_round']
     openm=await g_db("SELECT COUNT(*) AS n FROM gounament_matches WHERE guild_id=? AND round_no=? AND status!='confirmed' AND p1 IS NOT NULL AND p2 IS NOT NULL",(str(i.guild_id),current),True)
-    if openm and openm['n']:return await i.response.send_message(f'{openm["n"]} match(es) are not confirmed yet, including disputed matches.',ephemeral=True)
+    if openm and openm['n']:return await i.followup.send(f'{openm["n"]} match(es) are not confirmed yet, including disputed matches.',ephemeral=True)
     total=await g_db('SELECT COUNT(*) AS n FROM gounament_matches WHERE guild_id=? AND round_no=?',(str(i.guild_id),current+1),True)
     if not total or total['n']==0:
-        return await i.response.send_message('The Gounament is finished. No next round remains.',ephemeral=True)
+        return await i.followup.send('The Gounament is finished. No next round remains.',ephemeral=True)
     ms=await g_db('SELECT * FROM gounament_matches WHERE guild_id=? AND round_no=?',(str(i.guild_id),current+1),True,True)
-    if any(not m['p1'] or not m['p2'] for m in ms):return await i.response.send_message('Some next-round slots are not filled yet. Resolve the current round first.',ephemeral=True)
+    if any(not m['p1'] or not m['p2'] for m in ms):return await i.followup.send('Some next-round slots are not filled yet. Resolve the current round first.',ephemeral=True)
     await g_db('UPDATE gounament_state SET current_round=? WHERE guild_id=?',(current+1,str(i.guild_id)))
     for m in ms:await g_make_thread(i.guild,m)
-    await i.response.send_message(f'Round {current+1} opened. {len(ms)} match thread(s) created.',ephemeral=False)
+    await g_host_announce(i.guild, f'▶️ **Round {current+1} has started!** {len(ms)} match thread(s) have been created.')
+    await i.followup.send(f'Round {current+1} opened. {len(ms)} match thread(s) created.',ephemeral=False)
 
 @tournament.command(name='end',description='End the active Gounament and remove Gourny roles')
 async def tournament_end(i):
@@ -4046,7 +4147,21 @@ class GConfirmAdminView(discord.ui.View):
                 try:await m.remove_roles(role,reason='Gounament ended/reset')
                 except Exception as e:log.warning('Could not remove Gourny role from %s: %s',p['user_id'],e)
         if self.action=='end':
-            await g_db("UPDATE gounament_state SET status='ended' WHERE guild_id=?",(str(i.guild_id),))
+            # Remove the actual registration post before marking the tournament ended.
+            # The channel remains in place; only the rules/prizes/register message is deleted.
+            reg_channel = i.guild.get_channel(int(s['registration_ch'])) if s.get('registration_ch') else None
+            reg_message_id = s.get('registration_msg')
+            if reg_channel and reg_message_id:
+                try:
+                    reg_message = await reg_channel.fetch_message(int(reg_message_id))
+                    await reg_message.delete()
+                except discord.NotFound:
+                    pass
+                except discord.Forbidden as e:
+                    log.warning('Cannot delete Gounament registration message %s: %s', reg_message_id, e)
+                except Exception as e:
+                    log.warning('Could not delete Gounament registration message %s: %s', reg_message_id, e)
+            await g_db("UPDATE gounament_state SET status='ended', registration_msg=NULL WHERE guild_id=?",(str(i.guild_id),))
             for m in await g_db('SELECT thread_id FROM gounament_matches WHERE guild_id=?',(str(i.guild_id),),True,True):
                 th=i.guild.get_thread(int(m['thread_id'])) if m['thread_id'] else None
                 if th:
