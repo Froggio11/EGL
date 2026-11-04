@@ -3553,10 +3553,17 @@ _g_db_initialized=False
 _g_db_init_lock=asyncio.Lock()
 
 async def g_db(sql, args=(), fetch=False, many=False):
-    if not _g_db_initialized:
-        await g_init_db()
+    # Ensure the Gounament schema on the SAME SQLite connection used by the
+    # query. This avoids stale process-level initialization flags and protects
+    # against a missing table if the database file was recreated/replaced.
     async with aiosqlite.connect(DB) as db:
         db.row_factory=aiosqlite.Row
+        await db.executescript("""
+        CREATE TABLE IF NOT EXISTS gounament_state(guild_id TEXT PRIMARY KEY,name TEXT,prize1 TEXT,prize2 TEXT,prize3 TEXT,info TEXT,status TEXT,category_id TEXT,role_id TEXT,registration_ch TEXT,host_ch TEXT,chat_ch TEXT,bracket_ch TEXT,players_ch TEXT,results_ch TEXT,registration_msg TEXT,bracket_msg TEXT,current_round INTEGER DEFAULT 0,created_at TEXT);
+        CREATE TABLE IF NOT EXISTS gounament_players(guild_id TEXT,user_id TEXT,signup_msg TEXT,seed INTEGER,PRIMARY KEY(guild_id,user_id));
+        CREATE TABLE IF NOT EXISTS gounament_matches(guild_id TEXT,match_no INTEGER,round_no INTEGER,p1 TEXT,p2 TEXT,winner TEXT,score TEXT,status TEXT DEFAULT 'pending',thread_id TEXT,reporter TEXT,dispute_reason TEXT,PRIMARY KEY(guild_id,match_no));
+        CREATE TABLE IF NOT EXISTS gounament_slots(guild_id TEXT,round_no INTEGER,slot_no INTEGER,user_id TEXT,PRIMARY KEY(guild_id,round_no,slot_no));
+        """)
         cur=await db.execute(sql,args)
         rows=await cur.fetchall() if fetch and many else ([await cur.fetchone()] if fetch else None)
         await db.commit()
@@ -3877,40 +3884,21 @@ class GScoreSelect(discord.ui.Select):
         super().__init__(placeholder='Choose the score (winner first)',options=[discord.SelectOption(label=x,value=x) for x in ['3-0','3-1','3-2']])
     async def callback(self,i):
         score=self.values[0]
-        # The confirmer is ALWAYS the participant who did not submit /1v1 result.
-        # Do not derive this from the selected winner: the reporter may report either player as winner.
-        reporter=str(i.user.id)
-        p1,p2=str(self.match['p1']),str(self.match['p2'])
-        if reporter == p1:
-            other=p2
-        elif reporter == p2:
-            other=p1
-        else:
-            return await i.response.send_message('Only match participants can submit a result.',ephemeral=True)
+        # Confirmation must go to the other participant, not the loser.
+        # The reporter is the person who invoked /1v1 result; the opponent
+        # is determined from reporter identity, regardless of who won.
+        other=self.match['p2'] if str(i.user.id)==str(self.match['p1']) else self.match['p1']
         cur=await g_db('SELECT status FROM gounament_matches WHERE guild_id=? AND match_no=?',(str(i.guild_id),self.match['match_no']),True)
         if not cur or cur['status']!='pending':
             return await i.response.edit_message(content='This match is no longer accepting a result.',view=None)
-        await g_db("UPDATE gounament_matches SET reporter=?,score=?,winner=?,status='awaiting_confirmation' WHERE guild_id=? AND match_no=? AND status='pending'",(reporter,score,self.winner,str(i.guild_id),self.match['match_no']))
-        winner_member=i.guild.get_member(int(self.winner))
-        if winner_member is None:
-            try: winner_member=await i.guild.fetch_member(int(self.winner))
-            except Exception: winner_member=None
-        loser_id=p2 if self.winner==p1 else p1
-        loser_member=i.guild.get_member(int(loser_id))
-        if loser_member is None:
-            try: loser_member=await i.guild.fetch_member(int(loser_id))
-            except Exception: loser_member=None
-        other_member=i.guild.get_member(int(other))
-        if other_member is None:
-            try: other_member=await i.guild.fetch_member(int(other))
-            except Exception: other_member=None
-        winner_label=winner_member.display_name if winner_member else f'User {self.winner}'
-        loser_label=loser_member.display_name if loser_member else f'User {loser_id}'
-        view=GConfirmResultView(self.match['match_no'],self.winner,score,reporter)
+        await g_db("UPDATE gounament_matches SET reporter=?,score=?,winner=?,status='awaiting_confirmation' WHERE guild_id=? AND match_no=? AND status='pending'",(str(i.user.id),score,self.winner,str(i.guild_id),self.match['match_no']))
+        member=i.guild.get_member(int(other))
+        if member is None:
+            try: member=await i.guild.fetch_member(int(other))
+            except Exception: member=None
+        view=GConfirmResultView(self.match['match_no'],self.winner,score,str(i.user.id))
         await i.response.edit_message(content='Result submitted. The other player has been asked to confirm or dispute it.',view=None)
-        # Show the exact proposed score before the opponent confirms. Score is winner-first.
-        mention=other_member.mention if other_member else f'<@{other}>'
-        await i.followup.send(f'**Proposed result – Match #{int(self.match["match_no"]):02d}**\n**{winner_label}** defeated **{loser_label}** ({score}, winner first).\n{mention}: please confirm or dispute this result.',view=view,ephemeral=False,allowed_mentions=discord.AllowedMentions(users=True,roles=False,everyone=False))
+        await i.followup.send(f'{member.mention if member else f"<@{other}>"}: confirm or dispute this result.',view=view,ephemeral=False,allowed_mentions=discord.AllowedMentions(users=True,roles=False,everyone=False))
 class GScoreSelectView(discord.ui.View):
     def __init__(self,m,w):super().__init__(timeout=300);self.add_item(GScoreSelect(m,w))
 class GResultView(discord.ui.View):
@@ -4058,19 +4046,7 @@ class GConfirmAdminView(discord.ui.View):
                 try:await m.remove_roles(role,reason='Gounament ended/reset')
                 except Exception as e:log.warning('Could not remove Gourny role from %s: %s',p['user_id'],e)
         if self.action=='end':
-            # Remove the public registration embed/buttons when the tournament ends,
-            # while keeping the registration channel and the rest of its history.
-            reg_ch=i.guild.get_channel(int(s['registration_ch'])) if s.get('registration_ch') else None
-            reg_msg_id=s.get('registration_msg')
-            if reg_ch and reg_msg_id:
-                try:
-                    reg_msg=await reg_ch.fetch_message(int(reg_msg_id))
-                    await reg_msg.delete()
-                except discord.NotFound:
-                    pass
-                except Exception as e:
-                    log.warning('Could not delete Gounament registration message: %s',e)
-            await g_db("UPDATE gounament_state SET status='ended', registration_msg=NULL WHERE guild_id=?",(str(i.guild_id),))
+            await g_db("UPDATE gounament_state SET status='ended' WHERE guild_id=?",(str(i.guild_id),))
             for m in await g_db('SELECT thread_id FROM gounament_matches WHERE guild_id=?',(str(i.guild_id),),True,True):
                 th=i.guild.get_thread(int(m['thread_id'])) if m['thread_id'] else None
                 if th:
