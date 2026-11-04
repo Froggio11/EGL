@@ -3746,7 +3746,10 @@ async def g_publish_bracket(guild):
     if not ch:return
 
     byround={}
-    for r in rows:byround.setdefault(r['round_no'],[]).append(r)
+    for r in rows:
+        if r['round_no']==1 and (not r['p1'] or not r['p2']):
+            continue
+        byround.setdefault(r['round_no'],[]).append(r)
     for rn in byround:
         byround[rn].sort(key=lambda row: (row['bracket_pos'] if row['bracket_pos'] is not None else row['match_no']))
 
@@ -3756,7 +3759,8 @@ async def g_publish_bracket(guild):
         previous=byround.get(rn-1, [])
         # Every match is fed by the winners of two adjacent matches in the
         # previous round. Bye advances occupy their original feeder position.
-        source_indexes=(match_index*2, match_index*2+1)
+        bracket_index=int(m['bracket_pos'] if m['bracket_pos'] is not None else match_index)
+        source_indexes=(bracket_index*2, bracket_index*2+1)
         def incoming_name(player_id, source_index):
             if player_id:
                 member=guild.get_member(int(player_id))
@@ -3771,8 +3775,6 @@ async def g_publish_bracket(guild):
         loser=None
         if m['winner']:
             loser=m['p2'] if str(m['winner'])==str(m['p1']) else m['p1']
-        if loser and str(loser)==str(m['p1']): a=f"~~{a}~~"
-        elif loser and str(loser)==str(m['p2']): b=f"~~{b}~~"
         return a,b
 
     # Keep the bot operational on hosts that do not have Pillow installed.
@@ -3782,6 +3784,9 @@ async def g_publish_bracket(guild):
             lines.append(f"**Round {rn}**")
             for ix,m in enumerate(matches):
                 a,b=bracket_names(rn,ix,m)
+                if m['winner']:
+                    if str(m['winner'])==str(m['p1']): b=f"~~{b}~~"
+                    elif str(m['winner'])==str(m['p2']): a=f"~~{a}~~"
                 winner=guild.get_member(int(m['winner'])) if m['winner'] else None
                 status=f" — **{winner.display_name} wins ({m['score']})**" if winner else (" — **DISPUTED**" if m['status']=='disputed' else " — Pending")
                 lines.append(f"`#{m['match_no']:02d}` {a} vs {b}{status}")
@@ -3802,14 +3807,14 @@ async def g_publish_bracket(guild):
     # Larger, heavier typography so player names remain readable in Discord previews.
     # DejaVu Sans Bold is the primary font because it is commonly available on Linux hosts.
     try:
-        font=ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',30)
-        small_font=ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',17)
-        header_font=ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',22)
+        font=ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',28)
+        small_font=ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',16)
+        header_font=ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',20)
     except Exception:
         try:
-            font=ImageFont.truetype('/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf',30)
-            small_font=ImageFont.truetype('/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf',17)
-            header_font=ImageFont.truetype('/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf',22)
+            font=ImageFont.truetype('/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf',28)
+            small_font=ImageFont.truetype('/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf',16)
+            header_font=ImageFont.truetype('/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf',20)
         except Exception:
             font=small_font=header_font=ImageFont.load_default()
 
@@ -3831,11 +3836,11 @@ async def g_publish_bracket(guild):
             output.append(replacement or '?')
         return ''.join(output)
 
-    card_w=390
+    card_w=430
     col_gap=65
     width=max(980, 90 + rounds*(card_w+col_gap))
     max_matches=max(len(v) for v in byround.values())
-    card_h=98
+    card_h=92
     vertical_gap=24
     height=max(460, 105 + max_matches*(card_h+vertical_gap))
     im=Image.new('RGB',(width,height),(25,27,33))
@@ -3853,9 +3858,9 @@ async def g_publish_bracket(guild):
     def draw_player_line(x0,y0,text_value,uid,match,slot):
         is_loser=bool(match['winner']) and uid is not None and str(uid)!=str(match['winner'])
         color=(155,160,172) if is_loser else (244,246,250)
-        available=card_w-92
+        available=card_w-100
         shown=fit_to_width(text_value,available,font)
-        d.text((x0,y0),shown,font=font,fill=color,stroke_width=1,stroke_fill=color)
+        d.text((x0,y0),shown,font=font,fill=color)
         if is_loser:
             # Strike through the visual center of the rendered glyphs, not a fixed y offset.
             bbox=d.textbbox((x0,y0),shown,font=font)
@@ -3874,8 +3879,8 @@ async def g_publish_bracket(guild):
             uid_b=m['p2']
             d.rounded_rectangle((x,y,x+card_w,y+card_h),radius=9,outline=(112,126,153),width=2,fill=(34,37,46))
             d.text((x+12,y+14),f"#{int(m['match_no']):02d}",font=small_font,fill=(166,181,210))
-            draw_player_line(x+76,y+10,a,uid_a,m,'p1')
-            draw_player_line(x+76,y+55,b,uid_b,m,'p2')
+            draw_player_line(x+78,y+8,a,uid_a,m,'p1')
+            draw_player_line(x+78,y+50,b,uid_b,m,'p2')
             if m['status']=='disputed':
                 tag='DISPUTED'
                 tag_w=d.textlength(tag,font=small_font)
@@ -4156,38 +4161,48 @@ async def tournament_start(i):
     first_round_positions=size//2
     rounds=int(math.log2(size))
 
-    # Select bye positions, then make actual Round 1 pairings only from the
-    # remaining entrants. No synthetic BYE matches are stored or displayed.
-    # Assign at most one bye to each first-round pairing. This guarantees
-    # every empty first-round slot has exactly one player advancing from it.
-    bye_pair_positions=set(random.sample(range(first_round_positions),bye_count)) if bye_count else set()
-    bye_positions=set()
-    for pair_pos in bye_pair_positions:
-        bye_positions.add(pair_pos*2 + random.randrange(2))
-    bracket_slots=[None]*size
-    entrant_iter=iter(ids)
-    for position in range(size):
-        if position not in bye_positions:
-            bracket_slots[position]=next(entrant_iter)
+    # Select the bye players first. Every other entrant must be paired in
+    # Round 1. A Round 1 feeder position either contains one bye player
+    # (who enters Round 2 directly) or one real match (two players).
+    # Round 2 match slots are fed by pairs of adjacent Round 1 positions.
+    target_count=size//4
+    if bye_count >= target_count:
+        bye_positions=set()
+        # Ensure every Round 2 match receives at least one direct bye entrant.
+        for target_index in range(target_count):
+            bye_positions.add(target_index*2 + random.randrange(2))
+        remaining_byes=bye_count-len(bye_positions)
+        available=[pos for pos in range(first_round_positions) if pos not in bye_positions]
+        if remaining_byes:
+            bye_positions.update(random.sample(available,remaining_byes))
+    else:
+        bye_positions=set(random.sample(range(first_round_positions),bye_count))
 
-    # Each pair of bracket slots either becomes a real Round 1 match or
-    # advances its sole entrant directly into the matching Round 2 side.
+    bye_ids=set(random.sample(ids,bye_count)) if bye_count else set()
+    bye_players=list(bye_ids)
+    random.shuffle(bye_players)
+    round1_players=[uid for uid in ids if uid not in bye_ids]
+    random.shuffle(round1_players)
+
     round1_pairs=[]
     bye_advances={}
+    bye_iter=iter(bye_players)
+    player_iter=iter(round1_players)
     for match_pos in range(first_round_positions):
-        left=bracket_slots[match_pos*2]
-        right=bracket_slots[match_pos*2+1]
-        if left is not None and right is not None:
-            round1_pairs.append((match_pos,left,right))
-        elif left is not None or right is not None:
-            target_index=match_pos//2
-            target_slot='p1' if match_pos%2==0 else 'p2'
-            bye_advances[(target_index,target_slot)]=left or right
+        target_index=match_pos//2
+        target_slot='p1' if match_pos%2==0 else 'p2'
+        if match_pos in bye_positions:
+            bye_advances[(target_index,target_slot)]=next(bye_iter)
+        else:
+            a=next(player_iter)
+            b=next(player_iter)
+            round1_pairs.append((match_pos,a,b))
 
-    # The number of real first-round matches is exactly half the non-bye entrants.
-    real_matches=[]
-    for match_pos,a,b in round1_pairs:
-        real_matches.append((match_pos,a,b))
+    # Safety checks: every registered player is placed exactly once, and
+    # no Round 1 match contains an empty/bye slot.
+    placed=[uid for _,a,b in round1_pairs for uid in (a,b)] + list(bye_advances.values())
+    assert len(placed)==len(ids) and set(placed)==set(ids)
+    assert all(a and b for _,a,b in round1_pairs)
 
     async with aiosqlite.connect(DB) as db:
         await db.execute('DELETE FROM gounament_matches WHERE guild_id=?',(str(i.guild_id),))
@@ -4199,7 +4214,7 @@ async def tournament_start(i):
             )
 
         next_match_no=1
-        for bracket_pos,a,b in real_matches:
+        for bracket_pos,a,b in round1_pairs:
             await db.execute(
                 "INSERT INTO gounament_matches(guild_id,match_no,round_no,p1,p2,status,bracket_pos) VALUES(?,?,1,?,?,'pending',?)",
                 (str(i.guild_id),next_match_no,a,b,bracket_pos)
@@ -4228,8 +4243,32 @@ async def tournament_start(i):
     ms=await g_db("SELECT * FROM gounament_matches WHERE guild_id=? AND round_no=1 ORDER BY bracket_pos",(str(i.guild_id),),True,True)
     for match in ms:
         await g_make_thread(i.guild,match)
-    await g_host_announce(i.guild, f'🏁 **The Gounament has started!** Round 1 is underway with **{len(ids)} players**, **{bye_count} bye(s)** and **{len(ms)} actual match(es)**. Bye players enter directly in Round 2.')
-    await i.followup.send(f'Gounament started: **{len(ids)} players**, **{bye_count} bye(s)** and **{len(ms)} Round 1 matches**. Bye players are placed directly into Round 2.',ephemeral=False)
+    total_matches = len(ids) - 1
+    bye_names = []
+    for uid in bye_advances.values():
+        member = i.guild.get_member(int(uid))
+        bye_names.append(member.display_name if member else f'Player {uid}')
+    bye_text = ', '.join(f'**{discord.utils.escape_markdown(name)}**' for name in bye_names) if bye_names else 'None'
+
+    host_message = (
+        f'🏁 **{discord.utils.escape_markdown(s.get("name") or "The Gounament")} has started!**\n'
+        f'**Participants:** {len(ids)}\n'
+        f'**Byes awarded:** {bye_count}\n'
+        f'**Round 1 matches:** {len(ms)}\n'
+        f'**Total matches in the tournament:** {total_matches}\n\n'
+        f'**Why are there byes?** A single-elimination bracket needs a power-of-two number of slots '
+        f'(2, 4, 8, 16, etc.). Because {len(ids)} players registered, {bye_count} player(s) were '
+        f'randomly given a bye so the bracket fits correctly.\n'
+        f'**Players with a bye:** {bye_text}. They are already placed in Round 2 and do not play in Round 1.\n\n'
+        f'**All other players:** Please complete your Round 1 match and wait. Round 2 will only begin '
+        f'when every Round 1 match is finished and a League Admin starts the next round.'
+    )
+    await g_host_announce(i.guild, host_message)
+    await i.followup.send(
+        f'Gounament started: **{len(ids)} players**, **{bye_count} bye(s)**, '
+        f'**{len(ms)} Round 1 matches** and **{total_matches} total matches**.',
+        ephemeral=False
+    )
 
 @tournament.command(name='nextround',description='Open matches for the next Gounament round')
 async def tournament_nextround(i):
