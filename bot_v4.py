@@ -27,8 +27,49 @@ def parse_schedule(s):
     yr=datetime.now(timezone.utc).year
     return datetime.strptime(f"{day:02d} {mon} {yr} {h:02d}:{mi:02d}","%d %b %Y %H:%M").replace(tzinfo=timezone.utc)
 RANKS=[(0,"Awakened"),(900,"Adept"),(1000,"Elementalist"),(1050,"Master"),(1100,"Ascendant"),(1150,"Avatar")]
+# Commands allowed while the emergency command lock is enabled.
+LEAGUE_ADMIN_COMMANDS={
+    "setup run","setup reset","scrimbot setup","scrimbot reset","setchannel",
+    "guide","matchrules","scrimguide",
+    "league create","league delete","league end","league finals","league tiebreaker","league grandfinal",
+    "deleteteam","resetallteams","resetteams","scrimban","forcecaptainswap","forcekick","forcenamechange",
+    "schedulestatus","schedulereview","closematch","mmr adjust","recordadjust",
+    "generatematch week","test generatematches","leaderboard","teaminfoall","backup","restore",
+    "tournament setup","tournament close-reg","tournament start","tournament nextround",
+    "tournament end","tournament reset","tournament closematch",
+    "disablecommands","enablecommands",
+}
+
+class EGLCommandTree(app_commands.CommandTree):
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.guild_id is None:
+            return True
+        try:
+            async with aiosqlite.connect(DB) as db:
+                async with db.execute(
+                    "SELECT commands_disabled FROM bot_controls WHERE guild_id=?",
+                    (str(interaction.guild_id),)
+                ) as cur:
+                    row=await cur.fetchone()
+            disabled=bool(row and row[0])
+        except Exception:
+            log.exception("Could not read command-lock state")
+            disabled=True  # Fail closed if the saved lock state cannot be read.
+
+        if not disabled:
+            return True
+        qualified=interaction.command.qualified_name if interaction.command else ""
+        if qualified in LEAGUE_ADMIN_COMMANDS and is_admin(interaction.user):
+            return True
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                "🔒 **Commands are temporarily disabled.** Only League Admin commands are available. "
+                "Ask a League Admin to run `/enablecommands`.", ephemeral=True
+            )
+        return False
+
 intents=discord.Intents.default();intents.members=True;intents.message_content=True
-bot=commands.Bot(command_prefix="!",intents=intents)
+bot=commands.Bot(command_prefix="!",intents=intents,tree_cls=EGLCommandTree)
 
 # Serialize private-thread member additions so match generation does not
 # burst Discord's thread-member endpoint and trigger repeated 429s.
@@ -92,6 +133,7 @@ async def init_db():
         CREATE TABLE IF NOT EXISTS scrim_v2(sid TEXT PRIMARY KEY,guild_id TEXT,date TEXT,thread_id TEXT,msg_id TEXT,thread_msg_id TEXT,max_players INT DEFAULT 4,scrim_title TEXT,unix_time INT,pinged INT DEFAULT 0,cleanup_retry_at INT);
         CREATE TABLE IF NOT EXISTS scrim_signups_v2(sid TEXT,guild_id TEXT,user_id TEXT,position INT,PRIMARY KEY(sid,user_id));
         CREATE TABLE IF NOT EXISTS scrim_bans(guild_id TEXT,user_id TEXT,expires_at INT,PRIMARY KEY(guild_id,user_id));
+        CREATE TABLE IF NOT EXISTS bot_controls(guild_id TEXT PRIMARY KEY,commands_disabled INTEGER NOT NULL DEFAULT 0,updated_at TEXT);
         """)
         # Migrate: track which Sunday generation cycle has already run.
         try:await db.execute("ALTER TABLE season ADD COLUMN last_generation_cycle TEXT")
@@ -355,6 +397,38 @@ async def need_admin(i):
     if not is_admin(i.user):
         await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return False
     return True
+
+@bot.tree.command(name="disablecommands",description="Temporarily disable all non-League-Admin commands")
+async def disablecommands_cmd(i: discord.Interaction):
+    if not await need_admin(i):
+        return
+    gid=str(i.guild_id)
+    async with aiosqlite.connect(DB) as db:
+        await db.execute(
+            "INSERT INTO bot_controls(guild_id,commands_disabled,updated_at) VALUES(?,1,?) "
+            "ON CONFLICT(guild_id) DO UPDATE SET commands_disabled=1,updated_at=excluded.updated_at",
+            (gid,datetime.now(timezone.utc).isoformat())
+        )
+        await db.commit()
+    await i.response.send_message(
+        "🔒 **Commands disabled.** Only League Admin commands are available. "
+        "This setting remains active after a bot restart. Use `/enablecommands` to unlock commands.",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="enablecommands",description="Re-enable all bot commands")
+async def enablecommands_cmd(i: discord.Interaction):
+    if not await need_admin(i):
+        return
+    gid=str(i.guild_id)
+    async with aiosqlite.connect(DB) as db:
+        await db.execute(
+            "INSERT INTO bot_controls(guild_id,commands_disabled,updated_at) VALUES(?,0,?) "
+            "ON CONFLICT(guild_id) DO UPDATE SET commands_disabled=0,updated_at=excluded.updated_at",
+            (gid,datetime.now(timezone.utc).isoformat())
+        )
+        await db.commit()
+    await i.response.send_message("🔓 **All commands are enabled again.**",ephemeral=True)
 
 def team_captain_ids(t):
     if not t:return []
@@ -2085,7 +2159,15 @@ async def team_create(i,name:str,clantag:str):
     if await team_get(gid,name):await i.response.send_message(f"\u274c Exists.",ephemeral=True);return
     if await is_on_cooldown(gid,uid):await i.response.send_message("\u274c 24h cooldown.",ephemeral=True);return
     start_mmr=await get_player_mmr(gid,uid)
-    await i.response.defer()
+    # Another callback/check may already have acknowledged this interaction.
+    # Never attempt a second initial response; continue with a followup instead.
+    if not i.response.is_done():
+        try:
+            await i.response.defer(thinking=True)
+        except discord.HTTPException as e:
+            if getattr(e, "code", None) != 40060:
+                raise
+            log.warning("team_create interaction %s was already acknowledged; continuing with followup", i.id)
     async with aiosqlite.connect(DB)as db:await db.execute("INSERT INTO teams (guild_id,name,display,captain_id,secondary_captain_id,wins,losses,mmr,thread_id,role_id,created_at,clantag) VALUES (?,?,?,?,NULL,0,0,?,NULL,NULL,?,?)",(gid,name.lower(),name,uid,start_mmr,datetime.now(timezone.utc).isoformat(),clantag));await db.execute("INSERT INTO members VALUES(?,?,?)",(gid,name.lower(),uid));await db.execute("DELETE FROM fa WHERE guild_id=? AND user_id=?",(gid,uid));await db.commit()
     c=await cfg_get(gid);tr=await add_roles(i.guild,i.user,name,captain=True)
     role_id=str(tr.id)if tr else None;thread_id=None
