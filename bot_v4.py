@@ -1405,9 +1405,9 @@ async def setup_run(i):
     if goon:open_perm[goon]=discord.PermissionOverwrite(read_messages=True,send_messages=True)
     # #recruiting is a forum: Regular Goons can create LFG/LFT posts and reply.
     forum_perm=_base()
-    if ar:forum_perm[ar]=discord.PermissionOverwrite(read_messages=True,send_messages=True,create_forum_threads=True,send_messages_in_threads=True)
-    forum_perm[i.guild.me]=discord.PermissionOverwrite(read_messages=True,send_messages=True,create_forum_threads=True,send_messages_in_threads=True)
-    if goon:forum_perm[goon]=discord.PermissionOverwrite(read_messages=True,send_messages=False,create_forum_threads=True,send_messages_in_threads=True)
+    if ar:forum_perm[ar]=discord.PermissionOverwrite(read_messages=True,send_messages=True,create_public_threads=True,send_messages_in_threads=True)
+    forum_perm[i.guild.me]=discord.PermissionOverwrite(read_messages=True,send_messages=True,create_public_threads=True,send_messages_in_threads=True)
+    if goon:forum_perm[goon]=discord.PermissionOverwrite(read_messages=True,send_messages=False,create_public_threads=True,send_messages_in_threads=True)
     # #teams is a read-only team directory for Regular Goons; private team threads remain usable.
     teams_view_perm=_base()
     if goon:teams_view_perm[goon]=discord.PermissionOverwrite(read_messages=True,send_messages=False,send_messages_in_threads=True,create_private_threads=False,create_public_threads=False)
