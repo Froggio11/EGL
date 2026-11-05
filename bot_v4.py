@@ -1,6 +1,6 @@
 # Elements Divided League Bot v5 — Elite Goon League
 # pip install discord.py aiosqlite
-# 3v3 league, max 4 players/team, rank-based system
+# 2v2 league, max 3 players/team, rank-based system
 import asyncio,logging,os,uuid,random,unicodedata
 from datetime import datetime,timezone,timedelta
 import aiosqlite,discord
@@ -9,7 +9,7 @@ from discord.ext import commands,tasks
 logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(message)s")
 log=logging.getLogger(__name__)
 TOKEN=os.environ.get("DISCORD_BOT_TOKEN","")
-DB="league.db";DEFAULT_MMR=1000;MAX_TEAM=5;SEASON_WEEKS=8
+DB="league.db";DEFAULT_MMR=1000;MAX_TEAM=3;SEASON_WEEKS=8
 ADMIN_ROLE="League Admin";TESTER_ROLE="EGL Tester";SPOON_ROLE="Spoon";SCRIM_BAN_ROLE="Scrim Banned"
 MAPS=["Chessboard","Portal Mayhem","Construction Site","Parking Lot"]
 SCHED_FMT="%d %b %H:%M";SCHED_HELP="DD Mon HH:MM or 8pm (e.g. 05 Aug 20:00 or 05 Aug 8pm)"
@@ -84,10 +84,12 @@ async def init_db():
         CREATE TABLE IF NOT EXISTS player_history(guild_id TEXT,user_id TEXT,last_mmr INT DEFAULT 1000,cooldown_until TEXT,PRIMARY KEY(guild_id,user_id));
         CREATE TABLE IF NOT EXISTS guild_settings(guild_id TEXT PRIMARY KEY,teams_ch TEXT);
         CREATE TABLE IF NOT EXISTS leaderboard_state(guild_id TEXT PRIMARY KEY,ch TEXT,msg TEXT);
+        CREATE TABLE IF NOT EXISTS roster_state(guild_id TEXT PRIMARY KEY,ch TEXT,msg TEXT);
+        CREATE TABLE IF NOT EXISTS team_commands_state(guild_id TEXT PRIMARY KEY,ch TEXT);
         CREATE TABLE IF NOT EXISTS setup_data(guild_id TEXT PRIMARY KEY,league_name TEXT,league_category_id TEXT,matches_category_id TEXT,announcements_ch TEXT,general_ch TEXT,teams_ch TEXT,fa_ch TEXT,matches_ch TEXT,results_ch TEXT);
-        CREATE TABLE IF NOT EXISTS scrim_sessions(guild_id TEXT,date TEXT,thread_id TEXT,msg_id TEXT,max_players INT DEFAULT 6,PRIMARY KEY(guild_id,date));
+        CREATE TABLE IF NOT EXISTS scrim_sessions(guild_id TEXT,date TEXT,thread_id TEXT,msg_id TEXT,max_players INT DEFAULT 4,PRIMARY KEY(guild_id,date));
         CREATE TABLE IF NOT EXISTS scrim_signups(guild_id TEXT,date TEXT,user_id TEXT,position INT,PRIMARY KEY(guild_id,date,user_id));
-        CREATE TABLE IF NOT EXISTS scrim_v2(sid TEXT PRIMARY KEY,guild_id TEXT,date TEXT,thread_id TEXT,msg_id TEXT,thread_msg_id TEXT,max_players INT DEFAULT 6,scrim_title TEXT,unix_time INT,pinged INT DEFAULT 0,cleanup_retry_at INT);
+        CREATE TABLE IF NOT EXISTS scrim_v2(sid TEXT PRIMARY KEY,guild_id TEXT,date TEXT,thread_id TEXT,msg_id TEXT,thread_msg_id TEXT,max_players INT DEFAULT 4,scrim_title TEXT,unix_time INT,pinged INT DEFAULT 0,cleanup_retry_at INT);
         CREATE TABLE IF NOT EXISTS scrim_signups_v2(sid TEXT,guild_id TEXT,user_id TEXT,position INT,PRIMARY KEY(sid,user_id));
         CREATE TABLE IF NOT EXISTS scrim_bans(guild_id TEXT,user_id TEXT,expires_at INT,PRIMARY KEY(guild_id,user_id));
         """)
@@ -110,7 +112,7 @@ async def init_db():
         try:await db.execute("ALTER TABLE teams ADD COLUMN clantag TEXT")
         except:pass
         # Migrate: add new columns to scrim_sessions if missing
-        for col,typ in [("max_players","INT DEFAULT 6"),("scrim_title","TEXT"),("unix_time","INT"),("thread_id","TEXT"),("thread_msg_id","TEXT"),("pinged","INT DEFAULT 0")]:
+        for col,typ in [("max_players","INT DEFAULT 4"),("scrim_title","TEXT"),("unix_time","INT"),("thread_id","TEXT"),("thread_msg_id","TEXT"),("pinged","INT DEFAULT 0")]:
             try:await db.execute(f"ALTER TABLE scrim_sessions ADD COLUMN {col} {typ}")
             except:pass
         # Persist mixed-scrim deletion retries across scheduler iterations/restarts.
@@ -125,7 +127,7 @@ async def init_db():
                 dd=r.get("date")or""
                 if not dd:continue
                 await db.execute("INSERT OR IGNORE INTO scrim_v2(sid,guild_id,date,thread_id,msg_id,thread_msg_id,max_players,scrim_title,unix_time,pinged) VALUES(?,?,?,?,?,NULL,?,?,?,0)",
-                    ("L"+dd,r.get("guild_id"),dd,r.get("thread_id"),r.get("msg_id"),r.get("max_players")or 6,r.get("scrim_title")or"Mixed Scrim",r.get("unix_time")))
+                    ("L"+dd,r.get("guild_id"),dd,r.get("thread_id"),r.get("msg_id"),r.get("max_players")or 4,r.get("scrim_title")or"Mixed Scrim",r.get("unix_time")))
             async with db.execute("SELECT * FROM scrim_signups")as c:
                 lsign=[dict(r)for r in await c.fetchall()]
             for r in lsign:
@@ -137,6 +139,29 @@ async def init_db():
                 await db.execute("DELETE FROM scrim_signups")
                 log.info("migrated %d legacy scrims",len(legacy))
         except Exception as e:log.warning("scrim migrate: %s",e)
+        # Enforce the roster cap at database level too, so concurrent invites
+        # or future commands cannot add a fourth member.
+        await db.execute("""
+            CREATE TRIGGER IF NOT EXISTS limit_team_members
+            BEFORE INSERT ON members
+            WHEN (SELECT COUNT(*) FROM members
+                  WHERE guild_id=NEW.guild_id AND team_name=NEW.team_name) >= 3
+            BEGIN
+                SELECT RAISE(ABORT, 'Team roster is limited to 3 players');
+            END
+        """)
+        # Existing active mixed scrims must also follow the new 2v2 capacity.
+        await db.execute("UPDATE scrim_v2 SET max_players=4 WHERE max_players>4")
+        # Keep oversized legacy rosters intact (no players are removed), but
+        # they will not be eligible for new league matches until corrected.
+        async with db.execute("""
+            SELECT guild_id, team_name, COUNT(*) AS n
+            FROM members GROUP BY guild_id, team_name HAVING COUNT(*) > 3
+        """) as c:
+            oversized = await c.fetchall()
+        for row in oversized:
+            log.warning("Team %s in guild %s has %s members; reduce roster to 3 before it can play.",
+                        row[1], row[0], row[2])
         await db.commit()
 
 async def cfg_get(gid):
@@ -144,6 +169,33 @@ async def cfg_get(gid):
         db.row_factory=aiosqlite.Row
         async with db.execute("SELECT * FROM config WHERE guild_id=?",(gid,))as c:
             r=await c.fetchone();return dict(r)if r else None
+
+async def team_commands_channel(guild):
+    """Return #general inside the EGL category for team commands and invites."""
+    gid=str(guild.id)
+    async with aiosqlite.connect(DB) as db:
+        async with db.execute("SELECT ch FROM team_commands_state WHERE guild_id=?",(gid,)) as cur:
+            row=await cur.fetchone()
+    ch=guild.get_channel(int(row[0])) if row and row[0] else None
+    # Never reuse a stale ID that points to the previously proposed management channel.
+    if not (isinstance(ch,discord.TextChannel) and ch.name=="general" and ch.category and ch.category.name=="EGL"):
+        ch=None
+    if ch is None:
+        egl_category=discord.utils.get(guild.categories,name="EGL")
+        if egl_category:
+            ch=discord.utils.get(egl_category.text_channels,name="general")
+    return ch
+
+async def log_team_action(guild, message, view=None):
+    """Post team-management activity in #general under the EGL category."""
+    ch=await team_commands_channel(guild)
+    if ch:
+        try:
+            await ch.send(message,view=view)
+            return ch
+        except Exception as e:
+            log.warning("Could not post team activity in EGL #general: %s",e)
+    return None
 
 async def team_get(gid,name):
     async with aiosqlite.connect(DB)as db:
@@ -195,7 +247,7 @@ async def scrim_signup_count(sid):
 async def scrim_max_players(sid):
     async with aiosqlite.connect(DB)as db:
         async with db.execute("SELECT max_players FROM scrim_v2 WHERE sid=?",(sid,))as c:
-            r=await c.fetchone();return r[0]if r and r[0] else 6
+            r=await c.fetchone();return r[0]if r and r[0] else 4
 
 async def scrim_signups_active(sid):
     max_p=await scrim_max_players(sid)
@@ -353,6 +405,7 @@ async def addcaptain_cmd(i,name:discord.Member):
         except Exception as e:
             log.warning("Could not add second captain %s to match thread %s: %s",target_id,tr["thread_id"],e)
     await i.response.send_message(f"\u2705 {name.mention} is now the second captain of **{t['display']}** and has the same **Captain** role. Added to {added_threads} active match thread(s).")
+    await log_team_action(i.guild,f"\u265c {name.mention} was made second captain of **{t['display']}** by {i.user.mention}.")
 
 # ===== Views =====
 async def captain_team(gid,uid):
@@ -1193,7 +1246,7 @@ async def gen_matches(guild,c,force=False,target_week=None):
     if week<1:return
     if week>SEASON_WEEKS and not force:return
     ts=await teams_all(gid)
-    eligible=[t for t in ts if len(t.get("members",[]))>=3]
+    eligible=[t for t in ts if 2 <= len(t.get("members",[])) <= MAX_TEAM]
     names=[t["display"]for t in eligible]
     n=len(names)
     if n<2:return
@@ -1259,7 +1312,7 @@ async def gen_matches(guild,c,force=False,target_week=None):
                     if is_admin(m)and str(m.id)not in added:
                         if await add_thread_member_safely(th,m):
                             added.add(str(m.id))
-                await th.send(f"⚡ **{a} vs {b} - Week {week}**\nEveryone's here! **Captains, use `/schedule` to choose a match day and time.** Once both captains confirm, the map vote will open.")
+                await th.send(f"⚡ **{a} vs {b} - Week {week}**\nEveryone's here! **Only 2 players per team may play; any third roster member is the reserve.** Captains, use `/schedule` to choose a match day and time. Once both captains confirm, the map vote will open.")
             except Exception as e:log.warning("Thread: %s",e)
         lines=[f"⚡ **Week {week} Matches**",""]+[f"• **{a}** vs **{b}**"for _,a,b in match_ids]+["","Check threads!"]
         await ch.send("\n".join(lines))
@@ -1278,8 +1331,8 @@ async def gen_matches(guild,c,force=False,target_week=None):
 @bot.tree.command(name="guide",description="Post the league guide (League Admin only)")
 async def guide_cmd(i):
     if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
-    embed1=discord.Embed(title="\U0001f4d6 EGL - Elite Goon League",description="Welcome to the EGL, our own 3v3 competitive league for Elements Divided.",color=0x5865F2)
-    embed1.add_field(name="\U0001f3c6 League Format",value="- Teams of **up to 5 players**\n- Season lasts **8 weeks**\n- Matches every **Sunday 10pm GMT**\n- You play **1 match a week** - sometimes **2** if there are lots of teams, so everyone gets to play everyone\n- Captains vote on map (coin flip on tie)\n- **Top 4** advance to Finals, then Grand Final!",inline=False)
+    embed1=discord.Embed(title="\U0001f4d6 EGL - Elite Goon League",description="Welcome to the EGL, our own 2v2 competitive league for Elements Divided.",color=0x5865F2)
+    embed1.add_field(name="\U0001f3c6 League Format",value="- Teams of **up to 3 players** (2 players compete in each 2v2 match; the third can be a substitute)\n- Season lasts **8 weeks**\n- Matches every **Sunday 10pm GMT**\n- You play **1 match a week** - sometimes **2** if there are lots of teams, so everyone gets to play everyone\n- Captains vote on map (coin flip on tie)\n- **Top 4** advance to Finals, then Grand Final!",inline=False)
     embed1.add_field(name="\U0001f4ca Ranks",value="\U0001f7e4 Awakened\n\u26aa Adept\n\U0001f7e1 **Elementalist** *(start)*\n\U0001f7e2 Master\n\U0001f535 Ascendant\n\U0001f451 Avatar",inline=True)
     embed1.add_field(name="MMR System",value="**Who you play matters:**\nWin vs a stronger team = **bigger gain**\nWin vs a weaker team = **smaller gain**\nLose vs a stronger team = **smaller loss**\nLose vs a weaker team = **bigger loss**\n\n**How you play matters too:**\nSweep (3-0) = **bigger reward**\nClose game (3-2) = **smaller reward**",inline=True)
     embed1.add_field(name="\u23f1\ufe0f Rules",value="- **24h cooldown** after leaving/disbanding\n- Returning players inherit **old team's MMR**",inline=False)
@@ -1301,16 +1354,16 @@ async def guide_cmd(i):
 async def matchrules_cmd(i):
     if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
     rules_embed=discord.Embed(title="\U0001f4dc Match Rules",color=0x9b59b6)
-    rules_embed.add_field(name="\U0001f525 Element Rules",value="Play **anything you want**, as long as there are no copies.\n- Example: You can't play 2x fire, but you can play fire and explosion.\n- **No duplicate ultimates** on a team (e.g. 3 players = 3 different ults)",inline=False)
+    rules_embed.add_field(name="\U0001f525 Element Rules",value="Play **anything you want**, as long as there are no copies.\n- Example: You can't play 2x fire, but you can play fire and explosion.\n- **No duplicate ultimates** on a team (2 players = 2 different ults)",inline=False)
     rules_embed.add_field(name="\U0001f3ae Game Rules",value="- **Control point:** OFF\n- **Damage zone:** ON\n- **Game mode:** Rounds\n- **Rounds to win:** 3 (BO5)\n- **Stage hazards:** ON\n- **Off map damage:** ON\n- **Multipliers:** All x1",inline=False)
     rules_embed.add_field(name="\U0001f3a8 Team Shader Rule",value="All players on the same team must use the same team shader during the match. Captains are responsible for making sure their team follows this rule.",inline=False)
     rules_embed.add_field(name="\U0001f30d Server Region",value="- All matches are played on **EU servers by default**.\n- **US servers are allowed only when every player in the match is from the US.**\n- If there is **even one EU player**, the match must be played on EU servers.",inline=False)
     rules_embed.add_field(name="\U0001f5fa\ufe0f Map",value="Voted on after the match time is set.",inline=False)
     rules_embed.add_field(name="\u26a1 Toggles",value="- Powerups: OFF\n- Ultimates: ON\n- Techniques: ON\n- Blocking: ON\n- Perfect blocking: ON\n- Dashing: ON",inline=False)
-    rules_embed.add_field(name="\U0001f465 Match Size",value="- All matches must be scheduled as **3v3**. Teams cannot agree to play 2v2 or any other reduced match format.",inline=False)
-    rules_embed.add_field(name="\u23f0 No-Shows & Forfeits",value="- If some of your team **doesn't show up within 15 minutes**, you can either **play with the players available** (e.g. 2v3 or 1v3) or **forfeit** (3-0 loss).\n- If a team **can't play** that week, they forfeit the match **3-0**.\n- If you **can't agree on a time**, contact the League Admins.\n- Captains are responsible for the rules - a match played with invalid rules **must be replayed**.",inline=False)
+    rules_embed.add_field(name="\U0001f465 Match Size",value="- All matches must be scheduled as **2v2**. Each team may use exactly 2 players per match. A third roster member may be kept as a substitute, but cannot join that match.",inline=False)
+    rules_embed.add_field(name="\u23f0 No-Shows & Forfeits",value="- If some of your team **doesn't show up within 15 minutes**, you can either **play with the players available** (e.g. 1v2) or **forfeit** (3-0 loss).\n- If a team **can't play** that week, they forfeit the match **3-0**.\n- If you **can't agree on a time**, contact the League Admins.\n- Captains are responsible for the rules - a match played with invalid rules **must be replayed**.",inline=False)
     rules_embed.add_field(name="\u2696\ufe0f Scheduling Disputes",value="- If teams cannot agree on a match time, an **impartial League Admin or assigned neutral person** will review the scheduling chat.\n- They will decide whether either team failed to make a reasonable effort, whether both teams tried their best, and who should forfeit if necessary.\n- Decisions will be based on the chat history and each team's effort to find a suitable time.",inline=False)
-    rules_embed.add_field(name="\ud83d\udeab Substitutes",value="- **No subs** - nobody outside your team can join the match\n- You play with your own roster only",inline=False)
+    rules_embed.add_field(name="\ud83d\udeab Substitutes",value="- **No outside substitutes** - only players on your registered roster may play\n- Each match is still **2v2**: if your roster has 3 players, one must sit out as the reserve",inline=False)
     rules_embed.add_field(name="\U0001f91d Sportsmanship",value="- We trust all players and teams to act with good sportsmanship, respect, and honesty.\n- Treat opponents fairly, respect agreed match arrangements, and avoid toxic behaviour, harassment, or deliberate rule abuse.\n- Disagreements should be handled respectfully. If an issue cannot be resolved between both teams, contact a League Admin.\n- Everyone is expected to play in good faith and help keep the league competitive, fair, and enjoyable for everyone.",inline=False)
     await i.response.send_message(embed=rules_embed)
 
@@ -1319,7 +1372,7 @@ async def matchrules_cmd(i):
 async def scrimguide_cmd(i):
     if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
     embed=discord.Embed(title="\U0001f3ae Scrims Guide",description="Casual practice matches - no league points, just fun.",color=0xe67e22)
-    embed.add_field(name="\U0001f4dd How it works",value="`/create mixedscrim time:20:00` - **anyone can create one**\n- **3v3 = 6 spots**\n- Click **Sign Up** in #mixed-scrims to join\n- Once 6 players are in, anyone else goes on the **Up Next** queue\n- If someone drops out, the **first person in the queue is pulled in** automatically",inline=False)
+    embed.add_field(name="\U0001f4dd How it works",value="`/create mixedscrim time:20:00` - **anyone can create one**\n- **2v2 = 4 spots**\n- Click **Sign Up** in #mixed-scrims to join\n- Once 4 players are in, anyone else goes on the **Up Next** queue\n- If someone drops out, the **first person in the queue is pulled in** automatically",inline=False)
     embed.add_field(name="\u23f1\ufe0f Before you sign up",value="Scrims usually last **around an hour**.\nMake sure you have the **time and the charge** before you sign up - don't leave your team short.",inline=False)
     embed.add_field(name="\U0001f6aa If you drop out",value="You **have to get a new player in** to replace you.\nDon't just sign off and leave - the next person in the **Up Next** queue gets pulled in automatically, but it's on you to make sure the spot is filled.",inline=False)
     embed.add_field(name="\U0001f9f5 The scrim thread",value="Every scrim gets its own thread - everyone signed up (and everyone in the queue) is added automatically.\n\nIn the thread you'll see the live list, plus:\n- **Sign Off** - drop out\n- **Ask for Queue** - ping the next player in line to fill a spot",inline=False)
@@ -1338,7 +1391,7 @@ async def setup_run(i):
             if await cur.fetchone():await i.followup.send("\u274c Already set up. Use `/setup reset` first.",ephemeral=True);return
     ev=i.guild.default_role;ar=discord.utils.get(i.guild.roles,name=ADMIN_ROLE)
     goon=discord.utils.get(i.guild.roles,name="Regular Goon")
-    bot_override=discord.PermissionOverwrite(send_messages=True,read_messages=True)
+    bot_override=discord.PermissionOverwrite(send_messages=True,read_messages=True,send_messages_in_threads=True,create_private_threads=True)
     everyone_deny=discord.PermissionOverwrite(read_messages=False,send_messages=False,add_reactions=False)
     def _base():
         d={ev:everyone_deny,i.guild.me:bot_override}
@@ -1350,34 +1403,47 @@ async def setup_run(i):
     if goon:react_only[goon]=discord.PermissionOverwrite(read_messages=True,send_messages=False,add_reactions=True)
     open_perm=_base()
     if goon:open_perm[goon]=discord.PermissionOverwrite(read_messages=True,send_messages=True)
+    # #recruiting is a forum: Regular Goons can create LFG/LFT posts and reply.
+    forum_perm=_base()
+    if ar:forum_perm[ar]=discord.PermissionOverwrite(read_messages=True,send_messages=True,create_forum_threads=True,send_messages_in_threads=True)
+    forum_perm[i.guild.me]=discord.PermissionOverwrite(read_messages=True,send_messages=True,create_forum_threads=True,send_messages_in_threads=True)
+    if goon:forum_perm[goon]=discord.PermissionOverwrite(read_messages=True,send_messages=False,create_forum_threads=True,send_messages_in_threads=True)
+    # #teams is a read-only team directory for Regular Goons; private team threads remain usable.
+    teams_view_perm=_base()
+    if goon:teams_view_perm[goon]=discord.PermissionOverwrite(read_messages=True,send_messages=False,send_messages_in_threads=True,create_private_threads=False,create_public_threads=False)
     cat_perm=_base()
     if goon:cat_perm[goon]=discord.PermissionOverwrite(read_messages=True)
     try:
         lcat=await i.guild.create_category("EGL",overwrites=cat_perm)
         ann=await i.guild.create_text_channel("announcements",category=lcat,overwrites=admin_only)
         guide_ch=await i.guild.create_text_channel("guide",category=lcat,overwrites=admin_only)
+        admin_cmd_ch=await i.guild.create_text_channel("admin-commands",category=lcat,overwrites=admin_only)
         gen=await i.guild.create_text_channel("general",category=lcat,overwrites=open_perm)
-        tch=await i.guild.create_text_channel("teams",category=lcat,overwrites=open_perm)
-        rec=await i.guild.create_forum("recruiting",category=lcat,overwrites=open_perm)
+        tch=await i.guild.create_text_channel("teams",category=lcat,overwrites=teams_view_perm)
+        rec=await i.guild.create_forum("recruiting",category=lcat,overwrites=forum_perm)
         mcat=await i.guild.create_category("Matches",overwrites=cat_perm)
         mat=await i.guild.create_text_channel("matches",category=mcat,overwrites=react_only)
+        mr=await i.guild.create_text_channel("match-rules",category=mcat,overwrites=admin_only)
         res=await i.guild.create_text_channel("results",category=mcat,overwrites=react_only)
         lb=await i.guild.create_text_channel("leaderboard",category=mcat,overwrites=admin_only)
-        mr=await i.guild.create_text_channel("match-rules",category=mcat,overwrites=admin_only)
+        ov=await i.guild.create_text_channel("overseer",category=mcat,overwrites=admin_only)
     except Exception as e:await i.followup.send(f"\u274c Failed: {e}");return
     async with aiosqlite.connect(DB)as db:
         await db.execute("INSERT INTO setup_data VALUES(?,?,?,?,?,?,?,?,?,?)",(gid,"EGL",str(lcat.id),str(mcat.id),str(ann.id),str(gen.id),str(tch.id),"",str(mat.id),str(res.id)))
+        await db.execute("INSERT OR REPLACE INTO team_commands_state VALUES(?,?)",(gid,str(gen.id)))
         await db.commit()
     msg="\u2694\ufe0f **Elite Goon League is live.**\nAll channels and permissions have been configured.\n\n"
     msg+=f"{ann.mention} \u2014 Announcements\n"
     msg+=f"{guide_ch.mention} \u2014 Player guide\n"
+    msg+=f"{admin_cmd_ch.mention} \u2014 Admin commands\n"
     msg+=f"{gen.mention} \u2014 General chat\n"
-    msg+=f"{tch.mention} \u2014 Team threads\n"
-    msg+=f"{rec.mention} \u2014 Recruiting (looking for team)\n"
+    msg+=f"{tch.mention} \u2014 Team directory (read-only) + private team threads\n"
+    msg+=f"{rec.mention} \u2014 Recruiting forum (LFG / LFT posts; Regular Goons can create posts)\n"
     msg+=f"{mat.mention} \u2014 Match schedule\n"
+    msg+=f"{mr.mention} \u2014 Match rules\n"
     msg+=f"{res.mention} \u2014 Results\n"
     msg+=f"{lb.mention} \u2014 Leaderboard\n"
-    msg+=f"{mr.mention} \u2014 Match rules\n\n"
+    msg+=f"{ov.mention} \u2014 Overseer leaderboard\n\n"
     await i.followup.send(msg)
 @setup.command(name="reset",description="Delete all bot channels and reset")
 async def setup_reset(i):
@@ -1407,7 +1473,11 @@ async def setup_reset(i):
                 await cat.delete()
             except:pass
             break
-    async with aiosqlite.connect(DB)as db:await db.execute("DELETE FROM setup_data WHERE guild_id=?",(gid,));await db.commit()
+    async with aiosqlite.connect(DB)as db:
+        await db.execute("DELETE FROM setup_data WHERE guild_id=?",(gid,))
+        await db.execute("DELETE FROM team_commands_state WHERE guild_id=?",(gid,))
+        await db.execute("DELETE FROM roster_state WHERE guild_id=?",(gid,))
+        await db.commit()
     await i.followup.send("\u2705 Reset complete.")
 
 # ===== /scrimbot =====
@@ -1478,6 +1548,44 @@ async def overseer_leaderboard(i):
         lines.append(f"**{rank}.** {name} — **{count}** match{'es' if count != 1 else ''}")
 
     await i.response.send_message("\n".join(lines))
+
+@overseer.command(name="rules",description="Show the Overseer spectating and recording rules")
+async def overseer_rules(i):
+    embed=discord.Embed(
+        title="👁️ Overseer Rules",
+        description=(
+            "As soon as a match is scheduled, you guys get pinged and you can choose to Spectate.\n\n"
+            "- Go to the match thread and click **👁️ Spectate Match**.\n"
+            "- As soon as you join, set everything up immediately. **Do NOT make the teams wait for you.**\n"
+            "- **Do NOT talk to the teams.** Let them set up and start their match without interruption.\n"
+            "- Keep VC + mic **OFF** at all times. You should not hear them, and they should not hear you.\n"
+            "- Once everything is ready, join as a spectator and start recording.\n"
+            "- Record the entire match from start to finish.\n"
+            "- Do not communicate, give callouts, or interfere with the teams in any way.\n"
+            "- Keep your camera/head movement as smooth as possible. Avoid sharp joystick turns if possible.\n"
+            "- Send the recording after the match."
+        ),
+        color=0x5865F2
+    )
+    embed.add_field(
+        name="Recording",
+        value=(
+            "Make sure the footage is clear and watchable. Very shaky/jagged footage may not be used. "
+            "Show the leaderboard when the game starts and when it ends, so everyone can see the stats."
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="Thumbnail",
+        value="Thumbnails are optional. Ask the team if they want to provide one. If not, that's completely fine.",
+        inline=False
+    )
+    embed.add_field(
+        name="Your job",
+        value="Set up quickly → stay muted → let the teams play → record the full match → send the video.",
+        inline=False
+    )
+    await i.response.send_message(embed=embed)
 
 league=app_commands.Group(name="league",description="League management")
 @league.command(name="create",description="Create a season")
@@ -1682,6 +1790,8 @@ async def _create_finals_match_thread(guild,c,gid,mid,a,b,label):
         await _add_thread_members(th,guild,ids)
         await th.send(
             f"🏆 **FINALS — {a} vs {b}**\n\n"
+            "**2v2 — exactly 2 players per team may compete.** If a team has 3 registered players, "
+            "the third player is the reserve and must sit out this match. No outside substitutes.\n"
             "BO5 — first team to 3 rounds wins.\n"
             "When the match is complete, either captain uses `/match result` here. "
             "The confirmed result will be posted to #results and this thread will then close."
@@ -1708,9 +1818,14 @@ async def league_finals(i):
     if int(row["weeks_done"] or 0)<SEASON_WEEKS:
         await i.response.send_message(f"❌ The regular season is not finished yet. Week **{row['weeks_done']}/{SEASON_WEEKS}**.",ephemeral=True);return
 
-    ts=sorted(await teams_all(gid),key=lambda x:(x["mmr"],x["wins"],-x["losses"]),reverse=True)[:4]
+    # Only valid 2–3 player rosters can qualify for Finals.
+    eligible_teams=[t for t in await teams_all(gid) if 2 <= len(t.get("members",[])) <= MAX_TEAM]
+    ts=sorted(eligible_teams,key=lambda x:(x["mmr"],x["wins"],-x["losses"]),reverse=True)[:4]
     if len(ts)<4:
-        await i.response.send_message(f"❌ Need 4 teams, have {len(ts)}.",ephemeral=True);return
+        await i.response.send_message(
+            f"❌ Need 4 eligible teams with 2–{MAX_TEAM} registered players. Found {len(ts)}. "
+            "Teams with fewer than 2 or more than 3 players cannot qualify.",ephemeral=True
+        );return
     names=[t["display"] for t in ts]
 
     # Seed-based buildup: 1v4, 2v3, 1v3, 2v4, 1v2, 3v4.
@@ -1811,6 +1926,13 @@ async def league_tiebreaker(i,team1:str,team2:str):
     a=lookup.get(team1.strip().lower());b=lookup.get(team2.strip().lower())
     if not a or not b:
         await i.response.send_message("❌ Both teams must be Top-4 Finals teams.",ephemeral=True);return
+    for team_name in (a,b):
+        team=await team_get(gid,team_name)
+        if not team or not (2 <= len(team.get("members",[])) <= MAX_TEAM):
+            await i.response.send_message(
+                f"❌ **{team_name}** does not have a valid roster. Finals teams must have 2–{MAX_TEAM} registered players.",
+                ephemeral=True
+            );return
     if points[a]!=points[b]:
         await i.response.send_message(f"❌ A tiebreaker can only be created between teams tied on Finals Points. **{a}: {points[a]}**, **{b}: {points[b]}**.",ephemeral=True);return
     async with aiosqlite.connect(DB) as db:
@@ -1854,6 +1976,14 @@ async def league_grandfinal(i):
     ranked=sorted(points,key=lambda t:(points[t],tb_wins.get(t,0)),reverse=True)
     if len(ranked)<4:
         await i.response.send_message("❌ Finals standings are incomplete.",ephemeral=True);return
+    # Recheck finalists before creating the Grand Final in case a roster changed.
+    for team_name in ranked[:2]:
+        team=await team_get(gid,team_name)
+        if not team or not (2 <= len(team.get("members",[])) <= MAX_TEAM):
+            await i.response.send_message(
+                f"❌ **{team_name}** no longer has a valid 2–{MAX_TEAM} player roster. Correct the roster before creating the Grand Final.",
+                ephemeral=True
+            );return
 
     # Any unresolved tie crossing a qualification boundary must be resolved first:
     # - tie for 1st/2nd
@@ -1917,7 +2047,16 @@ class InviteView(discord.ui.View):
         if len(t["members"])>=MAX_TEAM:await i.response.send_message("Full.",ephemeral=True);return
         if await team_by_player(str(i.guild_id),str(i.user.id)):await i.response.send_message("On team.",ephemeral=True);return
         if await is_on_cooldown(str(i.guild_id),str(i.user.id)):await i.response.send_message("\u274c 24h cooldown.",ephemeral=True);return
-        async with aiosqlite.connect(DB)as db:await db.execute("INSERT INTO members VALUES(?,?,?)",(str(i.guild_id),s.tn.lower(),str(i.user.id)));await db.execute("DELETE FROM fa WHERE guild_id=? AND user_id=?",(str(i.guild_id),str(i.user.id)));await db.commit()
+        try:
+            async with aiosqlite.connect(DB) as db:
+                await db.execute("INSERT INTO members VALUES(?,?,?)",
+                                 (str(i.guild_id),s.tn.lower(),str(i.user.id)))
+                await db.execute("DELETE FROM fa WHERE guild_id=? AND user_id=?",
+                                 (str(i.guild_id),str(i.user.id)))
+                await db.commit()
+        except aiosqlite.IntegrityError:
+            await i.response.send_message("❌ This team is already full (maximum 3 players).",ephemeral=True)
+            return
         await add_roles(i.guild,i.user,t["display"])
         if t.get("thread_id"):
             th=i.guild.get_thread(int(t["thread_id"]))
@@ -1975,6 +2114,7 @@ async def team_create(i,name:str,clantag:str):
     async with aiosqlite.connect(DB)as db:await db.execute("UPDATE teams SET role_id=?,thread_id=? WHERE guild_id=? AND name=?",(role_id,thread_id,gid,name.lower()));await db.commit()
     extra=f"\n\U0001f4cc <#{thread_id}>"if thread_id else""
     await i.followup.send(f"\u2694\ufe0f **{name}** created!\nCaptain:{i.user.mention}|Rank:{get_rank(start_mmr)}|1/{MAX_TEAM}{' | Clan tag: '+clantag if clantag else ''}{extra}")
+    await log_team_action(i.guild,f"\u2694\ufe0f Team **{name}** created by {i.user.mention}.")
     await refresh_leaderboard(i.guild)
     await refresh_rosters(i.guild)
 @team.command(name="invite",description="Invite (captain)")
@@ -1986,9 +2126,10 @@ async def team_invite(i,player:discord.Member):
     if str(player.id)in t["members"]:await i.response.send_message("\u274c Already.",ephemeral=True);return
     if len(t["members"])>=MAX_TEAM:await i.response.send_message("\u274c Full.",ephemeral=True);return
     if await team_by_player(gid,str(player.id)):await i.response.send_message("\u274c Other team.",ephemeral=True);return
-    c=await cfg_get(gid);teams_ch=c.get("teams_ch")if c else None;view=InviteView(player.id,d,i.user.id,gid)
-    if teams_ch and(ch:=i.guild.get_channel(int(teams_ch))):await ch.send(f"\U0001f4e8 {player.mention} invited to **{d}** by {i.user.mention}!",view=view);await i.response.send_message(f"\u2705 Sent in {ch.mention}.",ephemeral=True)
-    else:await i.response.send_message(f"\U0001f4e8 {player.mention} invited to **{d}**!",view=view)
+    view=InviteView(player.id,d,i.user.id,gid)
+    ch=await log_team_action(i.guild,f"\U0001f4e8 {player.mention} invited to **{d}** by {i.user.mention}!",view=view)
+    if ch:await i.response.send_message(f"\u2705 Invite posted in {ch.mention}.",ephemeral=True)
+    else:await i.response.send_message("\u274c EGL #general was not found. Run `/setup reset` and `/setup run` again.",ephemeral=True)
 @team.command(name="kick",description="Kick (captain)")
 @app_commands.describe(player="Player")
 async def team_kick(i,player:discord.Member):
@@ -2008,6 +2149,7 @@ async def team_kick(i,player:discord.Member):
             try:await th.remove_user(player)
             except:pass
     await i.followup.send(f"\U0001f9b5 **{player.display_name}** has been kicked.")
+    await log_team_action(i.guild,f"\U0001f9b5 {player.mention} was removed from **{t['display']}** by {i.user.mention}.")
 @team.command(name="leave",description="Leave (players only)")
 async def team_leave(i):
     gid=str(i.guild_id);uid=str(i.user.id);t=await team_by_player(gid,uid)
@@ -2023,6 +2165,7 @@ async def team_leave(i):
             try:await th.remove_user(i.user)
             except:pass
     await i.followup.send(f"\U0001f44b Left **{t['display']}**.")
+    await log_team_action(i.guild,f"\U0001f44b {i.user.mention} left **{t['display']}**.")
 bot.tree.add_command(team)
 
 @bot.tree.command(name="disband",description="Disband your team (captain only)")
@@ -2047,6 +2190,7 @@ async def disband(i):
         if not is_tester(m):await set_cooldown(gid,uid,t["mmr"])
     async with aiosqlite.connect(DB)as db:await db.execute("DELETE FROM members WHERE guild_id=? AND team_name=?",(gid,t["name"]));await db.execute("DELETE FROM teams WHERE guild_id=? AND name=?",(gid,t["name"]));await db.commit()
     await i.followup.send(f"\U0001f5d1\ufe0f **{t['display']}** disbanded.")
+    await log_team_action(i.guild,f"\U0001f5d1\ufe0f Team **{t['display']}** was disbanded by {i.user.mention}.")
     await refresh_leaderboard(i.guild)
     await refresh_rosters(i.guild)
 
@@ -2856,6 +3000,7 @@ async def captain_swap(i,player:discord.Member):
         try:await i.user.remove_roles(cr);await player.add_roles(cr)
         except:pass
     await i.followup.send(f"\U0001f451 Capt of **{d}** \u2192 {player.mention}.")
+    await log_team_action(i.guild,f"\U0001f451 Captain of **{d}** transferred from {i.user.mention} to {player.mention}.")
 bot.tree.add_command(cap)
 
 mat=app_commands.Group(name="match",description="Match")
@@ -3010,7 +3155,7 @@ async def generate_week_cmd(i,number:app_commands.Range[int,1,SEASON_WEEKS]):
     if not n:
         await i.followup.send(
             f"❌ No matches were generated for **Week {number}**. "
-            "Check that at least two eligible teams have 3+ players.",
+            "Check that at least two eligible teams have 2–3 players.",
             ephemeral=True
         )
         return
@@ -3068,8 +3213,8 @@ async def create_mixedscrim(i,time:str):
     except:await i.response.send_message("\u274c Try: 20:00, 20.00, 8pm, 8:30pm",ephemeral=True);return
     await i.response.defer(ephemeral=True)
     if not has_scrims(i.guild):await i.followup.send("\u274c Run `/scrimbot setup` first.",ephemeral=True);return
-    gid=str(i.guild_id);max_p=6;today=datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    title="Mixed Scrim - 3V3"
+    gid=str(i.guild_id);max_p=4;today=datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    title="Mixed Scrim - 2V2"
     msc=None
     for cat in i.guild.categories:
         if cat.name=="Scrims":
@@ -3086,7 +3231,7 @@ async def create_mixedscrim(i,time:str):
     async with aiosqlite.connect(DB)as db:await db.execute("INSERT OR REPLACE INTO scrim_v2(sid,guild_id,date,thread_id,msg_id,max_players,scrim_title,unix_time) VALUES(?,?,?,NULL,?,?,?,?)",(sid,gid,today,str(msg.id),max_p,title,unix));await db.commit()
     # Create the scrim thread
     try:
-        th=await msc.create_thread(name=f"Scrim {scrim_time} GMT - 3V3",type=discord.ChannelType.public_thread,auto_archive_duration=1440)
+        th=await msc.create_thread(name=f"Scrim {scrim_time} GMT - 2V2",type=discord.ChannelType.public_thread,auto_archive_duration=1440)
         async with aiosqlite.connect(DB)as db:
             await db.execute("UPDATE scrim_v2 SET thread_id=? WHERE sid=?",(str(th.id),sid));await db.commit()
         await update_scrim_thread(sid)
@@ -3119,7 +3264,7 @@ async def refresh_leaderboard(guild):
     c=await cfg_get(gid)
     season_name=c["name"]if c else "EGL"
     embed=discord.Embed(title=f"\U0001f4ca {season_name} Leaderboard",description="\n".join(rows),color=0x5865F2)
-    embed.set_footer(text=f"{len(ts)} teams \u00b7 Updates automatically")
+    embed.set_footer(text=f"{len(ts)} teams \u00b7 Max {MAX_TEAM} players per team \u00b7 Updates automatically")
     try:
         msg=await ch.fetch_message(int(r[1]))
         await msg.edit(embed=embed)
@@ -3149,7 +3294,7 @@ async def leaderboard_cmd(i):
     c=await cfg_get(gid)
     season_name=c["name"]if c else"EGL"
     embed=discord.Embed(title=f"\U0001f4ca {season_name} Leaderboard",description="```\n"+"\n".join(rows)+"\n```",color=0x5865F2)
-    embed.set_footer(text=f"{len(ts)} teams \u00b7 Updates automatically")
+    embed.set_footer(text=f"{len(ts)} teams \u00b7 Max {MAX_TEAM} players per team \u00b7 Updates automatically")
     # Delete old message if exists
     async with aiosqlite.connect(DB)as db:
         await db.execute("CREATE TABLE IF NOT EXISTS leaderboard_state(guild_id TEXT PRIMARY KEY,ch TEXT,msg TEXT)")
@@ -3182,7 +3327,9 @@ async def refresh_rosters(guild):
     for t in ts[:25]:
         cap_id=t["captain_id"]
         sorted_uids=sorted(t["members"],key=lambda u:0 if u==cap_id else 1)
-        lines.append(f"**{t['display']}** ({len(t['members'])}/{MAX_TEAM}) \u00b7 {get_rank(t['mmr'])}")
+        roster_count=len(t["members"])
+        roster_status=" ⚠️ OVER LIMIT — reduce to 3" if roster_count>MAX_TEAM else ""
+        lines.append(f"**{t['display']}** ({roster_count}/{MAX_TEAM}) · {get_rank(t['mmr'])}{roster_status}")
         for uid in sorted_uids:
             m=guild.get_member(int(uid))
             nm=m.display_name if m else f"<@{uid}>"
@@ -3191,43 +3338,46 @@ async def refresh_rosters(guild):
     if not ts: lines=["*No teams are currently registered.*"]
     c=await cfg_get(gid)
     season_name=c["name"]if c else "EGL"
-    embed=discord.Embed(title=f"\U0001f4cb {season_name} Rosters",description="\n".join(lines),color=0x57F287)
-    embed.set_footer(text=f"{len(ts)} teams \u00b7 Updates automatically")
+    embed=discord.Embed(title=f"\U0001f4cb {season_name} Teams",description="\n".join(lines),color=0x57F287)
+    embed.set_footer(text=f"{len(ts)} teams \u00b7 Max {MAX_TEAM} players per team \u00b7 Updates automatically")
     try:
         msg=await ch.fetch_message(int(r[1]))
         await msg.edit(embed=embed)
     except:pass
 
-@bot.tree.command(name="teaminfoall",description="Post/refresh the team roster list (League Admin only)")
+@bot.tree.command(name="teaminfoall",description="Post/refresh the team directory in #teams (League Admin only)")
 async def teaminfoall_cmd(i):
     if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
     gid=str(i.guild_id)
-    ro_ch=None
-    for cat in i.guild.categories:
-        for ch in cat.text_channels:
-            if ch.name=="rosters":ro_ch=ch;break
-    if not ro_ch:await i.response.send_message("\u274c No #rosters channel. Create one first.",ephemeral=True);return
-    if i.channel.id!=ro_ch.id:await i.response.send_message(f"\u274c Use this in {ro_ch.mention}.",ephemeral=True);return
+    teams_ch=None
+    c=await cfg_get(gid)
+    if c and c.get("teams_ch"):
+        teams_ch=i.guild.get_channel(int(c["teams_ch"]))
+    if teams_ch is None:
+        teams_ch=discord.utils.get(i.guild.text_channels,name="teams")
+    if not teams_ch:await i.response.send_message("\u274c No #teams channel. Run `/setup run` first.",ephemeral=True);return
+    if i.channel.id!=teams_ch.id:await i.response.send_message(f"\u274c Use this command in {teams_ch.mention}.",ephemeral=True);return
     ts=sorted(await teams_all(gid),key=lambda x:x["mmr"],reverse=True)
-    if not ts:await i.response.send_message("No teams yet.",ephemeral=True);return
     lines=[]
     for t in ts[:25]:
         cap_id=t["captain_id"]
         sorted_uids=sorted(t["members"],key=lambda u:0 if u==cap_id else 1)
-        lines.append(f"**{t['display']}** ({len(t['members'])}/{MAX_TEAM}) \u00b7 {get_rank(t['mmr'])}")
+        roster_count=len(t["members"])
+        roster_status=" ⚠️ OVER LIMIT — reduce to 3" if roster_count>MAX_TEAM else ""
+        lines.append(f"**{t['display']}** ({roster_count}/{MAX_TEAM}) · {get_rank(t['mmr'])}{roster_status}")
         for uid in sorted_uids:
             m=i.guild.get_member(int(uid))
             nm=m.display_name if m else f"<@{uid}>"
-            lines.append(f"\U0001f451 {nm}"if uid==cap_id else f"\u00b7 {nm}")
+            lines.append(f"\U0001f451 {nm}"if uid==cap_id else f"· {nm}")
         lines.append("")
+    if not ts:lines=["*No teams are currently registered.*"]
     c=await cfg_get(gid)
     season_name=c["name"]if c else "EGL"
-    embed=discord.Embed(title=f"\U0001f4cb {season_name} Rosters",description="\n".join(lines),color=0x57F287)
-    embed.set_footer(text=f"{len(ts)} teams \u00b7 Updates automatically")
+    embed=discord.Embed(title=f"\U0001f4cb {season_name} Teams",description="\n".join(lines),color=0x57F287)
+    embed.set_footer(text=f"{len(ts)} teams · Max {MAX_TEAM} players per team · Updates automatically")
     async with aiosqlite.connect(DB)as db:
         await db.execute("CREATE TABLE IF NOT EXISTS roster_state(guild_id TEXT PRIMARY KEY,ch TEXT,msg TEXT)")
-        async with db.execute("SELECT ch,msg FROM roster_state WHERE guild_id=?",(gid,))as cur:
-            old=await cur.fetchone()
+        async with db.execute("SELECT ch,msg FROM roster_state WHERE guild_id=?",(gid,))as cur:old=await cur.fetchone()
     if old and old[0]:
         old_ch=i.guild.get_channel(int(old[0]))
         if old_ch and old[1]:
@@ -3235,11 +3385,11 @@ async def teaminfoall_cmd(i):
                 old_msg=await old_ch.fetch_message(int(old[1]))
                 await old_msg.delete()
             except:pass
-    msg=await ro_ch.send(embed=embed)
+    msg=await teams_ch.send(embed=embed)
     async with aiosqlite.connect(DB)as db:
-        await db.execute("INSERT OR REPLACE INTO roster_state VALUES(?,?,?)",(gid,str(ro_ch.id),str(msg.id)))
+        await db.execute("INSERT OR REPLACE INTO roster_state VALUES(?,?,?)",(gid,str(teams_ch.id),str(msg.id)))
         await db.commit()
-    await i.response.send_message("\u2705 Rosters posted!",ephemeral=True)
+    await i.response.send_message(f"\u2705 Team directory posted in {teams_ch.mention}.",ephemeral=True)
 
 @tasks.loop(minutes=1)
 async def leaderboard_refresh():
@@ -4520,6 +4670,7 @@ async def g_1v1_result(i):
     await i.response.send_message('Select the winner and BO5 score.',view=GResultView(m,labels),ephemeral=True)
 
 bot.tree.add_command(onevone)
+bot.tree.add_command(overseer)
 
 bot.tree.add_command(tournament)
 
