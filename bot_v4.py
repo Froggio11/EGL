@@ -430,6 +430,12 @@ async def disablecommands_cmd(i: discord.Interaction):
         "This setting remains active after a bot restart. Use `/enablecommands` to unlock commands.",
         ephemeral=True
     )
+    await log_team_action(
+        i.guild,
+        "🔧 **EGL Bot Maintenance**\n"
+        "Bot commands have been temporarily disabled while we work on updates and improvements. "
+        "We’ll let everyone know when the bot is back online."
+    )
 
 @bot.tree.command(name="enablecommands",description="Re-enable all bot commands")
 async def enablecommands_cmd(i: discord.Interaction):
@@ -444,6 +450,11 @@ async def enablecommands_cmd(i: discord.Interaction):
         )
         await db.commit()
     await i.response.send_message("🔓 **All commands are enabled again.**",ephemeral=True)
+    await log_team_action(
+        i.guild,
+        "✅ **EGL Bot Update Complete**\n"
+        "Bot maintenance is complete and commands are enabled again. Thanks for your patience!"
+    )
 
 def team_captain_ids(t):
     if not t:return []
