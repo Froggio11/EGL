@@ -9,7 +9,7 @@ from discord.ext import commands,tasks
 logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(message)s")
 log=logging.getLogger(__name__)
 TOKEN=os.environ.get("DISCORD_BOT_TOKEN","")
-DB="league.db";DEFAULT_MMR=1000;MAX_TEAM=3;SEASON_WEEKS=8
+DB="league.db";DEFAULT_MMR=1000;MAX_TEAM=3;SEASON_WEEKS=6
 ADMIN_ROLE="League Admin";TESTER_ROLE="EGL Tester";SPOON_ROLE="Spoon";SCRIM_BAN_ROLE="Scrim Banned"
 MAPS=["Chessboard","Portal Mayhem","Construction Site","Parking Lot"]
 SCHED_FMT="%d %b %H:%M";SCHED_HELP="DD Mon HH:MM or 8pm (e.g. 05 Aug 20:00 or 05 Aug 8pm)"
@@ -1244,11 +1244,12 @@ class RescheduleView(discord.ui.View):
 
 # ===== Gen Matches =====
 def _build_week_pairs(names, history, week, seed):
-    """Build a 2-matches-per-team schedule, minimizing repeats and recent rematches.
+    """Build exactly two matches per team for the generated week.
 
     For 3+ teams this creates a cycle: each team appears in exactly two matches
     and no pairing appears twice in the same generated week. With only two teams,
     playing the same opponent twice is unavoidable if both teams must play twice.
+    Historical pairings are used to reduce recent rematches.
     """
     names = list(names)
     n = len(names)
@@ -1406,7 +1407,7 @@ async def gen_matches(guild,c,force=False,target_week=None):
 async def guide_cmd(i):
     if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
     embed1=discord.Embed(title="\U0001f4d6 EGL - Elite Goon League",description="Welcome to the EGL, our own 2v2 competitive league for Elements Divided.",color=0x5865F2)
-    embed1.add_field(name="\U0001f3c6 League Format",value="- Teams of **up to 3 players** (2 players compete in each 2v2 match; the third can be a substitute)\n- Season lasts **8 weeks**\n- Matches every **Sunday 10pm GMT**\n- You play **1 match a week** - sometimes **2** if there are lots of teams, so everyone gets to play everyone\n- Captains vote on map (coin flip on tie)\n- **Top 4** advance to Finals, then Grand Final!",inline=False)
+    embed1.add_field(name="\U0001f3c6 League Format",value="- Teams of **up to 3 players** (2 players compete in each 2v2 match; the third can be a substitute)\n- Season lasts **6 weeks**\n- Every team plays **2 matches per week** (12 regular-season matches total)\n- Matches are generated every **Sunday 10pm GMT**\n- Opponents are rotated to reduce repeat matchups\n- Captains vote on map (coin flip on tie)\n- **Top 4** advance to Finals, then Grand Final!",inline=False)
     embed1.add_field(name="\U0001f4ca Ranks",value="\U0001f7e4 Awakened\n\u26aa Adept\n\U0001f7e1 **Elementalist** *(start)*\n\U0001f7e2 Master\n\U0001f535 Ascendant\n\U0001f451 Avatar",inline=True)
     embed1.add_field(name="MMR System",value="**Who you play matters:**\nWin vs a stronger team = **bigger gain**\nWin vs a weaker team = **smaller gain**\nLose vs a stronger team = **smaller loss**\nLose vs a weaker team = **bigger loss**\n\n**How you play matters too:**\nSweep (3-0) = **bigger reward**\nClose game (3-2) = **smaller reward**",inline=True)
     embed1.add_field(name="\u23f1\ufe0f Rules",value="- **24h cooldown** after leaving/disbanding\n- Returning players inherit **old team's MMR**",inline=False)
@@ -1685,7 +1686,7 @@ async def league_create(i,name:str):
     if sd.get("announcements_ch"):
         ann=i.guild.get_channel(int(sd["announcements_ch"]))
         if ann:
-            await ann.send(f"\U0001f3c6 **{name}** has begun!\n\n\u2022 **{SEASON_WEEKS}-week season**  -  every team plays every other team\n\u2022 Matches generated **Sunday at 10pm GMT** (automatic recovery runs until **Monday 4am GMT** if the bot was offline) (<t:{sun_unix}:t> your time)\n\u2022 End of regular season: **{end_date.strftime('%d %b %Y')}**\n\u2022 Top 4 advance to Finals, then Grand Final\n\nGood luck, Goons!")
+            await ann.send(f"\U0001f3c6 **{name}** has begun!\n\n\u2022 **{SEASON_WEEKS}-week season**  -  every team plays **2 matches per week** (12 regular-season matches total); opponents are rotated to reduce repeats\n\u2022 Matches generated **Sunday at 10pm GMT** (automatic recovery runs until **Monday 4am GMT** if the bot was offline) (<t:{sun_unix}:t> your time)\n\u2022 End of regular season: **{end_date.strftime('%d %b %Y')}**\n\u2022 Top 4 advance to Finals, then Grand Final\n\nGood luck, Goons!")
     await i.response.send_message(f"\u2694\ufe0f **{name}** season started!")
 @league.command(name="delete",description="Delete league")
 async def league_delete(i):
