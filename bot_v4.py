@@ -33,7 +33,7 @@ LEAGUE_ADMIN_COMMANDS={
     "guide","matchrules","scrimguide",
     "league create","league delete","league end","league finals","league tiebreaker","league grandfinal",
     "deleteteam","resetallteams","resetteams","scrimban","forcecaptainswap","forcekick","forcenamechange",
-    "schedulestatus","schedulereview","closematch","mmr adjust","recordadjust",
+    "schedulestatus","closematch","mmr adjust","recordadjust",
     "generatematch week","test generatematches","leaderboard","teaminfoall","backup","restore",
     "tournament setup","tournament close-reg","tournament start","tournament nextround",
     "tournament end","tournament reset","tournament closematch",
@@ -134,6 +134,21 @@ async def init_db():
         CREATE TABLE IF NOT EXISTS scrim_signups_v2(sid TEXT,guild_id TEXT,user_id TEXT,position INT,PRIMARY KEY(sid,user_id));
         CREATE TABLE IF NOT EXISTS scrim_bans(guild_id TEXT,user_id TEXT,expires_at INT,PRIMARY KEY(guild_id,user_id));
         CREATE TABLE IF NOT EXISTS bot_controls(guild_id TEXT PRIMARY KEY,commands_disabled INTEGER NOT NULL DEFAULT 0,updated_at TEXT);
+        CREATE TABLE IF NOT EXISTS underdog_bans(
+            match_id TEXT PRIMARY KEY,
+            guild_id TEXT NOT NULL,
+            underdog_team TEXT NOT NULL,
+            opponent_team TEXT NOT NULL,
+            underdog_mmr INTEGER NOT NULL,
+            opponent_mmr INTEGER NOT NULL,
+            captain_id TEXT NOT NULL,
+            selected_ultimate TEXT,
+            banned_ultimate TEXT,
+            announcement_message_id TEXT,
+            schedule_message_id TEXT,
+            created_at TEXT NOT NULL,
+            confirmed_at TEXT
+        );
         """)
         # Migrate: track which Sunday generation cycle has already run.
         try:await db.execute("ALTER TABLE season ADD COLUMN last_generation_cycle TEXT")
@@ -481,6 +496,255 @@ async def addcaptain_cmd(i,name:discord.Member):
     await i.response.send_message(f"\u2705 {name.mention} is now the second captain of **{t['display']}** and has the same **Captain** role. Added to {added_threads} active match thread(s).")
     await log_team_action(i.guild,f"\u265c {name.mention} was made second captain of **{t['display']}** by {i.user.mention}.")
 
+# ===== Underdog Ultimate Ban =====
+UNDERDOG_ULTIMATES = [
+    "Meteor", "Earth Trap", "Lava Eruption", "Metal Rain",
+    "Water Torrent", "Atom Bomb", "Blood Flamethrower", "Leaf Tornado",
+    "Fire Pillar", "Lightning Bolt", "Explosive Nova", "Fire Rain",
+    "Air Vortex", "Air Slash Trap", "Storm Prison", "Spirit Orb",
+]
+_underdog_views_registered = set()
+
+
+async def get_underdog_state(match_id):
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory=aiosqlite.Row
+        async with db.execute("SELECT * FROM underdog_bans WHERE match_id=?", (str(match_id),)) as cur:
+            row = await cur.fetchone()
+    return dict(row) if row else None
+
+
+async def update_underdog_schedule_confirmation(guild, match_id, banned_ultimate):
+    """Update only the Underdog line in the already-posted schedule confirmation."""
+    state = await get_underdog_state(match_id)
+    if not state or not state.get("schedule_message_id"):
+        return
+    async with aiosqlite.connect(DB) as db:
+        async with db.execute("SELECT thread_id FROM matches WHERE id=? AND guild_id=?", (str(match_id), state["guild_id"])) as cur:
+            match_row = await cur.fetchone()
+    if not match_row or not match_row[0]:
+        return
+    try:
+        thread = guild.get_thread(int(match_row[0]))
+        if thread is None:
+            thread = await guild.fetch_channel(int(match_row[0]))
+        message = await thread.fetch_message(int(state["schedule_message_id"]))
+        line = f"🚫 **Underdog Ban:** {banned_ultimate}"
+        content = message.content or ""
+        import re
+        if re.search(r"🚫 \*\*Underdog Ban:\*\*", content):
+            content = re.sub(r"🚫 \*\*Underdog Ban:\*\*[^\n]*", line, content, count=1)
+        else:
+            content = content.rstrip() + "\n" + line
+        # Keep the original schedule confirmation wording, line position and its existing view.
+        await message.edit(content=content)
+    except discord.NotFound:
+        log.warning("Schedule confirmation %s for match %s no longer exists.", state["schedule_message_id"], match_id)
+    except Exception as e:
+        log.warning("Could not update Underdog line in schedule confirmation for %s: %s", match_id, e)
+
+
+class UnderdogBanView(discord.ui.View):
+    """Persistent, captain-only Ultimate selection and one-time confirmation."""
+    def __init__(self, match_id, selected_ultimate=None):
+        super().__init__(timeout=None)
+        self.match_id = str(match_id)
+        self.selected_ultimate = selected_ultimate
+        options = [
+            discord.SelectOption(label=name, value=name, default=(name == selected_ultimate))
+            for name in UNDERDOG_ULTIMATES
+        ]
+        select = discord.ui.Select(
+            placeholder="Choose one Ultimate to ban",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id=f"egl_underdog_select:{self.match_id}",
+            row=0,
+        )
+        select.callback = self.choose_ultimate
+        self.add_item(select)
+        confirm = discord.ui.Button(
+            label="Confirm Ultimate Ban",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"egl_underdog_confirm:{self.match_id}",
+            row=1,
+        )
+        confirm.callback = self.confirm_ban
+        self.add_item(confirm)
+
+    async def _get_valid_state(self, interaction):
+        state = await get_underdog_state(self.match_id)
+        if not state:
+            await interaction.response.send_message("This Underdog ban is no longer available.", ephemeral=True)
+            return None
+        if str(interaction.user.id) != str(state["captain_id"]):
+            await interaction.response.send_message("Only the designated Underdog captain can use this selection.", ephemeral=True)
+            return None
+        async with aiosqlite.connect(DB) as db:
+            async with db.execute(
+                "SELECT winner FROM matches WHERE id=? AND guild_id=?",
+                (self.match_id, state["guild_id"])
+            ) as cur:
+                match_row = await cur.fetchone()
+        if not match_row or match_row[0] is not None:
+            await interaction.response.send_message("This match has ended or been deleted. The Underdog ban is closed.", ephemeral=True)
+            return None
+        if state.get("banned_ultimate"):
+            await interaction.response.send_message("An Ultimate has already been banned for this match.", ephemeral=True)
+            return None
+        return state
+
+    async def choose_ultimate(self, interaction):
+        state = await self._get_valid_state(interaction)
+        if not state:
+            return
+        selected = interaction.data.get("values", [None])[0]
+        if selected not in UNDERDOG_ULTIMATES:
+            await interaction.response.send_message("Invalid Ultimate selection.", ephemeral=True)
+            return
+        async with aiosqlite.connect(DB) as db:
+            cur = await db.execute(
+                "UPDATE underdog_bans SET selected_ultimate=? WHERE match_id=? AND banned_ultimate IS NULL "
+                "AND EXISTS (SELECT 1 FROM matches WHERE matches.id=underdog_bans.match_id AND matches.winner IS NULL)",
+                (selected, self.match_id)
+            )
+            await db.commit()
+        if cur.rowcount != 1:
+            await interaction.response.send_message("The Underdog ban is no longer available.", ephemeral=True)
+            return
+        self.selected_ultimate = selected
+        for item in self.children:
+            if isinstance(item, discord.ui.Select):
+                for option in item.options:
+                    option.default = option.value == selected
+        await interaction.response.edit_message(view=self)
+        await interaction.followup.send(
+            f"You selected **{selected}**. Press **Confirm Ultimate Ban** to finalize it.",
+            ephemeral=True
+        )
+
+    async def confirm_ban(self, interaction):
+        state = await self._get_valid_state(interaction)
+        if not state:
+            return
+        async with aiosqlite.connect(DB) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute(
+                "SELECT selected_ultimate FROM underdog_bans WHERE match_id=? AND banned_ultimate IS NULL",
+                (self.match_id,)
+            ) as cur:
+                selected_row = await cur.fetchone()
+            selected = selected_row["selected_ultimate"] if selected_row else None
+            if not selected:
+                await db.rollback()
+                await interaction.response.send_message("Choose an Ultimate from the dropdown first.", ephemeral=True)
+                return
+            cur = await db.execute(
+                "UPDATE underdog_bans SET banned_ultimate=?,confirmed_at=? "
+                "WHERE match_id=? AND banned_ultimate IS NULL "
+                "AND EXISTS (SELECT 1 FROM matches WHERE matches.id=underdog_bans.match_id AND matches.winner IS NULL)",
+                (selected, datetime.now(timezone.utc).isoformat(), self.match_id)
+            )
+            await db.commit()
+            if cur.rowcount != 1:
+                await interaction.response.send_message("An Ultimate has already been banned or this match has ended.", ephemeral=True)
+                return
+
+        await interaction.response.defer()
+        # Edit the original pinned public announcement, removing the controls.
+        try:
+            announcement = interaction.message
+            base = announcement.content or ""
+            base += f"\n\n🚫 **Banned Ultimate: {selected}**\nThe opposing team cannot use this Ultimate during this match."
+            await announcement.edit(content=base, view=None)
+        except Exception as e:
+            log.warning("Could not update Underdog announcement for match %s: %s", self.match_id, e)
+        await update_underdog_schedule_confirmation(interaction.guild, self.match_id, selected)
+        try:
+            await interaction.followup.send(f"🚫 **{selected}** has been banned for the opposing team for this match.")
+        except Exception as e:
+            log.warning("Could not post Underdog ban confirmation for match %s: %s", self.match_id, e)
+
+
+async def snapshot_underdog_for_match(gid, match_id, team1_display, team2_display):
+    """Persist the MMR comparison as soon as a match is created."""
+    teams = await teams_all(str(gid))
+    t1 = next((t for t in teams if str(t.get("display", "")).casefold() == str(team1_display).casefold()), None)
+    t2 = next((t for t in teams if str(t.get("display", "")).casefold() == str(team2_display).casefold()), None)
+    if not t1 or not t2:
+        log.warning("Underdog snapshot skipped for match %s: could not resolve both teams.", match_id)
+        return None
+    mmr1, mmr2 = int(t1.get("mmr", DEFAULT_MMR)), int(t2.get("mmr", DEFAULT_MMR))
+    if mmr1 == mmr2:
+        return None
+    underdog, opponent = (t1, t2) if mmr1 < mmr2 else (t2, t1)
+    underdog_mmr, opponent_mmr = (mmr1, mmr2) if mmr1 < mmr2 else (mmr2, mmr1)
+    captain_id = underdog.get("captain_id")
+    if not captain_id:
+        log.warning("Underdog snapshot skipped for match %s: %s has no primary captain ID.", match_id, underdog.get("display"))
+        return None
+    async with aiosqlite.connect(DB) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO underdog_bans(match_id,guild_id,underdog_team,opponent_team,underdog_mmr,opponent_mmr,captain_id,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (str(match_id), str(gid), underdog["display"], opponent["display"], underdog_mmr, opponent_mmr,
+             str(captain_id), datetime.now(timezone.utc).isoformat())
+        )
+        await db.commit()
+    return True
+
+
+async def create_underdog_announcement(guild, thread, match_id, team1_display, team2_display):
+    """Post/pin the saved Underdog decision before any other thread text."""
+    teams = await teams_all(str(guild.id))
+    t1 = next((t for t in teams if str(t.get("display", "")).casefold() == str(team1_display).casefold()), None)
+    t2 = next((t for t in teams if str(t.get("display", "")).casefold() == str(team2_display).casefold()), None)
+    if not t1 or not t2:
+        log.warning("Underdog skipped for match %s: could not resolve both teams (%s vs %s).", match_id, team1_display, team2_display)
+        return None
+    state = await get_underdog_state(match_id)
+    if not state:
+        await snapshot_underdog_for_match(str(guild.id), match_id, team1_display, team2_display)
+        state = await get_underdog_state(match_id)
+    if not state:
+        return None
+    underdog = next((t for t in teams if str(t.get("display", "")).casefold() == str(state["underdog_team"]).casefold()), None)
+    opponent = next((t for t in teams if str(t.get("display", "")).casefold() == str(state["opponent_team"]).casefold()), None)
+    if not underdog or not opponent:
+        log.warning("Underdog announcement skipped for match %s: a team record no longer exists.", match_id)
+        return None
+    captain_id = state["captain_id"]
+    underdog_role = guild.get_role(int(underdog["role_id"])) if underdog.get("role_id") else None
+    opponent_role = guild.get_role(int(opponent["role_id"])) if opponent.get("role_id") else None
+    underdog_mention = underdog_role.mention if underdog_role else f"**{underdog['display']}**"
+    opponent_mention = opponent_role.mention if opponent_role else f"**{opponent['display']}**"
+    content = (
+        "**UNDERDOGS:**\n\n"
+        f"{underdog_mention} has a lower rating than {opponent_mention} and receives one Ultimate ban against the opposing team.\n\n"
+        f"<@{captain_id}>, choose which Ultimate you want removed from the enemy team's selection using the dropdown menu below."
+    )
+    view = UnderdogBanView(match_id)
+    try:
+        message = await thread.send(content, view=view, allowed_mentions=discord.AllowedMentions(users=True, roles=True))
+        try:
+            await message.pin(reason="EGL Underdog Ultimate Ban")
+        except Exception as e:
+            log.warning("Could not pin Underdog announcement for match %s: %s", match_id, e)
+        async with aiosqlite.connect(DB) as db:
+            await db.execute(
+                "UPDATE underdog_bans SET announcement_message_id=? WHERE match_id=?",
+                (str(message.id), str(match_id))
+            )
+            await db.commit()
+        _underdog_views_registered.add(str(match_id))
+        return message
+    except Exception as e:
+        log.warning("Could not create Underdog announcement for match %s: %s", match_id, e)
+        return None
+
+
 # ===== Views =====
 async def captain_team(gid,uid):
     t=await team_by_player(gid,uid)
@@ -762,13 +1026,23 @@ class ScheduleConfirmView(discord.ui.View):
 
         overseer_role=find_role(i.guild,"Overseer")
         overseer_ping=f" {overseer_role.mention}" if overseer_role else ""
-        await i.channel.send(
+        underdog_state=await get_underdog_state(self.mid)
+        underdog_line=(
+            f"\n🚫 **Underdog Ban:** {underdog_state['banned_ultimate'] or 'Pending'}\n\n"
+            if underdog_state else "\n\n"
+        )
+        confirmation=await i.channel.send(
             content=f"📅 **Confirmed!** Match scheduled: **{self.sched}**\n"
-                    f"🕐 Your time: <t:{self.unix}:f>\n\n"
+                    f"🕐 Your time: <t:{self.unix}:f>"
+                    f"{underdog_line}"
                     f"First {overseer_ping} to Click **👁️ Spectate Match** will record the match. "
                     "Overseer's VC will be turned OFF and will NOT interfere with your match.",
             view=OverseerSpectateView(self.mid)
         )
+        if underdog_state:
+            async with aiosqlite.connect(DB) as db:
+                await db.execute("UPDATE underdog_bans SET schedule_message_id=? WHERE match_id=?", (str(confirmation.id), self.mid))
+                await db.commit()
         await send_map_vote(i.channel,self.mid)
     @discord.ui.button(label="\u274c Decline",style=discord.ButtonStyle.red)
     async def decline(self,i,btn):
@@ -1214,33 +1488,6 @@ async def create_scrim_thread(gid,date):
     # Not used — scrim threads removed
     pass
 
-class RescheduleView(discord.ui.View):
-    def __init__(self,ocid,nt,mid,gid):
-        super().__init__(timeout=86400);self.ocid=ocid;self.nt=nt;self.mid=mid;self.gid=gid
-    async def _other_cap(self,gid,user_id):
-        async with aiosqlite.connect(DB)as db:
-            db.row_factory=aiosqlite.Row
-            async with db.execute("SELECT team1,team2 FROM matches WHERE id=?",(self.mid,))as cur:
-                row=await cur.fetchone()
-        if not row:return []
-        own_team=await team_by_player(gid,user_id)
-        if not own_team:return []
-        other_name=row["team2"] if own_team["name"]==row["team1"] else row["team1"]
-        other_team=await team_get(gid,other_name)
-        return team_captain_ids(other_team)
-    @discord.ui.button(label="Approve",style=discord.ButtonStyle.green)
-    async def approve(self,i,btn):
-        gid=str(i.guild_id)
-        other=await self._other_cap(gid,str(i.user.id))
-        if not other or str(i.user.id) not in other:await i.response.send_message("Other captain only.",ephemeral=True);return
-        async with aiosqlite.connect(DB)as db:await db.execute("UPDATE matches SET scheduled=?, reminder_sent=0 WHERE id=?",(self.nt,self.mid));await db.commit()
-        for c in self.children:c.disabled=True
-        await i.response.edit_message(content=f"Rescheduled to **{self.nt}**",view=self)
-    @discord.ui.button(label="Deny",style=discord.ButtonStyle.red)
-    async def deny(self,i,btn):
-        other=await self._other_cap(str(i.guild_id),str(i.user.id))
-        if not other or str(i.user.id) not in other:await i.response.send_message("Other captain only.",ephemeral=True);return
-        for c in self.children:c.disabled=True;await i.response.edit_message(content="Denied.",view=self)
 
 # ===== Gen Matches =====
 def _build_week_pairs(names, history, week, seed):
@@ -1352,6 +1599,7 @@ async def gen_matches(guild,c,force=False,target_week=None):
     )
     if not all_pairs:return
     match_ids=[]
+    eligible_by_display={str(t["display"]).casefold():t for t in eligible}
     async with aiosqlite.connect(DB)as db:
         for a,b in all_pairs:
             mid=str(uuid.uuid4())[:8]
@@ -1359,6 +1607,14 @@ async def gen_matches(guild,c,force=False,target_week=None):
                 "INSERT INTO matches (id,guild_id,week,team1,team2,created_at) VALUES(?,?,?,?,?,?)",
                 (mid,gid,week,a,b,datetime.now(timezone.utc).isoformat())
             )
+            ta=eligible_by_display.get(str(a).casefold());tb=eligible_by_display.get(str(b).casefold())
+            if ta and tb and int(ta.get("mmr",DEFAULT_MMR)) != int(tb.get("mmr",DEFAULT_MMR)):
+                underdog,opponent=(ta,tb) if int(ta.get("mmr",DEFAULT_MMR)) < int(tb.get("mmr",DEFAULT_MMR)) else (tb,ta)
+                if underdog.get("captain_id"):
+                    await db.execute(
+                        "INSERT OR IGNORE INTO underdog_bans(match_id,guild_id,underdog_team,opponent_team,underdog_mmr,opponent_mmr,captain_id,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                        (mid,gid,underdog["display"],opponent["display"],int(underdog["mmr"]),int(opponent["mmr"]),str(underdog["captain_id"]),datetime.now(timezone.utc).isoformat())
+                    )
             match_ids.append((mid,a,b))
         if not force and target_week is None:
             now_cycle=datetime.now(timezone.utc)
@@ -1387,7 +1643,8 @@ async def gen_matches(guild,c,force=False,target_week=None):
                     if is_admin(m)and str(m.id)not in added:
                         if await add_thread_member_safely(th,m):
                             added.add(str(m.id))
-                await th.send(f"⚡ **{a} vs {b} - Week {week}**\nEveryone's here! **Only 2 players per team may play; any third roster member is the reserve.** Captains, use `/schedule` to choose a match day and time. Once both captains confirm, the map vote will open.")
+                await create_underdog_announcement(guild,th,mid,a,b)
+                await th.send(f"⚡ **{a} vs {b} - Week {week}**\nEveryone's here! **Each team can choose any 2 of its registered players to compete in this 2v2 match.** All registered team members are equal, so there is no designated reserve. Captains, use `/schedule` to choose a match day and time. Once both captains confirm, the map vote will open.")
             except Exception as e:log.warning("Thread: %s",e)
         lines=[f"⚡ **Week {week} Matches**",""]+[f"• **{a}** vs **{b}**"for _,a,b in match_ids]+["","Check threads!"]
         await ch.send("\n".join(lines))
@@ -1407,7 +1664,7 @@ async def gen_matches(guild,c,force=False,target_week=None):
 async def guide_cmd(i):
     if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
     embed1=discord.Embed(title="\U0001f4d6 EGL - Elite Goon League",description="Welcome to the EGL, our own 2v2 competitive league for Elements Divided.",color=0x5865F2)
-    embed1.add_field(name="\U0001f3c6 League Format",value="- Teams of **up to 3 players** (2 players compete in each 2v2 match; the third can be a substitute)\n- Season lasts **6 weeks**\n- Every team plays **2 matches per week** (12 regular-season matches total)\n- Matches are generated every **Sunday 10pm GMT**\n- Opponents are rotated to reduce repeat matchups\n- Captains vote on map (coin flip on tie)\n- **Top 4** advance to Finals, then Grand Final!",inline=False)
+    embed1.add_field(name="\U0001f3c6 League Format",value="- Teams can have **up to 3 players**. All registered players are equal members of the team.\n- Every match is **2v2**. For each match, the team chooses which 2 of its registered players will compete.\n- There is no designated reserve or substitute within the team.\n- Season lasts **6 weeks**\n- Every team plays **2 matches per week** (12 regular-season matches total)\n- Matches are generated every **Sunday 10pm GMT**\n- Opponents are rotated to reduce repeat matchups\n- Captains vote on map (coin flip on tie)\n- **Top 4** advance to Finals, then Grand Final!",inline=False)
     embed1.add_field(name="\U0001f4ca Ranks",value="\U0001f7e4 Awakened\n\u26aa Adept\n\U0001f7e1 **Elementalist** *(start)*\n\U0001f7e2 Master\n\U0001f535 Ascendant\n\U0001f451 Avatar",inline=True)
     embed1.add_field(name="MMR System",value="**Who you play matters:**\nWin vs a stronger team = **bigger gain**\nWin vs a weaker team = **smaller gain**\nLose vs a stronger team = **smaller loss**\nLose vs a weaker team = **bigger loss**\n\n**How you play matters too:**\nSweep (3-0) = **bigger reward**\nClose game (3-2) = **smaller reward**",inline=True)
     embed1.add_field(name="\u23f1\ufe0f Rules",value="- **24h cooldown** after leaving/disbanding\n- Returning players inherit **old team's MMR**",inline=False)
@@ -1419,7 +1676,7 @@ async def guide_cmd(i):
     await i.followup.send(embed=flow_embed)
     embed2=discord.Embed(title="\U0001f4cb Commands",color=0x5865F2)
     embed2.add_field(name="\u2694\ufe0f Team",value="`/team create` - Start a team (you become captain)\n`/team invite @player` - Invite someone\n`/team kick @player` - Remove someone\n`/team leave` - Leave your team\n`/disband` - Delete your team\n`/captain swap @player` - Transfer captain\n`/teaminfo name:Name` - Look up any team",inline=False)
-    embed2.add_field(name="\U0001f4c5 Match *(captains only, in match thread)*",value="`/schedule 05 Aug 19:00` - Set match time\n`/reschedule 05 Aug 20:00` - Change time (other captain approves)\n`/match result opponent:Name score:2-1` - Report result",inline=False)
+    embed2.add_field(name="\U0001f4c5 Match *(captains only, in match thread)*",value="`/schedule 05 Aug 19:00` - Set match time (other captain confirms)\n`/match result opponent:Name score:2-1` - Report result",inline=False)
     embed2.add_field(name="\U0001f4ca Stats",value="`/teaminfo name:Name` - Rank, MMR, progress bar\n`/leaderboard` - Full leaderboard (live)\n`/league status` - Season progress + top 4",inline=False)
     embed2.set_footer(text="Questions? Ask a League Admin. Good luck, Goons!")
     await i.followup.send(embed=embed2)
@@ -1435,10 +1692,10 @@ async def matchrules_cmd(i):
     rules_embed.add_field(name="\U0001f30d Server Region",value="- All matches are played on **EU servers by default**.\n- **US servers are allowed only when every player in the match is from the US.**\n- If there is **even one EU player**, the match must be played on EU servers.",inline=False)
     rules_embed.add_field(name="\U0001f5fa\ufe0f Map",value="Voted on after the match time is set.",inline=False)
     rules_embed.add_field(name="\u26a1 Toggles",value="- Powerups: OFF\n- Ultimates: ON\n- Techniques: ON\n- Blocking: ON\n- Perfect blocking: ON\n- Dashing: ON",inline=False)
-    rules_embed.add_field(name="\U0001f465 Match Size",value="- All matches must be scheduled as **2v2**. Each team may use exactly 2 players per match. A third roster member may be kept as a substitute, but cannot join that match.",inline=False)
+    rules_embed.add_field(name="\U0001f465 Match Size",value="- All matches must be played as **2v2**. Each team can have up to 3 registered players and may choose any 2 of them to compete in each match.",inline=False)
     rules_embed.add_field(name="\u23f0 No-Shows & Forfeits",value="- If some of your team **doesn't show up within 15 minutes**, you can either **play with the players available** (e.g. 1v2) or **forfeit** (3-0 loss).\n- If a team **can't play** that week, they forfeit the match **3-0**.\n- If you **can't agree on a time**, contact the League Admins.\n- Captains are responsible for the rules - a match played with invalid rules **must be replayed**.",inline=False)
     rules_embed.add_field(name="\u2696\ufe0f Scheduling Disputes",value="- If teams cannot agree on a match time, an **impartial League Admin or assigned neutral person** will review the scheduling chat.\n- They will decide whether either team failed to make a reasonable effort, whether both teams tried their best, and who should forfeit if necessary.\n- Decisions will be based on the chat history and each team's effort to find a suitable time.",inline=False)
-    rules_embed.add_field(name="\ud83d\udeab Substitutes",value="- **No outside substitutes** - only players on your registered roster may play\n- Each match is still **2v2**: if your roster has 3 players, one must sit out as the reserve",inline=False)
+    rules_embed.add_field(name="\ud83d\udeab Team Roster",value="- Only players on the registered team roster may participate.\n- Teams with 3 registered players can choose freely which 2 players participate in each match.\n- All registered players are equal team members. There is no designated reserve or substitute.",inline=False)
     rules_embed.add_field(name="\U0001f91d Sportsmanship",value="- We trust all players and teams to act with good sportsmanship, respect, and honesty.\n- Treat opponents fairly, respect agreed match arrangements, and avoid toxic behaviour, harassment, or deliberate rule abuse.\n- Disagreements should be handled respectfully. If an issue cannot be resolved between both teams, contact a League Admin.\n- Everyone is expected to play in good faith and help keep the league competitive, fair, and enjoyable for everyone.",inline=False)
     await i.response.send_message(embed=rules_embed)
 
@@ -1454,7 +1711,7 @@ async def scrimguide_cmd(i):
     embed.add_field(name="\u23f0 Reminder",value="**5 minutes before start**, everyone in the scrim gets pinged in the thread.\nGet a lobby ready and drop the code in the chat!",inline=False)
     await i.response.send_message(embed=embed)
 
-# ===== /setup /setchannel /league /team /disband /teaminfo /captain /match /stats /fa /mmr /test /schedule /reschedule /backup /restore =====
+# ===== Command groups and slash commands =====
 setup=app_commands.Group(name="setup",description="Bot setup")
 @setup.command(name="run",description="Create all league channels (League Admin only)")
 async def setup_run(i):
@@ -1693,6 +1950,7 @@ async def league_delete(i):
     if not await need_admin(i):return
     gid=str(i.guild_id);c=await cfg_get(gid)
     async with aiosqlite.connect(DB)as db:
+        await db.execute("DELETE FROM underdog_bans WHERE guild_id=?",(gid,))
         for tbl in("config","teams","members","fa","matches","season","finals_state"):await db.execute(f"DELETE FROM {tbl} WHERE guild_id=?",(gid,))
         await db.commit()
     await i.response.send_message(f"\U0001f5d1\ufe0f **{c['name']}** deleted.")
@@ -1761,11 +2019,6 @@ async def league_end(i):
     msg+="\nHistorical Finals results and match records were preserved."
     await i.response.send_message(msg)
 
-@league.command(name="info",description="League info")
-async def league_info(i):
-    if not await need_league(i):return
-    c=await cfg_get(str(i.guild_id));ts=await teams_all(str(i.guild_id))
-    await i.response.send_message(f"\u2694\ufe0f **{c['name']}**\nTeams:{len(ts)}|{SEASON_WEEKS}w")
 
 async def finals_standings(gid):
     async with aiosqlite.connect(DB) as db:
@@ -1850,6 +2103,7 @@ async def _create_finals_match_thread(guild,c,gid,mid,a,b,label):
     ch=guild.get_channel(int(c["matches_ch"]))
     if not ch or not isinstance(ch,discord.TextChannel):return None
     try:
+        await snapshot_underdog_for_match(gid,mid,a,b)
         th=await ch.create_thread(
             name=f"🏆 {a} vs {b} — {label}",
             type=discord.ChannelType.private_thread,
@@ -1863,10 +2117,12 @@ async def _create_finals_match_thread(guild,c,gid,mid,a,b,label):
         # Private Finals match threads are visible/speakable by both teams and League Admins.
         ids.extend(await _finals_admin_ids(guild))
         await _add_thread_members(th,guild,ids)
+        await create_underdog_announcement(guild,th,mid,a,b)
         await th.send(
             f"🏆 **FINALS — {a} vs {b}**\n\n"
-            "**2v2 — exactly 2 players per team may compete.** If a team has 3 registered players, "
-            "the third player is the reserve and must sit out this match. No outside substitutes.\n"
+            "**2v2 — each team can choose any 2 of its registered players to compete.** "
+            "All registered team members are equal, and there is no designated reserve or substitute. "
+            "Only players on the registered team roster may participate.\n"
             "BO5 — first team to 3 rounds wins.\n"
             "When the match is complete, either captain uses `/match result` here. "
             "The confirmed result will be posted to #results and this thread will then close."
@@ -2450,6 +2706,7 @@ async def resetteams(i):
         # Do not reset season state, Finals state, teams, members, captains,
         # player history, Discord roles, or Discord threads.
         await db.execute("UPDATE teams SET mmr=1000,wins=0,losses=0 WHERE guild_id=?",(gid,))
+        await db.execute("DELETE FROM underdog_bans WHERE guild_id=?",(gid,))
         await db.execute("DELETE FROM matches WHERE guild_id=?",(gid,))
         await db.commit()
     await i.followup.send("✅ Teams reset to 1000 MMR, 0W/0L, and match history was cleared.")
@@ -2668,43 +2925,6 @@ async def schedulestatus(i):
     embed.set_footer(text=f"{len(rows)} open matches this week")
     await i.followup.send(embed=embed,ephemeral=True)
 
-@bot.tree.command(name="schedulereview",description="Analyze scheduling effort in this match thread (League Admin only)")
-async def schedulereview(i):
-    if not is_admin(i.user):await i.response.send_message(f"\u274c Need **{ADMIN_ROLE}**.",ephemeral=True);return
-    if not isinstance(i.channel,discord.Thread):await i.response.send_message("\u274c Use inside the match thread.",ephemeral=True);return
-    gid=str(i.guild_id)
-    await i.response.defer(ephemeral=True)
-    async with aiosqlite.connect(DB)as db:
-        db.row_factory=aiosqlite.Row
-        async with db.execute("SELECT id,team1,team2 FROM matches WHERE thread_id=?",(str(i.channel.id),))as cur:
-            m=await cur.fetchone()
-    if not m:await i.followup.send("\u274c No match in this thread.",ephemeral=True);return
-    m=dict(m);t1=m["team1"];t2=m["team2"]
-    async with aiosqlite.connect(DB)as db:
-        db.row_factory=aiosqlite.Row
-        await db.execute("CREATE TABLE IF NOT EXISTS sched_events(id INTEGER PRIMARY KEY AUTOINCREMENT,guild_id TEXT,match_id TEXT,team TEXT,action TEXT,detail TEXT,ts TEXT)")
-        async with db.execute("SELECT team,action,detail,ts FROM sched_events WHERE match_id=? ORDER BY id",(m["id"],))as cur:
-            evs=await cur.fetchall()
-    if not evs:await i.followup.send("\u274c No scheduling activity recorded for this match yet.",ephemeral=True);return
-    stats={}
-    for ev in evs:
-        ev=dict(ev);tm=ev["team"]
-        s=stats.setdefault(tm,{"propose":0,"counter":0,"confirm":0,"decline":0,"details":[]})
-        if ev["action"]in s:s[ev["action"]]+=1
-        if ev["detail"]:s["details"].append(f"{ev['action']}: {ev['detail']}")
-    for tm in[t1,t2]:stats.setdefault(tm,{"propose":0,"counter":0,"confirm":0,"decline":0,"details":[]})
-    def score(x):return x["propose"]*3+x["counter"]*2+x["confirm"]*2-x["decline"]*2
-    s1=stats[t1];s2=stats[t2]
-    def line(tm,s):return f"**{tm}**: proposals {s['propose']} \u00b7 counters {s['counter']} \u00b7 confirms {s['confirm']} \u00b7 declines {s['decline']}"
-    verdict=""
-    if score(s1)>score(s2):verdict=f"\n\n\u2705 **{t1}** tried harder to schedule."
-    elif score(s2)>score(s1):verdict=f"\n\n\u2705 **{t2}** tried harder to schedule."
-    else:verdict="\n\n\u26a0\ufe0f Both teams showed similar effort."
-    lines=[line(t1,s1),line(t2,s2)]
-    if s1["details"]:lines.append(f"\n**{t1}:** "+"; ".join(s1["details"][-5:]))
-    if s2["details"]:lines.append(f"**{t2}:** "+"; ".join(s2["details"][-5:]))
-    embed=discord.Embed(title="\U0001f4c5 Scheduling Review",description="\n".join(lines)+verdict,color=0x5865F2)
-    await i.followup.send(embed=embed,ephemeral=True)
 
 class CloseReasonModal(discord.ui.Modal):
     def __init__(self,callback_fn):
@@ -3264,9 +3484,6 @@ bot.tree.add_command(test)
 async def schedule_cmd(i):
     await _open_schedule_picker(i,"schedule")
 
-@bot.tree.command(name="reschedule",description="Reschedule a match")
-async def reschedule_cmd(i):
-    await _open_schedule_picker(i,"reschedule")
 
 create_grp=app_commands.Group(name="create",description="Create scrims")
 @create_grp.command(name="mixedscrim",description="Create a mixed scrim")
@@ -3753,6 +3970,21 @@ async def on_member_remove(member):
 async def on_ready():
     await init_db()
     await g_init_db()
+    # Restore only still-open, not-yet-confirmed Underdog menus. The DB match
+    # row is checked again on every interaction, so stale/deleted matches fail closed.
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory=aiosqlite.Row
+        async with db.execute(
+            "SELECT u.match_id,u.announcement_message_id,u.selected_ultimate "
+            "FROM underdog_bans u JOIN matches m ON m.id=u.match_id AND m.guild_id=u.guild_id "
+            "WHERE u.banned_ultimate IS NULL AND u.announcement_message_id IS NOT NULL AND m.winner IS NULL"
+        ) as cur:
+            pending_underdogs = await cur.fetchall()
+    for item in pending_underdogs:
+        mid = str(item["match_id"])
+        if mid not in _underdog_views_registered:
+            bot.add_view(UnderdogBanView(mid,item["selected_ultimate"]), message_id=int(item["announcement_message_id"]))
+            _underdog_views_registered.add(mid)
     bot.add_view(GRegistrationView())
     pending_g=await g_db("SELECT match_no,winner,score,reporter FROM gounament_matches WHERE status='awaiting_confirmation'",fetch=True,many=True)
     for gm in pending_g:
