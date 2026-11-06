@@ -1,7 +1,7 @@
 # Elements Divided League Bot v5 — Elite Goon League
 # pip install discord.py aiosqlite
 # 2v2 league, max 3 players/team, rank-based system
-import asyncio,logging,os,uuid,random,unicodedata
+import asyncio,logging,os,uuid,random,unicodedata,json
 from datetime import datetime,timezone,timedelta
 import aiosqlite,discord
 from discord import app_commands
@@ -71,6 +71,72 @@ class EGLCommandTree(app_commands.CommandTree):
 intents=discord.Intents.default();intents.members=True;intents.message_content=True
 bot=commands.Bot(command_prefix="!",intents=intents,tree_cls=EGLCommandTree)
 
+# Central registry for public, long-lived Discord interactions. Every registered
+# message is stored in SQLite and its View is reattached to the exact message on
+# startup. Short-lived ephemeral workflows intentionally do not use this system.
+_persistent_restore_done = False
+_persistent_factories = {}
+
+async def persist_interaction(message, view_type, object_id, state=None, register=True):
+    if message is None or getattr(message, "id", None) is None:
+        return
+    state = state or {}
+    now = datetime.now(timezone.utc).isoformat()
+    payload = json.dumps(state, separators=(",", ":"), default=str)
+    async with aiosqlite.connect(DB) as db:
+        await db.execute(
+            "INSERT INTO persistent_interactions(message_id,guild_id,channel_id,view_type,object_id,state_json,active,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,1,?,?) ON CONFLICT(message_id) DO UPDATE SET "
+            "guild_id=excluded.guild_id,channel_id=excluded.channel_id,view_type=excluded.view_type,"
+            "object_id=excluded.object_id,state_json=excluded.state_json,active=1,updated_at=excluded.updated_at",
+            (str(message.id), str(message.guild.id), str(message.channel.id), str(view_type), str(object_id), payload, now, now)
+        )
+        await db.commit()
+    factory = _persistent_factories.get(str(view_type))
+    if register and factory:
+        view = factory(str(object_id), state)
+        bot.add_view(view, message_id=int(message.id))
+
+async def retire_interaction(message_id):
+    if not message_id:
+        return
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("UPDATE persistent_interactions SET active=0,updated_at=? WHERE message_id=?",
+                         (datetime.now(timezone.utc).isoformat(), str(message_id)))
+        await db.commit()
+
+async def retire_match_interactions(guild_id, match_id, thread_id=None):
+    now=datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DB) as db:
+        await db.execute(
+            "UPDATE persistent_interactions SET active=0,updated_at=? WHERE guild_id=? AND "
+            "((object_id=? AND view_type IN ('underdog','overseer','map_vote','schedule_confirm')) "
+            "OR (channel_id=? AND view_type='result_confirm'))",
+            (now,str(guild_id),str(match_id),str(thread_id or ""))
+        )
+        await db.commit()
+
+async def restore_persistent_interactions():
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM persistent_interactions WHERE active=1") as cur:
+            rows = await cur.fetchall()
+    restored = 0
+    for row in rows:
+        factory = _persistent_factories.get(row["view_type"])
+        if not factory:
+            log.warning("No persistent View factory for type %s (message %s)", row["view_type"], row["message_id"])
+            continue
+        try:
+            state = json.loads(row["state_json"] or "{}")
+            view = factory(str(row["object_id"]), state)
+            bot.add_view(view, message_id=int(row["message_id"]))
+            restored += 1
+        except Exception:
+            log.exception("Could not restore persistent interaction %s (%s)", row["message_id"], row["view_type"])
+    log.info("Restored %d persistent interaction message(s).", restored)
+
+
 # Serialize private-thread member additions so match generation does not
 # burst Discord's thread-member endpoint and trigger repeated 429s.
 _thread_member_lock=asyncio.Lock()
@@ -134,6 +200,23 @@ async def init_db():
         CREATE TABLE IF NOT EXISTS scrim_signups_v2(sid TEXT,guild_id TEXT,user_id TEXT,position INT,PRIMARY KEY(sid,user_id));
         CREATE TABLE IF NOT EXISTS scrim_bans(guild_id TEXT,user_id TEXT,expires_at INT,PRIMARY KEY(guild_id,user_id));
         CREATE TABLE IF NOT EXISTS bot_controls(guild_id TEXT PRIMARY KEY,commands_disabled INTEGER NOT NULL DEFAULT 0,updated_at TEXT);
+        CREATE TABLE IF NOT EXISTS persistent_interactions(
+            message_id TEXT PRIMARY KEY,
+            guild_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            view_type TEXT NOT NULL,
+            object_id TEXT NOT NULL,
+            state_json TEXT NOT NULL DEFAULT '{}',
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS map_votes(
+            match_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            map_name TEXT NOT NULL,
+            PRIMARY KEY(match_id,user_id)
+        );
         CREATE TABLE IF NOT EXISTS underdog_bans(
             match_id TEXT PRIMARY KEY,
             guild_id TEXT NOT NULL,
@@ -670,6 +753,7 @@ class UnderdogBanView(discord.ui.View):
             base = announcement.content or ""
             base += f"\n\n🚫 **Banned Ultimate: {selected}**\nThe opposing team cannot use this Ultimate during this match."
             await announcement.edit(content=base, view=None)
+            await retire_interaction(announcement.id)
         except Exception as e:
             log.warning("Could not update Underdog announcement for match %s: %s", self.match_id, e)
         await update_underdog_schedule_confirmation(interaction.guild, self.match_id, selected)
@@ -750,6 +834,7 @@ async def create_underdog_announcement(guild, thread, match_id, team1_display, t
             )
             await db.commit()
         _underdog_views_registered.add(str(match_id))
+        await persist_interaction(message,"underdog",str(match_id),{"selected_ultimate":state.get("selected_ultimate")})
         return message
     except Exception as e:
         log.warning("Could not create Underdog announcement for match %s: %s", match_id, e)
@@ -768,38 +853,57 @@ async def record_sched_event(gid,match_id,team,action,detail=""):
         await db.commit()
 
 class MapVoteView(discord.ui.View):
-    def __init__(self,mid,th):
-        super().__init__(timeout=604800);self.mid=mid;self.th=th;self.p={}
+    def __init__(self,mid,channel_id,expires_at=None):
+        super().__init__(timeout=None);self.mid=str(mid);self.channel_id=str(channel_id)
+        self.expires_at=int(expires_at or (datetime.now(timezone.utc).timestamp()+604800))
+        for mn in MAPS:
+            btn=discord.ui.Button(label=mn,style=discord.ButtonStyle.primary,custom_id=f"egl_mapvote:{mn.lower().replace(' ','_')}")
+            async def cb(i,mn=mn): await self._v(i,mn)
+            btn.callback=cb;self.add_item(btn)
+
     async def _v(self,i,mn):
+        if datetime.now(timezone.utc).timestamp() >= self.expires_at:
+            await i.response.edit_message(content="⌛ This map vote has expired.",view=None)
+            await retire_interaction(i.message.id);return
         uid=str(i.user.id)
-        async with aiosqlite.connect(DB)as db:
+        async with aiosqlite.connect(DB) as db:
             db.row_factory=aiosqlite.Row
-            async with db.execute("SELECT team1,team2 FROM matches WHERE id=?",(self.mid,))as cur:
+            async with db.execute("SELECT team1,team2,winner FROM matches WHERE id=?",(self.mid,)) as cur:
                 row=await cur.fetchone()
-        if not row:await i.response.send_message("Match not found.",ephemeral=True);return
-        gid=str(i.guild_id)
-        t1=await team_get(gid,row["team1"]);t2=await team_get(gid,row["team2"])
-        caps=team_captain_ids(t1)+team_captain_ids(t2)
-        if uid not in caps:await i.response.send_message("Captains only.",ephemeral=True);return
-        if uid in self.p:await i.response.send_message("Already voted.",ephemeral=True);return
-        self.p[uid]=mn;await i.response.send_message(f"{mn}!",ephemeral=True)
-        if len(self.p)==2:
-            vs=list(self.p.values())
-            res=vs[0]if vs[0]==vs[1]else random.choice(vs)
-            coin=" (coin flip!)"if vs[0]!=vs[1]else""
-            for c in self.children:c.disabled=True
-            await i.edit_original_response(content=f"Map: **{res}**{coin}",view=None)
-            await self.th.send(f"\U0001f5fa\ufe0f Map: **{res}**{coin}")
-            async with aiosqlite.connect(DB)as db2:await db2.execute("UPDATE matches SET map=? WHERE id=?",(res,self.mid));await db2.commit()
+            if not row or row["winner"] is not None:
+                await i.response.send_message("This match is no longer open for map voting.",ephemeral=True);return
+            gid=str(i.guild_id)
+            t1=await team_get(gid,row["team1"]);t2=await team_get(gid,row["team2"])
+            caps=team_captain_ids(t1)+team_captain_ids(t2)
+            if uid not in caps:
+                await i.response.send_message("Captains only.",ephemeral=True);return
+            try:
+                await db.execute("INSERT INTO map_votes(match_id,user_id,map_name) VALUES(?,?,?)",(self.mid,uid,mn))
+            except aiosqlite.IntegrityError:
+                await i.response.send_message("Already voted.",ephemeral=True);return
+            async with db.execute("SELECT map_name FROM map_votes WHERE match_id=? ORDER BY rowid",(self.mid,)) as cur:
+                votes=[r[0] for r in await cur.fetchall()]
+            await db.commit()
+        await i.response.send_message(f"{mn}!",ephemeral=True)
+        if len(votes)>=2:
+            res=votes[0] if votes[0]==votes[1] else random.choice(votes)
+            coin=" (coin flip!)" if votes[0]!=votes[1] else ""
+            await i.message.edit(content=f"Map: **{res}**{coin}",view=None)
+            channel=i.guild.get_channel(int(self.channel_id))
+            if channel:
+                try: await channel.send(f"🗺️ Map: **{res}**{coin}")
+                except Exception: pass
+            async with aiosqlite.connect(DB) as db:
+                await db.execute("UPDATE matches SET map=? WHERE id=?",(res,self.mid))
+                await db.execute("DELETE FROM map_votes WHERE match_id=?",(self.mid,))
+                await db.commit()
+            await retire_interaction(i.message.id)
 
 async def send_map_vote(channel,mid):
-    mv=MapVoteView(mid,channel)
-    for mn in MAPS:
-        btn=discord.ui.Button(label=mn,style=discord.ButtonStyle.primary)
-        async def cb(i,mn=mn):await mv._v(i,mn)
-        btn.callback=cb;mv.add_item(btn)
-    return await channel.send("**\U0001f5fa\ufe0f Map Vote:**",view=mv)
-
+    mv=MapVoteView(mid,channel.id)
+    message=await channel.send("**🗺️ Map Vote:**",view=mv)
+    await persist_interaction(message,"map_vote",str(mid),{"channel_id":str(channel.id),"expires_at":int(datetime.now(timezone.utc).timestamp()+604800)})
+    return message
 
 async def _match_schedule_row(i):
     if not isinstance(i.channel,discord.Thread):
@@ -927,6 +1031,10 @@ async def _send_schedule_proposal(i,row,actor_team,dt,mode):
         f"{oc.mention} please confirm:",
         view=v
     )
+    try:
+        proposal_message=await i.original_response()
+        await persist_interaction(proposal_message,"schedule_confirm",str(row["id"]),{"actor_id":str(ot["captain_id"]),"proposer_id":str(i.user.id),"sched":sched,"unix":unix,"thread_id":str(i.channel.id),"expires_at":int(datetime.now(timezone.utc).timestamp()+86400)})
+    except Exception: log.exception("Could not register persistent schedule proposal")
 
 async def _open_schedule_picker(i,mode):
     row,actor=await _match_schedule_row(i)
@@ -958,16 +1066,20 @@ class CounterPickerLauncher:
                 f"{other_member.mention if other_member else ''} please reply:",
                 view=nv
             )
+            try:
+                proposal_message=await interaction.original_response()
+                await persist_interaction(proposal_message,"schedule_confirm",str(self.view.mid),{"actor_id":str(self.view.proposer_id),"proposer_id":str(self.view.actor_id),"sched":ns,"unix":unix,"thread_id":str(self.view.thread_id),"expires_at":int(datetime.now(timezone.utc).timestamp()+86400)})
+            except Exception: log.exception("Could not register persistent counter-proposal")
         await i.response.send_message("\U0001f504 **Counter Offer**\n\nChoose a new day and time from this match's week.",view=SchedulePickerView(i.user.id,dates,picked),ephemeral=True)
 
 
 class OverseerSpectateView(discord.ui.View):
     def __init__(self,mid):
         super().__init__(timeout=None)
-        self.mid=mid
+        self.mid=str(mid)
         self.claimed=False
 
-    @discord.ui.button(label="👁️ Spectate Match",style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="👁️ Spectate Match",style=discord.ButtonStyle.secondary,custom_id="egl_overseer:spectate")
     async def spectate(self,i,btn):
         role=find_role(i.guild,"Overseer")
         if not role or role not in i.user.roles:
@@ -1005,18 +1117,24 @@ class OverseerSpectateView(discord.ui.View):
                     "🎥 **Recording the match only — VC must remain OFF.**",
             view=self
         )
+        await retire_interaction(i.message.id)
 
 
 class ScheduleConfirmView(discord.ui.View):
-    def __init__(self,mid,actor_id,proposer_id,sched,unix,thread_id):
-        super().__init__(timeout=86400);self.mid=mid;self.actor_id=actor_id;self.proposer_id=proposer_id;self.sched=sched;self.unix=unix;self.thread_id=thread_id;self.done=False
+    def __init__(self,mid,actor_id,proposer_id,sched,unix,thread_id,expires_at=None):
+        super().__init__(timeout=None);self.mid=mid;self.actor_id=actor_id;self.proposer_id=proposer_id;self.sched=sched;self.unix=unix;self.thread_id=thread_id;self.done=False
+        self.expires_at=int(expires_at or (datetime.now(timezone.utc).timestamp()+86400))
     async def _check(self,i):
+        if datetime.now(timezone.utc).timestamp() >= self.expires_at:
+            await i.response.edit_message(content="⌛ This schedule proposal has expired.",view=None)
+            await retire_interaction(i.message.id)
+            return False
         if self.done:await i.response.send_message("Stale proposal.",ephemeral=True);return False
         team_name=await captain_team(str(i.guild_id),self.actor_id)
         team=await team_get(str(i.guild_id),team_name) if team_name else None
         if str(i.user.id) not in team_captain_ids(team):await i.response.send_message("Other captain only.",ephemeral=True);return False
         return True
-    @discord.ui.button(label="\u2705 Confirm",style=discord.ButtonStyle.green)
+    @discord.ui.button(label="\u2705 Confirm",style=discord.ButtonStyle.green,custom_id="egl_schedule:confirm")
     async def confirm(self,i,btn):
         if not await self._check(i):return
         gid=str(i.guild_id)
@@ -1030,6 +1148,7 @@ class ScheduleConfirmView(discord.ui.View):
         self.done=True
         for c in self.children:c.disabled=True
         await i.response.defer()
+        await retire_interaction(i.message.id)
         try:
             await i.message.delete()
         except Exception:
@@ -1050,12 +1169,13 @@ class ScheduleConfirmView(discord.ui.View):
                     "Overseer's VC will be turned OFF and will NOT interfere with your match.",
             view=OverseerSpectateView(self.mid)
         )
+        await persist_interaction(confirmation,"overseer",self.mid,{})
         if underdog_state:
             async with aiosqlite.connect(DB) as db:
                 await db.execute("UPDATE underdog_bans SET schedule_message_id=? WHERE match_id=?", (str(confirmation.id), self.mid))
                 await db.commit()
         await send_map_vote(i.channel,self.mid)
-    @discord.ui.button(label="\u274c Decline",style=discord.ButtonStyle.red)
+    @discord.ui.button(label="\u274c Decline",style=discord.ButtonStyle.red,custom_id="egl_schedule:decline")
     async def decline(self,i,btn):
         if not await self._check(i):return
         gid=str(i.guild_id)
@@ -1064,14 +1184,16 @@ class ScheduleConfirmView(discord.ui.View):
         self.done=True
         for c in self.children:c.disabled=True
         await i.response.edit_message(content="\u274c Schedule proposal declined.",view=self)
-    @discord.ui.button(label="\U0001f504 Counter",style=discord.ButtonStyle.blurple)
+        await retire_interaction(i.message.id)
+    @discord.ui.button(label="\U0001f504 Counter",style=discord.ButtonStyle.blurple,custom_id="egl_schedule:counter")
     async def counter(self,i,btn):
         if not await self._check(i):return
         await CounterPickerLauncher(self).open(i)
 
 class ResultConfirmView(discord.ui.View):
-    def __init__(self,ocid,rep_key,rep_disp,opp_key,opp_disp,score,won,winner,delta,gid,cfg,thread_id=""):
-        super().__init__(timeout=86400)
+    def __init__(self,ocid,rep_key,rep_disp,opp_key,opp_disp,score,won,winner,delta,gid,cfg,thread_id="",expires_at=None):
+        super().__init__(timeout=None)
+        self.expires_at=int(expires_at or (datetime.now(timezone.utc).timestamp()+86400))
         self.ocid=ocid;self.rep_key=rep_key;self.rep_disp=rep_disp
         self.opp_key=opp_key;self.opp_disp=opp_disp
         self.score=self._norm_score(score);self.won=won;self.winner=winner;self.delta=delta
@@ -1083,8 +1205,11 @@ class ResultConfirmView(discord.ui.View):
             return f"{a}-{b}"
         except Exception:
             return str(score)
-    @discord.ui.button(label="\u2705 Confirm Result",style=discord.ButtonStyle.green)
+    @discord.ui.button(label="\u2705 Confirm Result",style=discord.ButtonStyle.green,custom_id="egl_result:confirm")
     async def confirm(self,i,btn):
+        if datetime.now(timezone.utc).timestamp() >= self.expires_at:
+            await i.response.edit_message(content="⌛ This result confirmation has expired.",view=None)
+            await retire_interaction(i.message.id);return
         opponent_team=await team_get(self.gid,self.opp_key)
         if str(i.user.id) not in team_captain_ids(opponent_team):
             await i.response.send_message("Other captain only.",ephemeral=True);return
@@ -1105,6 +1230,7 @@ class ResultConfirmView(discord.ui.View):
                 await i.response.send_message("Match not found.",ephemeral=True);return
             if match["winner"] is not None:
                 await i.response.send_message("This match has already been recorded.",ephemeral=True);return
+            await retire_match_interactions(gid,match["id"],self.thread_id)
 
             finals_type=int(match["is_finals"] or 0)
             if finals_type in (1,3):
@@ -1239,17 +1365,22 @@ class ResultConfirmView(discord.ui.View):
                 ),
                 view=self
             )
+        await retire_interaction(i.message.id)
 
-    @discord.ui.button(label="\u26a0\ufe0f Dispute",style=discord.ButtonStyle.red)
+    @discord.ui.button(label="\u26a0\ufe0f Dispute",style=discord.ButtonStyle.red,custom_id="egl_result:dispute")
     async def dispute(self,i,btn):
+        if datetime.now(timezone.utc).timestamp() >= self.expires_at:
+            await i.response.edit_message(content="⌛ This result confirmation has expired.",view=None)
+            await retire_interaction(i.message.id);return
         if str(i.user.id)!=self.ocid:await i.response.send_message("Other captain only.",ephemeral=True);return
         for c in self.children:c.disabled=True
         await i.response.edit_message(content="\u26a0\ufe0f **Result disputed!** Contact a League Admin to resolve.",view=self)
+        await retire_interaction(i.message.id)
 
 class ScrimSignupView(discord.ui.View):
     def __init__(self,gid,sid):
         super().__init__(timeout=None);self.gid=gid;self.sid=sid
-    @discord.ui.button(label="Sign Up",style=discord.ButtonStyle.green,emoji="\u2795")
+    @discord.ui.button(label="Sign Up",style=discord.ButtonStyle.green,emoji="\u2795",custom_id="egl_scrim:signup")
     async def signup(self,i,btn):
         gid=self.gid;sid=self.sid;uid=str(i.user.id)
         ban_role=find_role(i.guild,SCRIM_BAN_ROLE)
@@ -1272,7 +1403,7 @@ class ScrimSignupView(discord.ui.View):
             except:pass
         await update_scrim_embed(sid)
         await update_scrim_thread(sid)
-    @discord.ui.button(label="Sign Off",style=discord.ButtonStyle.red,emoji="\u274c")
+    @discord.ui.button(label="Sign Off",style=discord.ButtonStyle.red,emoji="\u274c",custom_id="egl_scrim:leave")
     async def leave(self,i,btn):
         await scrim_leave(i,self.gid,self.sid)
 
@@ -1355,6 +1486,7 @@ async def close_scrim(sid,sess=None):
         return
 
     async with aiosqlite.connect(DB) as db:
+        await db.execute("UPDATE persistent_interactions SET active=0,updated_at=? WHERE object_id=? AND view_type IN ('scrim_signup','scrim_thread')",(datetime.now(timezone.utc).isoformat(),sid))
         await db.execute("DELETE FROM scrim_signups_v2 WHERE sid=?",(sid,))
         await db.execute("DELETE FROM scrim_v2 WHERE sid=?",(sid,))
         await db.commit()
@@ -1392,10 +1524,10 @@ async def scrim_leave(i,gid,sid):
 class ScrimThreadView(discord.ui.View):
     def __init__(self,gid,sid):
         super().__init__(timeout=None);self.gid=gid;self.sid=sid
-    @discord.ui.button(label="Sign Off",style=discord.ButtonStyle.red,emoji="\u274c")
+    @discord.ui.button(label="Sign Off",style=discord.ButtonStyle.red,emoji="\u274c",custom_id="egl_scrim_thread:leave")
     async def signoff(self,i,btn):
         await scrim_leave(i,self.gid,self.sid)
-    @discord.ui.button(label="Ask for Queue",style=discord.ButtonStyle.blurple,emoji="\U0001f4e3")
+    @discord.ui.button(label="Ask for Queue",style=discord.ButtonStyle.blurple,emoji="\U0001f4e3",custom_id="egl_scrim_thread:queue")
     async def askqueue(self,i,btn):
         sid=self.sid
         members=await scrim_signups_active(sid)
@@ -1446,6 +1578,7 @@ async def update_scrim_thread(sid):
     if target is not None:
         try:
             await target.edit(embed=embed,view=view)
+            await persist_interaction(target,"scrim_thread",sid,{"guild_id":str(session["guild_id"])})
         except Exception as e:
             log.warning("scrim thread edit: %s",e)
             try:await target.edit(embed=embed)
@@ -1459,6 +1592,7 @@ async def update_scrim_thread(sid):
         return
     try:
         m=await th.send(embed=embed,view=view)
+        await persist_interaction(m,"scrim_thread",sid,{"guild_id":str(session["guild_id"])})
         async with aiosqlite.connect(DB)as db:
             await db.execute("UPDATE scrim_v2 SET thread_msg_id=? WHERE sid=?",(str(m.id),sid));await db.commit()
         try:await m.pin()
@@ -1961,6 +2095,7 @@ async def league_delete(i):
     if not await need_admin(i):return
     gid=str(i.guild_id);c=await cfg_get(gid)
     async with aiosqlite.connect(DB)as db:
+        await db.execute("UPDATE persistent_interactions SET active=0,updated_at=? WHERE guild_id=? AND view_type IN ('underdog','overseer','map_vote','schedule_confirm','result_confirm')",(datetime.now(timezone.utc).isoformat(),gid))
         await db.execute("DELETE FROM underdog_bans WHERE guild_id=?",(gid,))
         for tbl in("config","teams","members","fa","matches","season","finals_state"):await db.execute(f"DELETE FROM {tbl} WHERE guild_id=?",(gid,))
         await db.commit()
@@ -2380,9 +2515,19 @@ async def league_status(i):
 bot.tree.add_command(league)
 
 class InviteView(discord.ui.View):
-    def __init__(s,iid,tn,cid,gid):super().__init__(timeout=86400);s.iid=iid;s.tn=tn;s.cid=cid;s.gid=gid
-    @discord.ui.button(label="\u2705 Accept",style=discord.ButtonStyle.green)
+    def __init__(s,iid,tn,cid,gid,expires_at=None):
+        super().__init__(timeout=None);s.iid=int(iid);s.tn=tn;s.cid=str(cid);s.gid=str(gid)
+        s.expires_at=int(expires_at or (datetime.now(timezone.utc).timestamp()+86400))
+    async def _check_expiry(s,i):
+        if datetime.now(timezone.utc).timestamp() >= s.expires_at:
+            for child in s.children: child.disabled=True
+            await i.response.edit_message(content="⌛ This team invite has expired.",view=s)
+            await retire_interaction(i.message.id)
+            return False
+        return True
+    @discord.ui.button(label="\u2705 Accept",style=discord.ButtonStyle.green,custom_id="egl_invite:accept")
     async def a(s,i,btn):
+        if not await s._check_expiry(i):return
         if i.user.id!=s.iid:await i.response.send_message("Not for you.",ephemeral=True);return
         t=await team_get(str(i.guild_id),s.tn)
         if not t:await i.response.send_message("Gone.",ephemeral=True);return
@@ -2407,10 +2552,14 @@ class InviteView(discord.ui.View):
                 except:pass
         for c in s.children:c.disabled=True
         await i.response.edit_message(content=f"\u2705 {i.user.mention} joined **{t['display']}**!",view=s)
-    @discord.ui.button(label="\u274c Decline",style=discord.ButtonStyle.red)
+        await retire_interaction(i.message.id)
+    @discord.ui.button(label="\u274c Decline",style=discord.ButtonStyle.red,custom_id="egl_invite:decline")
     async def d(s,i,btn):
+        if not await s._check_expiry(i):return
         if i.user.id!=s.iid:await i.response.send_message("Not for you.",ephemeral=True);return
-        for c in s.children:c.disabled=True;await i.response.edit_message(content="\u274c Declined.",view=s)
+        for c in s.children:c.disabled=True
+        await i.response.edit_message(content="\u274c Declined.",view=s)
+        await retire_interaction(i.message.id)
 
 team=app_commands.Group(name="team",description="Team management")
 @team.command(name="create",description="Create team")
@@ -2477,8 +2626,11 @@ async def team_invite(i,player:discord.Member):
     if len(t["members"])>=MAX_TEAM:await i.response.send_message("\u274c Full.",ephemeral=True);return
     if await team_by_player(gid,str(player.id)):await i.response.send_message("\u274c Other team.",ephemeral=True);return
     view=InviteView(player.id,d,i.user.id,gid)
-    ch=await log_team_action(i.guild,f"\U0001f4e8 {player.mention} invited to **{d}** by {i.user.mention}!",view=view)
-    if ch:await i.response.send_message(f"\u2705 Invite posted in {ch.mention}.",ephemeral=True)
+    ch=await team_commands_channel(i.guild)
+    if ch:
+        invite_message=await ch.send(f"\U0001f4e8 {player.mention} invited to **{d}** by {i.user.mention}!",view=view)
+        await persist_interaction(invite_message,"invite",str(invite_message.id),{"invited_id":str(player.id),"team_name":d,"captain_id":str(i.user.id),"guild_id":gid,"expires_at":int(datetime.now(timezone.utc).timestamp()+86400)})
+        await i.response.send_message(f"\u2705 Invite posted in {ch.mention}.",ephemeral=True)
     else:await i.response.send_message("\u274c EGL #general was not found. Run `/setup reset` and `/setup run` again.",ephemeral=True)
 @team.command(name="kick",description="Kick (captain)")
 @app_commands.describe(player="Player")
@@ -2717,6 +2869,7 @@ async def resetteams(i):
         # Do not reset season state, Finals state, teams, members, captains,
         # player history, Discord roles, or Discord threads.
         await db.execute("UPDATE teams SET mmr=1000,wins=0,losses=0 WHERE guild_id=?",(gid,))
+        await db.execute("UPDATE persistent_interactions SET active=0,updated_at=? WHERE guild_id=? AND view_type IN ('underdog','overseer','map_vote','schedule_confirm','result_confirm')",(datetime.now(timezone.utc).isoformat(),gid))
         await db.execute("DELETE FROM underdog_bans WHERE guild_id=?",(gid,))
         await db.execute("DELETE FROM matches WHERE guild_id=?",(gid,))
         await db.commit()
@@ -3366,7 +3519,8 @@ async def finalize_report(i,gid,reporter,opp_key,winner,loser,score):
     if not oc:return False
     su="+"if won else"-";st="-"if won else"+"
     v=ResultConfirmView(opp_t["captain_id"],my_t["name"],my_t["display"],opp_t["name"],opp_t["display"],score,won,winner,delta,gid,c,str(i.channel.id))
-    await i.channel.send(f"\u26a1 {i.user.mention} reports: **{winner} {score} {loser}**\n{reporter}({get_rank(my_mmr)}) {su}{delta} | {opp_t['display']}({get_rank(opp_mmr)}) {st}{delta}\n\n{oc.mention} please confirm:",view=v)
+    result_message=await i.channel.send(f"\u26a1 {i.user.mention} reports: **{winner} {score} {loser}**\n{reporter}({get_rank(my_mmr)}) {su}{delta} | {opp_t['display']}({get_rank(opp_mmr)}) {st}{delta}\n\n{oc.mention} please confirm:",view=v)
+    await persist_interaction(result_message,"result_confirm",str(result_message.id),{"ocid":str(opp_t["captain_id"]),"rep_key":my_t["name"],"rep_disp":my_t["display"],"opp_key":opp_t["name"],"opp_disp":opp_t["display"],"score":score,"won":bool(won),"winner":winner,"delta":int(delta),"gid":str(gid),"cfg":c,"thread_id":str(i.channel.id),"expires_at":int(datetime.now(timezone.utc).timestamp()+86400)})
     return True
 
 @mat.command(name="result",description="Report the result of this match (captain)")
@@ -3540,6 +3694,7 @@ async def create_mixedscrim(i,time:str):
     sid=str(uuid.uuid4())[:8]
     view=ScrimSignupView(gid,sid);msg=await msc.send(embed=embed,view=view)
     async with aiosqlite.connect(DB)as db:await db.execute("INSERT OR REPLACE INTO scrim_v2(sid,guild_id,date,thread_id,msg_id,max_players,scrim_title,unix_time) VALUES(?,?,?,NULL,?,?,?,?)",(sid,gid,today,str(msg.id),max_p,title,unix));await db.commit()
+    await persist_interaction(msg,"scrim_signup",sid,{"guild_id":gid})
     # Create the scrim thread
     try:
         th=await msc.create_thread(name=f"Scrim {scrim_time} GMT - 2V2",type=discord.ChannelType.public_thread,auto_archive_duration=1440)
@@ -3977,29 +4132,99 @@ async def on_member_remove(member):
     await refresh_leaderboard(member.guild)
     await refresh_rosters(member.guild)
 
+def _register_persistent_factories():
+    _persistent_factories.update({
+        "underdog": lambda oid, st: UnderdogBanView(oid, st.get("selected_ultimate")),
+        "overseer": lambda oid, st: OverseerSpectateView(oid),
+        "map_vote": lambda oid, st: MapVoteView(oid, st["channel_id"], st.get("expires_at")),
+        "scrim_signup": lambda oid, st: ScrimSignupView(st["guild_id"], oid),
+        "scrim_thread": lambda oid, st: ScrimThreadView(st["guild_id"], oid),
+        "invite": lambda oid, st: InviteView(st["invited_id"], st["team_name"], st["captain_id"], st["guild_id"], st.get("expires_at")),
+        "schedule_confirm": lambda oid, st: ScheduleConfirmView(oid, st["actor_id"], st["proposer_id"], st["sched"], int(st["unix"]), st["thread_id"], st.get("expires_at")),
+        "result_confirm": lambda oid, st: ResultConfirmView(st["ocid"], st["rep_key"], st["rep_disp"], st["opp_key"], st["opp_disp"], st["score"], st["won"], st["winner"], int(st["delta"]), st["gid"], st.get("cfg"), st.get("thread_id", ""), st.get("expires_at")),
+        "g_confirm_result": lambda oid, st: GConfirmResultView(int(oid), st["winner"], st["score"], st["reporter"]),
+    })
+
+
+async def backfill_legacy_persistent_interactions():
+    """Adopt still-active public interactions created before this registry existed."""
+    # Underdog announcements and their Overseer confirmation messages already
+    # have durable identifiers in the league database.
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT u.match_id,u.guild_id,u.announcement_message_id,u.schedule_message_id,"
+            "u.selected_ultimate,m.thread_id,m.winner FROM underdog_bans u "
+            "JOIN matches m ON m.id=u.match_id AND m.guild_id=u.guild_id "
+            "WHERE m.winner IS NULL"
+        ) as cur:
+            underdog_rows = await cur.fetchall()
+        async with db.execute(
+            "SELECT sid,guild_id,msg_id,thread_id,thread_msg_id FROM scrim_v2"
+        ) as cur:
+            scrim_rows = await cur.fetchall()
+    for row in underdog_rows:
+        guild = bot.get_guild(int(row["guild_id"]))
+        if not guild:
+            continue
+        if row["announcement_message_id"]:
+            try:
+                channel = await guild.fetch_channel(int(row["thread_id"]))
+                message = await channel.fetch_message(int(row["announcement_message_id"]))
+                view = UnderdogBanView(row["match_id"], row["selected_ultimate"])
+                await message.edit(view=view)
+                await persist_interaction(message,"underdog",row["match_id"],{"selected_ultimate":row["selected_ultimate"]},register=False)
+            except Exception as e:
+                log.info("Legacy Underdog message %s was not adopted: %s",row["announcement_message_id"],e)
+        if row["schedule_message_id"]:
+            try:
+                channel = await guild.fetch_channel(int(row["thread_id"]))
+                message = await channel.fetch_message(int(row["schedule_message_id"]))
+                await message.edit(view=OverseerSpectateView(row["match_id"]))
+                await persist_interaction(message,"overseer",row["match_id"],{},register=False)
+            except Exception as e:
+                log.info("Legacy Overseer message %s was not adopted: %s",row["schedule_message_id"],e)
+    for row in scrim_rows:
+        guild = bot.get_guild(int(row["guild_id"]))
+        if not guild:
+            continue
+        if row["msg_id"]:
+            try:
+                channel = next((ch for cat in guild.categories if cat.name=="Scrims" for ch in cat.text_channels if ch.name=="mixed-scrims"),None)
+                if channel:
+                    message = await channel.fetch_message(int(row["msg_id"]))
+                    await message.edit(view=ScrimSignupView(row["guild_id"],row["sid"]))
+                    await persist_interaction(message,"scrim_signup",row["sid"],{"guild_id":str(row["guild_id"])},register=False)
+            except Exception as e:
+                log.info("Legacy scrim signup %s was not adopted: %s",row["sid"],e)
+        if row["thread_id"] and row["thread_msg_id"]:
+            try:
+                channel = await guild.fetch_channel(int(row["thread_id"]))
+                message = await channel.fetch_message(int(row["thread_msg_id"]))
+                await message.edit(view=ScrimThreadView(row["guild_id"],row["sid"]))
+                await persist_interaction(message,"scrim_thread",row["sid"],{"guild_id":str(row["guild_id"])},register=False)
+            except Exception as e:
+                log.info("Legacy scrim thread controls %s were not adopted: %s",row["sid"],e)
+
+
 @bot.event
 async def on_ready():
     await init_db()
     await g_init_db()
-    # Restore only still-open, not-yet-confirmed Underdog menus. The DB match
-    # row is checked again on every interaction, so stale/deleted matches fail closed.
-    async with aiosqlite.connect(DB) as db:
-        db.row_factory=aiosqlite.Row
-        async with db.execute(
-            "SELECT u.match_id,u.announcement_message_id,u.selected_ultimate "
-            "FROM underdog_bans u JOIN matches m ON m.id=u.match_id AND m.guild_id=u.guild_id "
-            "WHERE u.banned_ultimate IS NULL AND u.announcement_message_id IS NOT NULL AND m.winner IS NULL"
-        ) as cur:
-            pending_underdogs = await cur.fetchall()
-    for item in pending_underdogs:
-        mid = str(item["match_id"])
-        if mid not in _underdog_views_registered:
-            bot.add_view(UnderdogBanView(mid,item["selected_ultimate"]), message_id=int(item["announcement_message_id"]))
-            _underdog_views_registered.add(mid)
+    global _persistent_restore_done
+    _register_persistent_factories()
+    if not _persistent_restore_done:
+        await backfill_legacy_persistent_interactions()
+        await restore_persistent_interactions()
+        _persistent_restore_done=True
     bot.add_view(GRegistrationView())
     pending_g=await g_db("SELECT match_no,winner,score,reporter FROM gounament_matches WHERE status='awaiting_confirmation'",fetch=True,many=True)
+    async with aiosqlite.connect(DB) as db:
+        async with db.execute("SELECT object_id FROM persistent_interactions WHERE view_type='g_confirm_result' AND active=1") as cur:
+            centrally_restored_g={str(r[0]) for r in await cur.fetchall()}
     for gm in pending_g:
-        if gm['winner'] and gm['score'] and gm['reporter']:
+        if gm['winner'] and gm['score'] and gm['reporter'] and str(gm['match_no']) not in centrally_restored_g:
+            # Legacy tournament confirmations created before the central registry.
             bot.add_view(GConfirmResultView(gm['match_no'],gm['winner'],gm['score'],gm['reporter']))
     for guild in bot.guilds:
         bot.tree.copy_global_to(guild=guild)
@@ -4654,7 +4879,8 @@ class GScoreSelect(discord.ui.Select):
                   f'**{winner_name}** defeated **{loser_name}** ({score}, winner first).\n\n'
                   f'{member.mention if member else f"<@{other}>"}: please confirm or dispute this result.')
         await i.response.edit_message(content='Result submitted. The other player has been asked to confirm or dispute it.',view=None)
-        await i.followup.send(proposed,view=view,ephemeral=False,allowed_mentions=discord.AllowedMentions(users=True,roles=False,everyone=False))
+        confirmation_message=await i.followup.send(proposed,view=view,ephemeral=False,allowed_mentions=discord.AllowedMentions(users=True,roles=False,everyone=False),wait=True)
+        await persist_interaction(confirmation_message,"g_confirm_result",str(self.match["match_no"]),{"winner":str(self.winner),"score":str(score),"reporter":str(i.user.id)})
 class GScoreSelectView(discord.ui.View):
     def __init__(self,m,w):super().__init__(timeout=300);self.add_item(GScoreSelect(m,w))
 class GResultView(discord.ui.View):
